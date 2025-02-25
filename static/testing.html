@@ -3,32 +3,12 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebXR Example</title>
+    <title>Test Page</title>
 </head>
 <body>
-    <script src="testing.js"></script>
-    <!-- <script>
-        async function enableVR() {
-            if ('xr' in navigator) {
-                const vrButton = document.createElement('button');
-                vrButton.textContent = 'Enter VR';
-                vrButton.style.position = 'absolute';
-                vrButton.style.top = '10px';
-                vrButton.style.left = '10px';
-                vrButton.onclick = async () => {
-                    try {
-                        const xrSession = await navigator.xr.requestSession('immersive-vr');
-                        console.log('VR Session Started:', xrSession);
-                    } catch (err) {
-                        console.error('Failed to start VR session:', err);
-                    }
-                };
-                document.body.appendChild(vrButton);
-            } else {
-                console.warn('WebXR not supported in this browser.');
-            }
-        }
-        enableVR();
-    </script> -->
+    <h1>Hello, World!</h1>
+
+    <!-- Include the JavaScript file -->
+    <script type="module" src="vtk_webxr.js"></script>
 </body>
 </html>
