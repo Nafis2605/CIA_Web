@@ -48,8 +48,8 @@ with SinglePageLayout(server) as layout:
 
             # Add WebXR Button to enter VR mode
             
-            with vuetify.VBtn(icon=False, click=startVR):
-                vuetify.VTextField("VR START")
+            with vuetify.VBtn(icon=False, click="startVR()"):
+                variant="text"
                     
             
 
