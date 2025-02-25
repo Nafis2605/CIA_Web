@@ -1,45 +1,96 @@
-import trame
-from trame.ui.vuetify import SinglePageLayout, vApp, vMain, vContainer, vBtn
-from trame.widgets import html
+from trame.app import get_server
+from trame.ui.vuetify import SinglePageLayout
+from trame.widgets import vtk, vuetify, html
+from vtkmodules.vtkFiltersSources import vtkConeSource
+from vtkmodules.vtkRenderingCore import (
+    vtkActor,
+    vtkPolyDataMapper,
+    vtkRenderer,
+    vtkRenderWindow
+)
+# Required for rendering initialization, not necessary for local rendering
+import vtkmodules.vtkRenderingOpenGL2  # noqa
 
-# Create a Trame app instance
-app = trame.App()
+# -------------------------------------------------------------------------
+# VTK Pipeline
+# -------------------------------------------------------------------------
 
-# Define the layout of the page
-def layout():
-    # Using Vuetify's VApp as the main wrapper
-    with vApp():
-        # SinglePageLayout provides the framework for header, sidebar, and content
-        with SinglePageLayout() as layout:
-            # Define header content
-            layout.header = html.Div()  # You can put your HTML content here
+renderer = vtkRenderer()
+renderWindow = vtkRenderWindow()
+renderWindow.AddRenderer(renderer)
 
-            # Define the sidebar
-            layout.sidebar = html.Div()  # This will be a custom HTML sidebar
+# Simple VTK geometry (cone)
+cone_source = vtkConeSource()
+mapper = vtkPolyDataMapper()
+mapper.SetInputConnection(cone_source.GetOutputPort())
+actor = vtkActor()
+actor.SetMapper(mapper)
+
+renderer.AddActor(actor)
+renderer.ResetCamera()
+
+# -------------------------------------------------------------------------
+# Trame Server Setup
+# -------------------------------------------------------------------------
+
+server = get_server(client_type="vue2")
+
+with SinglePageLayout(server) as layout:
+    layout.title.set_text("WebXR with VTK LocalView")
+
+    with layout.content:
+        with vuetify.VContainer(
+            fluid=True,
+            classes="pa-0 fill-height",
+        ):
+            # Local VTK view
+            view = vtk.VtkLocalView(renderWindow)
+
+            # Add WebXR Button to enter VR mode
             
-            # Define the footer (optional)
-            layout.footer = html.Div()  # Your footer content
+            with vuetify.VBtn(icon=False, click=startVR):
+                vuetify.VTextField("VR START")
+                    
             
-            # Define the main content
-            layout.main = html.Div(
-                """<h2>Custom HTML Inside Trame</h2>
-                <p>This is your custom HTML content!</p>
-                <button id="myButton">Click me!</button>"""
-            )
 
-# Add JavaScript inside the layout
-@trame.route
-def javascript_code():
-    # JavaScript to handle button click inside the Trame application
-    return """
-        document.getElementById('myButton').addEventListener('click', function() {
-            alert('Button clicked!');
-        });
-    """
+            # JavaScript for enabling WebXR and integrating VTK with WebXR
+            layout.content.children += [
+                html.Script("""
+                    async function startVR() {
+                        if ('xr' in navigator) {
+                            const session = await navigator.xr.requestSession('immersive-vr', {
+                                requiredFeatures: ['local', 'viewer']
+                            });
 
-# Add the layout to the app
-layout()
+                            session.addEventListener('end', () => {
+                                console.log("VR session ended");
+                            });
 
-# Run the app
+                            // Get the WebXR rendering context
+                            const xrContext = session.renderState.baseLayer;
+
+                            // Associate VTK's render window with the WebXR context
+                            const canvas = document.querySelector('canvas');
+                            xrContext.getContext('webgl').bindFramebuffer(xrContext.framebuffer);
+
+                            // The WebXR session should handle rendering the VTK scene from here
+                            // The VTK rendering should be updated via the WebXR interface
+                            session.requestAnimationFrame((time, xrFrame) => {
+                                // Apply VTK render updates
+                                renderWindow.Render();
+                            });
+
+                            console.log('VR session started');
+                        } else {
+                            console.warn('WebXR not supported in this browser.');
+                        }
+                    }
+                """)
+            ]
+
+# -------------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    app.run()
+    server.start()
