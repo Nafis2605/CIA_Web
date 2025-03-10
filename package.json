@@ -1,15 +1,16 @@
 {
   "name": "cia_development",
   "version": "1.0.0",
-  "main": "index.js",
-  "type": "module",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
+  "description": "testing out vtk.js",
   "keywords": [],
-  "author": "",
   "license": "ISC",
-  "description": "",
+  "author": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "webpack --progress --mode=production",
+    "dev": "webpack-dev-server --mode=development"
+  },
   "dependencies": {
     "@kitware/vtk.js": "^32.10.0",
     "socket.io-client": "^4.8.1",
@@ -18,6 +19,10 @@
     "webxr-polyfill": "^2.0.3"
   },
   "devDependencies": {
+    "@babel/core": "^7.26.9",
+    "@babel/preset-env": "^7.26.9",
+    "babel-loader": "^9.2.1",
+    "kw-web-suite": "^11.1.0",
     "webpack": "^5.98.0",
     "webpack-cli": "^6.0.1"
   }
