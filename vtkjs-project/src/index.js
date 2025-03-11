@@ -1,3 +1,6 @@
+// For streamlined VR development install the WebXR emulator extension
+// https://github.com/MozillaReality/WebXR-emulator-extension
+
 import '@kitware/vtk.js/favicon';
 
 // Load the rendering pieces we want to use (for both WebGL and WebGPU)
@@ -7,13 +10,33 @@ import vtkActor from '@kitware/vtk.js/Rendering/Core/Actor';
 import vtkCalculator from '@kitware/vtk.js/Filters/General/Calculator';
 import vtkConeSource from '@kitware/vtk.js/Filters/Sources/ConeSource';
 import vtkFullScreenRenderWindow from '@kitware/vtk.js/Rendering/Misc/FullScreenRenderWindow';
+import vtkWebXRRenderWindowHelper from '@kitware/vtk.js/Rendering/WebXR/RenderWindowHelper';
 import vtkMapper from '@kitware/vtk.js/Rendering/Core/Mapper';
 import { AttributeTypes } from '@kitware/vtk.js/Common/DataModel/DataSetAttributes/Constants';
 import { FieldDataTypes } from '@kitware/vtk.js/Common/DataModel/DataSet/Constants';
+import { XrSessionTypes } from '@kitware/vtk.js/Rendering/WebXR/RenderWindowHelper/Constants';
 
-import vtkFPSMonitor from '@kitware/vtk.js/Interaction/UI/FPSMonitor';
+// Force DataAccessHelper to have access to various data source
+import '@kitware/vtk.js/IO/Core/DataAccessHelper/HtmlDataAccessHelper';
+import '@kitware/vtk.js/IO/Core/DataAccessHelper/HttpDataAccessHelper';
+import '@kitware/vtk.js/IO/Core/DataAccessHelper/JSZipDataAccessHelper';
 
+import vtkResourceLoader from '@kitware/vtk.js/IO/Core/ResourceLoader';
+
+// Custom UI controls, including button to start XR session
 import controlPanel from './controller.html';
+
+// Dynamically load WebXR polyfill from CDN for WebVR and Cardboard API backwards compatibility
+if (navigator.xr === undefined) {
+  vtkResourceLoader
+    .loadScript(
+      'https://cdn.jsdelivr.net/npm/webxr-polyfill@latest/build/webxr-polyfill.js'
+    )
+    .then(() => {
+      // eslint-disable-next-line no-new, no-undef
+      new WebXRPolyfill();
+    });
+}
 
 // ----------------------------------------------------------------------------
 // Standard rendering code setup
@@ -24,19 +47,9 @@ const fullScreenRenderer = vtkFullScreenRenderWindow.newInstance({
 });
 const renderer = fullScreenRenderer.getRenderer();
 const renderWindow = fullScreenRenderer.getRenderWindow();
-
-const fpsMonitor = vtkFPSMonitor.newInstance();
-const fpsElm = fpsMonitor.getFpsMonitorContainer();
-fpsElm.style.position = 'absolute';
-fpsElm.style.left = '10px';
-fpsElm.style.bottom = '10px';
-fpsElm.style.background = 'rgba(255,255,255,0.5)';
-fpsElm.style.borderRadius = '5px';
-
-fpsMonitor.setContainer(document.querySelector('body'));
-fpsMonitor.setRenderWindow(renderWindow);
-
-fullScreenRenderer.setResizeCallback(fpsMonitor.update);
+const XRHelper = vtkWebXRRenderWindowHelper.newInstance({
+  renderWindow: fullScreenRenderer.getApiSpecificRenderWindow(),
+});
 
 // ----------------------------------------------------------------------------
 // Example code
@@ -46,11 +59,7 @@ fullScreenRenderer.setResizeCallback(fpsMonitor.update);
 // this
 // ----------------------------------------------------------------------------
 
-const coneSource = vtkConeSource.newInstance({
-  center: [0, 500000, 0],
-  height: 1.0,
-});
-
+const coneSource = vtkConeSource.newInstance({ height: 100.0, radius: 50 });
 const filter = vtkCalculator.newInstance();
 
 filter.setInputConnection(coneSource.getOutputPort());
@@ -80,12 +89,11 @@ mapper.setInputConnection(filter.getOutputPort());
 
 const actor = vtkActor.newInstance();
 actor.setMapper(mapper);
-actor.setPosition(500000.0, 0.0, 0.0);
+actor.setPosition(0.0, 0.0, -20.0);
 
 renderer.addActor(actor);
 renderer.resetCamera();
 renderWindow.render();
-fpsMonitor.update();
 
 // -----------------------------------------------------------
 // UI control handling
@@ -94,19 +102,28 @@ fpsMonitor.update();
 fullScreenRenderer.addController(controlPanel);
 const representationSelector = document.querySelector('.representations');
 const resolutionChange = document.querySelector('.resolution');
+const vrbutton = document.querySelector('.vrbutton');
 
 representationSelector.addEventListener('change', (e) => {
   const newRepValue = Number(e.target.value);
   actor.getProperty().setRepresentation(newRepValue);
   renderWindow.render();
-  fpsMonitor.update();
 });
 
 resolutionChange.addEventListener('input', (e) => {
   const resolution = Number(e.target.value);
   coneSource.setResolution(resolution);
   renderWindow.render();
-  fpsMonitor.update();
+});
+
+vrbutton.addEventListener('click', (e) => {
+  if (vrbutton.textContent === 'Send To VR') {
+    XRHelper.startXR(XrSessionTypes.HmdVR);
+    vrbutton.textContent = 'Return From VR';
+  } else {
+    XRHelper.stopXR();
+    vrbutton.textContent = 'Send To VR';
+  }
 });
 
 // -----------------------------------------------------------
