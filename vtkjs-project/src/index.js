@@ -8,11 +8,12 @@ import '@kitware/vtk.js/Rendering/Profiles/Geometry';
 
 import vtkActor from '@kitware/vtk.js/Rendering/Core/Actor';
 import vtkCalculator from '@kitware/vtk.js/Filters/General/Calculator';
-import vtkConeSource from '@kitware/vtk.js/Filters/Sources/ConeSource';
 import vtkFullScreenRenderWindow from '@kitware/vtk.js/Rendering/Misc/FullScreenRenderWindow';
 import vtkWebXRRenderWindowHelper from '@kitware/vtk.js/Rendering/WebXR/RenderWindowHelper';
 import vtkMapper from '@kitware/vtk.js/Rendering/Core/Mapper';
-import vtkPolyDataReader from '@kitware/vtk.js/IO/Legacy/PolyDataReader';
+import vtkXMLPolyDataReader from '@kitware/vtk.js/IO/XML/XMLPolyDataReader';
+import vtkPolyDataNormals from '@kitware/vtk.js/Filters/Core/PolyDataNormals';
+
 import { AttributeTypes } from '@kitware/vtk.js/Common/DataModel/DataSetAttributes/Constants';
 import { FieldDataTypes } from '@kitware/vtk.js/Common/DataModel/DataSet/Constants';
 import { XrSessionTypes } from '@kitware/vtk.js/Rendering/WebXR/RenderWindowHelper/Constants';
@@ -26,6 +27,9 @@ import vtkResourceLoader from '@kitware/vtk.js/IO/Core/ResourceLoader';
 
 // Custom UI controls, including button to start XR session
 import controlPanel from './controller.html';
+import vtkColorTransferFunction from '@kitware/vtk.js/Rendering/Core/ColorTransferFunction';
+import { colorSpaceToWorking } from 'three/tsl';
+import vtkPolyData from '@kitware/vtk.js/Common/DataModel/PolyData';
 
 // Dynamically load WebXR polyfill from CDN for WebVR and Cardboard API backwards compatibility
 if (navigator.xr === undefined) {
@@ -50,7 +54,14 @@ const renderer = fullScreenRenderer.getRenderer();
 const renderWindow = fullScreenRenderer.getRenderWindow();
 const XRHelper = vtkWebXRRenderWindowHelper.newInstance({
   renderWindow: fullScreenRenderer.getApiSpecificRenderWindow(),
+  drawControllersRay: true,
 });
+
+// function update() {
+//   const render = renderWindow.render;
+//   renderer.resetCamera();
+//   render();
+// }
 
 // ----------------------------------------------------------------------------
 // Example code
@@ -62,100 +73,80 @@ const XRHelper = vtkWebXRRenderWindowHelper.newInstance({
 
 // const coneSource = vtkConeSource.newInstance({ height: 100.0, radius: 50 });
 
-// Handle the file upload
-function handleFileUpload(event) {
-  const file = event.target.files[0];  // Get the selected file
-  if (!file) {
-    alert('No file selected!');
-    return;
-  }
+// const reader = vtkXMLPolyDataReader.newInstance();
 
-  const reader = vtkPolyDataReader.newInstance();
-  
-  // Use FileReader to read the uploaded file as ArrayBuffer
-  const fileReader = new FileReader();
+const vtpReader = vtkXMLPolyDataReader.newInstance();
 
-  fileReader.onload = function(e) {
-    const arrayBuffer = e.target.result;
 
-    // Parse the file using vtkPolyDataReader
-    reader.parseAsArrayBuffer(arrayBuffer)
-      .then(() => {
-        const polydata = reader.getOutputData(0);
-        const mapper = vtkMapper.newInstance();
-        const actor = vtkActor.newInstance();
-
-        mapper.setInputData(polydata);
-
-        // Create a filter (this is the same code you're using for random scalars)
-        const filter = vtkCalculator.newInstance();
-        filter.setInputConnection(reader.getOutputPort());
-        filter.setFormula({
-          getArrays: (inputDataSets) => ({
-            input: [],
-            output: [
-              {
-                location: FieldDataTypes.CELL,
-                name: 'Random',
-                dataType: 'Float32Array',
-                attribute: AttributeTypes.SCALARS,
-              },
-            ],
-          }),
-          evaluate: (arraysIn, arraysOut) => {
-            const [scalars] = arraysOut.map((d) => d.getData());
-            for (let i = 0; i < scalars.length; i++) {
-              scalars[i] = Math.random();
-            }
-          },
-        });
-
-        mapper.setInputConnection(filter.getOutputPort());
-
-        actor.setMapper(mapper);
-        actor.setPosition(0.0, 0.0, -20.0);
-
-        // Clear existing actors and add the new actor
-        renderer.removeAllActors();
-        renderer.addActor(actor);
-        renderer.resetCamera();
-        renderWindow.render();
-      })
-      .catch((err) => {
-        alert('Error reading or parsing the file: ' + err);
-      });
-  };
-
-  // Read the file as an ArrayBuffer
-  fileReader.readAsArrayBuffer(file);
+function preventDefaults(e) {
+  e.preventDefault();
+  e.stopPropagation();
 }
 
-  // -----------------------------------------------------------
-  // UI control handling
-  // -----------------------------------------------------------
+function createPipeline(fileContents){
+  vtpReader.parseAsArrayBuffer(fileContents);
+}
 
-  fullScreenRenderer.addController(controlPanel);
-  const representationSelector = document.querySelector('.representations');
-  const vrbutton = document.querySelector('.vrbutton');
-  const fileInput = document.getElementById("fileInput");
+function loadFile(file){
+  const reader = new FileReader();
+  reader.onload = function onLoad(e){
+    // createPipeline(reader.result);
 
+  };
+  reader.readAsArrayBuffer(file);
+}
 
-  representationSelector.addEventListener('change', (e) => {
-    const newRepValue = Number(e.target.value);
-    actor.getProperty().setRepresentation(newRepValue);
-    renderWindow.render();
-  });
+const source = vtpReader.getOutputData(0);
+const mapper = vtkMapper.newInstance();
+const actor = vtkActor.newInstance();
 
-  vrbutton.addEventListener('click', (e) => {
-    if (vrbutton.textContent === 'Send To VR') {
-      XRHelper.startXR(XrSessionTypes.HmdVR);
-      vrbutton.textContent = 'Return From VR';
-    } else {
-      XRHelper.stopXR();
-      vrbutton.textContent = 'Send To VR';
-    }
+actor.setMapper(mapper);
+
+function handleFile(e){
+  preventDefaults(e);
+  const dataTransfer = e.dataTransfer;
+  const files = e.target.files || dataTransfer.files;
+  if (files.length > 0){
+    const file = files[0];
+    // loadFile(file);
+    const fileReader = new FileReader();
+    fileReader.onload = function onLoad(e){
+      vtpReader.parseAsArrayBuffer(fileReader.result);
+      mapper.setInputData(vtpReader.getOutputData(0));
+      renderer.addActor(actor)
+      renderer.resetCamera();
+      renderWindow.render();
+    };
+    fileReader.readAsArrayBuffer(files[0]);
+  }
+}
+
+// -----------------------------------------------------------
+// UI control handling
+// -----------------------------------------------------------
+fullScreenRenderer.addController(controlPanel);
+const representationSelector = document.querySelector('.representations');
+const vrbutton = document.querySelector('.vrbutton');
+const fileInput = document.getElementById('fileInput');
+
+fileInput.addEventListener('change', handleFile);
+
+representationSelector.addEventListener('change', (e) => {
+  const newRepValue = Number(e.target.value);
+  actor.getProperty().setRepresentation(newRepValue);
+  renderWindow.render();
 });
-fileInput.addEventListener('change', handleFileUpload);
+
+vrbutton.addEventListener('click', (e) => {
+  if (vrbutton.textContent === 'Send To VR') {
+    XRHelper.startXR(XrSessionTypes.MobileAR);
+    vrbutton.textContent = 'Return From VR';
+  } else {
+    XRHelper.stopXR();
+    vrbutton.textContent = 'Send To VR';
+  }
+});
+
 // -----------------------------------------------------------
 // Make some variables global so that you can inspect and
 // modify objects in your browser's developer console:
@@ -166,4 +157,6 @@ fileInput.addEventListener('change', handleFileUpload);
 // global.actor = actor;
 // global.renderer = renderer;
 // global.renderWindow = renderWindow;
-global.fullScreenRenderer = fullScreenRenderer;
+
+// global.reader = reader;
+// global.fullScreenRenderer = fullScreenRenderer;
