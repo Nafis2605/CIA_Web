@@ -26,9 +26,8 @@ import '@kitware/vtk.js/IO/Core/DataAccessHelper/JSZipDataAccessHelper';
 import vtkResourceLoader from '@kitware/vtk.js/IO/Core/ResourceLoader';
 
 // Custom UI controls, including button to start XR session
-import controlPanel from './controller.html';
+import controlPanel from './controller.js';
 import vtkColorTransferFunction from '@kitware/vtk.js/Rendering/Core/ColorTransferFunction';
-import { colorSpaceToWorking } from 'three/tsl';
 import vtkPolyData from '@kitware/vtk.js/Common/DataModel/PolyData';
 
 // Dynamically load WebXR polyfill from CDN for WebVR and Cardboard API backwards compatibility
@@ -49,6 +48,7 @@ if (navigator.xr === undefined) {
 
 const fullScreenRenderer = vtkFullScreenRenderWindow.newInstance({
   background: [0, 0, 0],
+  rootContainer: document.getElementById('vtk-container')
 });
 const renderer = fullScreenRenderer.getRenderer();
 const renderWindow = fullScreenRenderer.getRenderWindow();
@@ -57,60 +57,42 @@ const XRHelper = vtkWebXRRenderWindowHelper.newInstance({
   drawControllersRay: true,
 });
 
-// function update() {
-//   const render = renderWindow.render;
-//   renderer.resetCamera();
-//   render();
-// }
-
 // ----------------------------------------------------------------------------
 // Example code
 // ----------------------------------------------------------------------------
-// create a filter on the fly, sort of cool, this is a random scalars
-// filter we create inline, for a simple cone you would not need
-// this
-// ----------------------------------------------------------------------------
-
-// const coneSource = vtkConeSource.newInstance({ height: 100.0, radius: 50 });
-
-// const reader = vtkXMLPolyDataReader.newInstance();
 
 const vtpReader = vtkXMLPolyDataReader.newInstance();
-
 
 function preventDefaults(e) {
   e.preventDefault();
   e.stopPropagation();
 }
 
-function createPipeline(fileContents){
+function createPipeline(fileContents) {
   vtpReader.parseAsArrayBuffer(fileContents);
 }
 
-function loadFile(file){
+function loadFile(file) {
   const reader = new FileReader();
-  reader.onload = function onLoad(e){
-    // createPipeline(reader.result);
-
+  reader.onload = function onLoad(e) {
+    createPipeline(reader.result);
   };
   reader.readAsArrayBuffer(file);
 }
 
-const source = vtpReader.getOutputData(0);
 const mapper = vtkMapper.newInstance();
 const actor = vtkActor.newInstance();
 
 actor.setMapper(mapper);
 
-function handleFile(e){
+function handleFile(e) {
   preventDefaults(e);
   const dataTransfer = e.dataTransfer;
   const files = e.target.files || dataTransfer.files;
-  if (files.length > 0){
+  if (files.length > 0) {
     const file = files[0];
-    // loadFile(file);
     const fileReader = new FileReader();
-    fileReader.onload = function onLoad(e){
+    fileReader.onload = function onLoad(e) {
       vtpReader.parseAsArrayBuffer(fileReader.result);
       mapper.setInputData(vtpReader.getOutputData(0));
       renderer.addActor(actor)
@@ -124,7 +106,13 @@ function handleFile(e){
 // -----------------------------------------------------------
 // UI control handling
 // -----------------------------------------------------------
-fullScreenRenderer.addController(controlPanel);
+
+// Insert the control panel into the DOM
+const controllerContainer = document.createElement('div');
+controllerContainer.innerHTML = controlPanel;
+fullScreenRenderer.addController(controllerContainer);
+
+// Attach event listeners
 const representationSelector = document.querySelector('.representations');
 const vrbutton = document.querySelector('.vrbutton');
 const fileInput = document.getElementById('fileInput');
@@ -146,17 +134,3 @@ vrbutton.addEventListener('click', (e) => {
     vrbutton.textContent = 'Send To VR';
   }
 });
-
-// -----------------------------------------------------------
-// Make some variables global so that you can inspect and
-// modify objects in your browser's developer console:
-// -----------------------------------------------------------
-
-// global.source = coneSource;
-// global.mapper = mapper;
-// global.actor = actor;
-// global.renderer = renderer;
-// global.renderWindow = renderWindow;
-
-// global.reader = reader;
-// global.fullScreenRenderer = fullScreenRenderer;
