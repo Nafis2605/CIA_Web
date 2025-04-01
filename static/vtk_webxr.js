@@ -1,6 +1,6 @@
 import * as THREE from 'three';
-import { VRButton } from 'three/examples/jsm/webxr/VRButton.js';
-import vtkFullScreenRenderWindow from '@kitware/vtk.js/Rendering/Misc/FullScreenRenderWindow';
+import { VRButton } from '../node_modules/three/examples/jsm/webxr/VRButton.js';
+import vtkFullScreenRenderWindow from '../node_modules/@kitware/vtk.js/Rendering/Misc/FullScreenRenderWindow.js';
 import { io } from 'socket.io-client';  // Ensure you have socket.io-client installed
 
 // Initialize vtk.js rendering window
