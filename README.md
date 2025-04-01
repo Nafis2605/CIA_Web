@@ -1,30 +1,29 @@
 # CIA_Web
 
 
-## WebXR With Trame Backend
+## Project Overview
 
-This project integrates WebXR with a **Trame backend** to enable immersive visualization in Virtual Reality (VR) using **Three.js** and **VTK.js**.
+A web-based, real-time collaborative platform for immersive scientific data visualization and analysis, leveraging advanced technologies for multi-user interaction and high-dimensional data exploration.
 
-## Installation
+## Instructions
 
-### 1. Install Python Dependencies
-Ensure you have Python installed, then install the required Python packages:
-```sh
-pip install trame trame-vtk trame-client flask-socketio
-```
+1. Install node dependencies from the `dependencies.txt` file:
 
-### 2. Install JavaScript Dependencies
-Install the required JavaScript libraries using npm:
-```sh
-npm install three@latest @webxr/webxr-polyfill vtk.js
-```
+   ```bash
+   xargs npm install < dependencies.txt
+   ```
 
-## Running the Server from VS Code Terminal
+2. Start the server from terminal
+   ```bash
+   npm start
+   ```
+3. Open Google Chrome and go to:
+   ```bash
+   http://localhost:9000/
+   ```
+4. Upload a **.vtp** file from the **vtp_files** folder manually.
 
-Start the Trame server by executing from terminal:
-```sh
-python app.py
-```
+5. Open Developer Tools in Chrome: Right click > Inspect > WebXR
 
 ## Accessing WebXR
 
@@ -41,6 +40,5 @@ Before running the WebXR experience, enable the following flags in Chrome/Edge:
 4. Restart the browser.
 
 ### Entering VR Mode
-1. Open the application in a WebXR-compatible browser.
-2. Click the **'Enter VR'** button.
-3. Put on your VR headset and enjoy the experience!
+1. Click the **'Enter VR'** button.
+2. Put on your VR headset and enjoy the experience!
