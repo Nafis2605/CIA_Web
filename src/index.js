@@ -139,7 +139,7 @@ representationSelector.addEventListener('change', (e) => {
 
 vrbutton.addEventListener('click', (e) => {
   if (vrbutton.textContent === 'Send To VR') {
-    XRHelper.startXR(XrSessionTypes.MobileAR);
+    XRHelper.startXR(XrSessionTypes.InlineVr);
     vrbutton.textContent = 'Return From VR';
   } else {
     XRHelper.stopXR();
