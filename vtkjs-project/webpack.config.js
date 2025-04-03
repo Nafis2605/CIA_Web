@@ -41,7 +41,7 @@ module.exports = {
         directory: path.join(__dirname, 'dist'),  // Serve static files from 'dist'
         },
         compress: true,  // Enable gzip compression
-        port: 9000,  // The port to run the server on
+        port: 8080,  // The port to run the server on
         open: true,  // Automatically open the browser
         hot: true,  // Enable Hot Module Replacement
     },
