@@ -12,18 +12,21 @@ A web-based, real-time collaborative platform for immersive scientific data visu
    ```bash
    xargs npm install < dependencies.txt
    ```
-
-2. Start the server from terminal
+2. Start the WebSocket server from terminal
    ```bash
-   npm start
+   node server.js
    ```
-3. Open Google Chrome and go to:
+3. Start the server from a separate terminal
    ```bash
-   http://localhost:9000/
+   npm run start
    ```
-4. Upload a **.vtp** file from the **vtp_files** folder manually.
+4. Open Google Chrome and go to:
+   ```bash
+   http://localhost:8080/
+   ```
+5. Upload a **.vtp** file from the **vtp_files** folder manually.
 
-5. Open Developer Tools in Chrome: Right click > Inspect > WebXR
+6. Open Developer Tools in Chrome: Right click > Inspect > WebXR
 
 ## Accessing WebXR
 
