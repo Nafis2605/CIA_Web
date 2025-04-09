@@ -14,6 +14,8 @@ import vtkMapper from '@kitware/vtk.js/Rendering/Core/Mapper';
 import vtkXMLPolyDataReader from '@kitware/vtk.js/IO/XML/XMLPolyDataReader';
 import vtkPolyDataNormals from '@kitware/vtk.js/Filters/Core/PolyDataNormals';
 import vtkRemoteView from '@kitware/vtk.js/Rendering/Misc/RemoteView';
+import vtkOrientationMarkerWidget from '@kitware/vtk.js/Interaction/Widgets/OrientationMarkerWidget';
+import vtkAnnotatedCubeActor from '@kitware/vtk.js/Rendering/Core/AnnotatedCubeActor';
 
 import { AttributeTypes } from '@kitware/vtk.js/Common/DataModel/DataSetAttributes/Constants';
 import { FieldDataTypes } from '@kitware/vtk.js/Common/DataModel/DataSet/Constants';
@@ -108,11 +110,56 @@ function createRemoteSession(){
   return socket;
 }
 
-// Send data to other tabs via WebSocket
-function sendDataToAllTabs(data){
-  if (socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify(data)); // Ensure you are sending valid JSON
-  }
+function createOrientationMarker(){
+  // create axes
+  const axes = vtkAnnotatedCubeActor.newInstance();
+  axes.setDefaultStyle({
+    text: '+X',
+    fontStyle: 'bold',
+    fontFamily: 'Arial',
+    fontColor: 'black',
+    fontSizeScale: (res) => res / 2,
+    faceColor: '#0000ff',
+    faceRotation: 0,
+    edgeThickness: 0.1,
+    edgeColor: 'black',
+    resolution: 400,
+  });
+  // axes.setXPlusFaceProperty({ text: '+X' });
+  axes.setXMinusFaceProperty({
+    text: '-X',
+    faceColor: '#ffff00',
+    faceRotation: 90,
+    fontStyle: 'italic',
+  });
+  axes.setYPlusFaceProperty({
+    text: '+Y',
+    faceColor: '#00ff00',
+    fontSizeScale: (res) => res / 4,
+  });
+  axes.setYMinusFaceProperty({
+    text: '-Y',
+    faceColor: '#00ffff',
+    fontColor: 'white',
+  });
+  axes.setZPlusFaceProperty({
+    text: '+Z',
+    edgeColor: 'yellow',
+  });
+  axes.setZMinusFaceProperty({ text: '-Z', faceRotation: 45, edgeThickness: 0 });
+
+  // create orientation widget
+  const orientationWidget = vtkOrientationMarkerWidget.newInstance({
+    actor: axes,
+    interactor: renderWindow.getInteractor(),
+  });
+  orientationWidget.setEnabled(true);
+  orientationWidget.setViewportCorner(
+    vtkOrientationMarkerWidget.Corners.BOTTOM_RIGHT
+  );
+  orientationWidget.setViewportSize(0.15);
+  orientationWidget.setMinPixelSize(100);
+  orientationWidget.setMaxPixelSize(300);
 }
 
 // Function to update the scene in response to received data
@@ -134,6 +181,8 @@ function updateScene(fileData) {
 
   const actor = vtkActor.newInstance();
   actor.setMapper(mapper);
+
+  createOrientationMarker();
   
   // Reset the camera and render the scene
   renderer.addActor(actor);
