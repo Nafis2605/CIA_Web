@@ -10,32 +10,56 @@ wss.on('connection', (ws) => {
 
   // Handle incoming messages from clients (browser tabs)
   ws.on('message', (message) => {
-    if (Buffer.isBuffer(message)) {
-      console.log('Received a binary file (VTK file):', message);
-      
-      // Broadcast the binary data to all connected clients (except the sender)
-      wss.clients.forEach(client => {
-        if (client !== ws && client.readyState === WebSocket.OPEN) {
-          client.send(message);  // Send binary data to other clients
-        }
-      });
-    }
-    else{
-      try {
-      console.log('Received non-binary message:', message);
-      const parsedMessage = JSON.parse(message); // Parse the message
-
-      // Broadcast the received message to all clients (except sender)
+    // Try to parse as JSON string first
+    try {
+      const str = message.toString('utf8');
+      const parsed = JSON.parse(str);
+  
+      console.log('Received JSON message:', parsed);
+  
+      // Broadcast to other clients
       wss.clients.forEach((client) => {
         if (client !== ws && client.readyState === WebSocket.OPEN) {
-          client.send(JSON.stringify(parsedMessage));  // Send the message to other clients
+          client.send(JSON.stringify(parsed));
         }
       });
-      } catch (e) {
-        console.error('Error parsing message:', e);
-      }
+  
+    } catch (err) {
+      // If not JSON, then treat it as binary (assume it's a VTK file)
+      console.log('Received binary VTK file:', message);
+  
+      wss.clients.forEach((client) => {
+        if (client !== ws && client.readyState === WebSocket.OPEN) {
+          client.send(message);
+        }
+      });
     }
   });
+    // if (Buffer.isBuffer(message)) {
+    //   console.log('Received a binary file (VTK file):', message);
+      
+    //   // Broadcast the binary data to all connected clients (except the sender)
+    //   wss.clients.forEach(client => {
+    //     if (client !== ws && client.readyState === WebSocket.OPEN) {
+    //       client.send(message);  // Send binary data to other clients
+    //     }
+    //   });
+    // }
+    // else{
+    //   try {
+    //   console.log('Received non-binary message:', message);
+    //   const parsedMessage = JSON.parse(message); // Parse the message
+
+    //   // Broadcast the received message to all clients (except sender)
+    //   wss.clients.forEach((client) => {
+    //     if (client !== ws && client.readyState === WebSocket.OPEN) {
+    //       client.send(JSON.stringify(parsedMessage));  // Send the message to other clients
+    //     }
+    //   });
+    //   } catch (e) {
+    //     console.error('Error parsing message:', e);
+    //   }
+    // }
 
   // Handle client disconnect
   ws.on('close', () => {

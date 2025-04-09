@@ -16,6 +16,7 @@ import vtkPolyDataNormals from '@kitware/vtk.js/Filters/Core/PolyDataNormals';
 import vtkRemoteView from '@kitware/vtk.js/Rendering/Misc/RemoteView';
 import vtkOrientationMarkerWidget from '@kitware/vtk.js/Interaction/Widgets/OrientationMarkerWidget';
 import vtkAnnotatedCubeActor from '@kitware/vtk.js/Rendering/Core/AnnotatedCubeActor';
+import vtkInteractorStyleTrackballCamera from '@kitware/vtk.js/Interaction/Style/InteractorStyleTrackballCamera';
 
 import { AttributeTypes } from '@kitware/vtk.js/Common/DataModel/DataSetAttributes/Constants';
 import { FieldDataTypes } from '@kitware/vtk.js/Common/DataModel/DataSet/Constants';
@@ -73,6 +74,8 @@ remoteView.setSession(remoteSession);
 // WebSocket Setup
 // ----------------------------------------------------------------------------
 
+let currentActor = null;
+
 function createRemoteSession(){
 
   socket.onopen = function(){
@@ -84,18 +87,44 @@ function createRemoteSession(){
     // Handle incoming messages, update the renderering as necessary
     const data = event.data;
     console.log(data);
-    // if(data.type === 'update'){
-    //   renderWindow.render();
-    // }
-    // if(data.type === 'file-upload'){
-      // If a file was uploaded in another tab, update the scene
-      // const fileData = data.fileData;
-      // Make sure fileData is an ArrayBuffer before passing it to vtkXMLPolyDataReader
+    // Make sure fileData is an ArrayBuffer before passing it to vtkXMLPolyDataReader
     if (data instanceof ArrayBuffer) {
       console.log('Received binary data (VTK file)');
       updateScene(data);
-    } else {
-      console.error('Received data is not an ArrayBuffer');
+      return;
+    } 
+    // Try to parse JSON messages
+    try {
+      const message = JSON.parse(data);
+
+      if (message.type === 'camera-update') {
+        console.log('Received camera update:', data);
+
+        if(!message.position || !message.focalPoint || !message.viewUp){
+          console.warn("Incomplete camera data:", data);
+          return;
+        }
+        else{
+          if (!currentActor) {
+            console.warn("No actor in scene. Camera update skipped.");
+            return;
+          }          
+          console.log(currentActor.getPosition());
+          const camera = renderer.getActiveCamera();
+          // console.log('Before:', camera.getPosition());
+          camera.setPosition(message.position);
+          // console.log('After:', camera.getPosition());
+          camera.setFocalPoint(message.focalPoint);
+          camera.setViewUp(message.viewUp);
+          
+          renderer.resetCamera();
+          renderWindow.render(); 
+
+          console.log(currentActor.getPosition());
+        }
+      }
+    } catch (err) {
+      console.error('Failed to parse message:', err);
     }
   };
 
@@ -188,6 +217,25 @@ function updateScene(fileData) {
   renderer.addActor(actor);
   renderer.resetCamera();
   renderWindow.render();
+
+  currentActor = actor;
+
+  const interactor = renderWindow.getInteractor();
+  const style = vtkInteractorStyleTrackballCamera.newInstance();
+  interactor.setInteractorStyle(style);
+
+  style.onInteractionEvent(() => {
+    const camera = renderer.getActiveCamera();
+    const cameraState = {
+      type: 'camera-update',
+      position: camera.getPosition(),
+      focalPoint: camera.getFocalPoint(),
+      viewUp: camera.getViewUp(),
+    };
+
+    // send through WebSocket
+    socket.send(JSON.stringify(cameraState));    
+  });
 }
 // const mouseEventHandler = (event) => {
 //   //handle mouse event and pass it to the remote server
