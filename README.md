@@ -27,7 +27,6 @@ A web-based, real-time collaborative platform for immersive scientific data visu
 5. Upload a **.vtp** file from the **vtp_files** folder manually.
 
 6. Open Developer Tools in Chrome: Right click > Inspect > WebXR
-<br  />Note: Reload page if the WebXR Emulator is not detected!
 
 ## Accessing WebXR
 
