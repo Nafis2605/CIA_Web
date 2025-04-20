@@ -70,6 +70,8 @@ socket.binaryType = 'arraybuffer'; // Set binaryType to 'arraybuffer' to receive
 
 const remoteSession = createRemoteSession();
 remoteView.setSession(remoteSession);
+
+const camera = renderer.getActiveCamera();
 // ----------------------------------------------------------------------------
 // WebSocket Setup
 // ----------------------------------------------------------------------------
@@ -104,23 +106,21 @@ function createRemoteSession(){
           console.warn("Incomplete camera data:", data);
           return;
         }
-        else{
-          if (!currentActor) {
-            console.warn("No actor in scene. Camera update skipped.");
-            return;
-          }          
-          console.log(currentActor.getPosition());
-          const camera = renderer.getActiveCamera();
-          // console.log('Before:', camera.getPosition());
-          camera.setPosition(message.position);
-          // console.log('After:', camera.getPosition());
-          camera.setFocalPoint(message.focalPoint);
-          camera.setViewUp(message.viewUp);
+        else{         
+          console.log('Message:', message);
           
-          renderer.resetCamera();
-          renderWindow.render(); 
+          // camera.setPosition(message.position[0], message.position[1], message.position[2]);
+          // camera.setFocalPoint(message.focalPoint[0], message.focalPoint[1], message.focalPoint[2]);
+          // camera.setViewUp(message.viewUp[0], message.viewUp[1], message.viewUp[2]);
+          camera.setPosition(...message.position);
+          camera.setFocalPoint(...message.focalPoint);
+          camera.setViewUp(...message.viewUp);
 
-          console.log(currentActor.getPosition());
+          console.log(camera.getPosition());
+          console.log(camera.getFocalPoint());
+          console.log(camera.getViewUp());
+          
+          renderWindow.render(); 
         }
       }
     } catch (err) {
@@ -225,7 +225,8 @@ function updateScene(fileData) {
   interactor.setInteractorStyle(style);
 
   style.onInteractionEvent(() => {
-    const camera = renderer.getActiveCamera();
+    // const camera = renderer.getActiveCamera();
+
     const cameraState = {
       type: 'camera-update',
       position: camera.getPosition(),
@@ -234,7 +235,7 @@ function updateScene(fileData) {
     };
 
     // send through WebSocket
-    socket.send(JSON.stringify(cameraState));    
+    socket.send(JSON.stringify(cameraState));
   });
 }
 // const mouseEventHandler = (event) => {
