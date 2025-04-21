@@ -99,30 +99,37 @@ function createRemoteSession(){
     try {
       const message = JSON.parse(data);
 
-      if (message.type === 'camera-update') {
-        console.log('Received camera update:', data);
-
-        if(!message.position || !message.focalPoint || !message.viewUp){
-          console.warn("Incomplete camera data:", data);
-          return;
-        }
-        else{         
-          console.log('Message:', message);
-          
-          // camera.setPosition(message.position[0], message.position[1], message.position[2]);
-          // camera.setFocalPoint(message.focalPoint[0], message.focalPoint[1], message.focalPoint[2]);
-          // camera.setViewUp(message.viewUp[0], message.viewUp[1], message.viewUp[2]);
-          camera.setPosition(...message.position);
-          camera.setFocalPoint(...message.focalPoint);
-          camera.setViewUp(...message.viewUp);
-
-          console.log(camera.getPosition());
-          console.log(camera.getFocalPoint());
-          console.log(camera.getViewUp());
-          
-          renderWindow.render(); 
+      if (message.type === 'actor-update') {
+        if (currentActor) {
+          // Apply the new actor position received from WebSocket
+          currentActor.setPosition(...message.position);
+          renderWindow.render();
         }
       }
+      // if (message.type === 'camera-update') {
+      //   console.log('Received camera update:', data);
+
+      //   if(!message.position || !message.focalPoint || !message.viewUp){
+      //     console.warn("Incomplete camera data:", data);
+      //     return;
+      //   }
+      //   else{         
+      //     console.log('Message:', message);
+          
+      //     // camera.setPosition(message.position[0], message.position[1], message.position[2]);
+      //     // camera.setFocalPoint(message.focalPoint[0], message.focalPoint[1], message.focalPoint[2]);
+      //     // camera.setViewUp(message.viewUp[0], message.viewUp[1], message.viewUp[2]);
+      //     camera.setPosition(...message.position);
+      //     camera.setFocalPoint(...message.focalPoint);
+      //     camera.setViewUp(...message.viewUp);
+
+      //     console.log(camera.getPosition());
+      //     console.log(camera.getFocalPoint());
+      //     console.log(camera.getViewUp());
+          
+      //     renderWindow.render(); 
+      //   }
+      // }
     } catch (err) {
       console.error('Failed to parse message:', err);
     }
@@ -193,6 +200,8 @@ function createOrientationMarker(){
 
 // Function to update the scene in response to received data
 function updateScene(fileData) {
+  console.log("Update Scene Camera position: ", camera.getPosition());
+
   // Make sure the fileData is an ArrayBuffer before passing it to vtkXMLPolyDataReader
   if (!(fileData instanceof ArrayBuffer)) {
     console.error('Expected ArrayBuffer but received:', fileData);
@@ -224,19 +233,71 @@ function updateScene(fileData) {
   const style = vtkInteractorStyleTrackballCamera.newInstance();
   interactor.setInteractorStyle(style);
 
+  let actorStartPos = null;
+  let isDraggingActor = false;
+  let mouseStartPos = [0,0];
+
   style.onInteractionEvent(() => {
-    // const camera = renderer.getActiveCamera();
+    // // const camera = renderer.getActiveCamera();
 
-    const cameraState = {
-      type: 'camera-update',
-      position: camera.getPosition(),
-      focalPoint: camera.getFocalPoint(),
-      viewUp: camera.getViewUp(),
-    };
+    // const cameraState = {
+    //   type: 'camera-update',
+    //   position: camera.getPosition(),
+    //   focalPoint: camera.getFocalPoint(),
+    //   viewUp: camera.getViewUp(),
+    // };
 
-    // send through WebSocket
-    socket.send(JSON.stringify(cameraState));
+    // // send through WebSocket
+    // socket.send(JSON.stringify(cameraState));
+    if (isDraggingActor) {
+      const mousePos = renderWindow.getInteractor().getEventPosition();
+      const deltaX = mousePos[0] - mouseStartPos[0];
+      const deltaY = mousePos[1] - mouseStartPos[1];
+  
+      // Adjust actor's position based on mouse movement (scale the delta if needed)
+      const actorPos = currentActor.getPosition();
+      currentActor.setPosition(
+        actorStartPos[0] + deltaX * 0.01,
+        actorStartPos[1] - deltaY * 0.01,  // Negative Y for typical screen coordinates
+        actorPos[2]
+      );
+  
+      sendActorPosition();
+
+      renderWindow.render();
+    }
   });
+
+  style.onButtonPress((callData) => {
+    if (callData.button === 0) {  // Left mouse button
+      // Check if the actor is clicked
+      const clickPos = renderWindow.getInteractor().getEventPosition();
+  
+      // Use a raycast or some logic to determine if the actor was clicked
+      // In this simple case, let's assume it's always clicked
+      isDraggingActor = true;
+      actorStartPos = currentActor.getPosition();
+      mouseStartPos = clickPos;  // Store the starting mouse position
+    }
+  });
+
+  style.onButtonRelease(() => {
+    isDraggingActor = false;
+    actorStartPos = null;
+    mouseStartPos = [0, 0];
+  });
+}
+
+// Function to send updated actor position to WebSocket
+function sendActorPosition() {
+  if (currentActor) {
+    const actorPos = currentActor.getPosition();
+    const actorState = {
+      type: 'actor-update',
+      position: actorPos
+    };
+    socket.send(JSON.stringify(actorState));
+  }
 }
 // const mouseEventHandler = (event) => {
 //   //handle mouse event and pass it to the remote server
