@@ -70,8 +70,51 @@ socket.binaryType = 'arraybuffer'; // Set binaryType to 'arraybuffer' to receive
 
 const remoteSession = createRemoteSession();
 remoteView.setSession(remoteSession);
+const interactor = renderWindow.getInteractor();
 
 const camera = renderer.getActiveCamera();
+
+let actorStartOrient = null;
+let isDraggingActor = false;
+let mouseStartPos = null;
+
+interactor.onMouseMove((callData) => {
+  if (isDraggingActor && currentActor) {
+    const mousePos = callData.position;
+    console.log('mouse position: ', mousePos.x);
+    const deltaX = mousePos.x - mouseStartPos.x;
+    const deltaY = mousePos.y - mouseStartPos.y;
+    console.log("delta x: ", deltaX);
+    console.log("delta y: ", deltaY);
+
+    const actorOrient = actorStartOrient;
+    currentActor.setOrientation(
+      actorOrient[0] - deltaY * 0.1,
+      actorOrient[1] + deltaX * 0.1, // flip Y
+      actorOrient[2]
+    );
+
+    sendActorPosition();
+    camera.setPosition(...defaultCameraPosition);
+    camera.setFocalPoint(...defaultCameraFocalPoint);
+    camera.setViewUp(...defaultCameraviewUp);
+    renderWindow.render();
+  }
+});
+
+
+interactor.onLeftButtonPress((callData) => {
+    isDraggingActor = true;
+    actorStartOrient = [...currentActor.getOrientation()];
+    console.log(actorStartOrient);
+    mouseStartPos = callData.position;  // Store the starting mouse position
+});
+
+interactor.onLeftButtonRelease(() => {
+  isDraggingActor = false;
+  actorStartOrient = null;
+  mouseStartPos = [0, 0];
+});
 // ----------------------------------------------------------------------------
 // WebSocket Setup
 // ----------------------------------------------------------------------------
@@ -102,34 +145,10 @@ function createRemoteSession(){
       if (message.type === 'actor-update') {
         if (currentActor) {
           // Apply the new actor position received from WebSocket
-          currentActor.setPosition(...message.position);
+          currentActor.setOrientation(...message.orientation);
           renderWindow.render();
         }
       }
-      // if (message.type === 'camera-update') {
-      //   console.log('Received camera update:', data);
-
-      //   if(!message.position || !message.focalPoint || !message.viewUp){
-      //     console.warn("Incomplete camera data:", data);
-      //     return;
-      //   }
-      //   else{         
-      //     console.log('Message:', message);
-          
-      //     // camera.setPosition(message.position[0], message.position[1], message.position[2]);
-      //     // camera.setFocalPoint(message.focalPoint[0], message.focalPoint[1], message.focalPoint[2]);
-      //     // camera.setViewUp(message.viewUp[0], message.viewUp[1], message.viewUp[2]);
-      //     camera.setPosition(...message.position);
-      //     camera.setFocalPoint(...message.focalPoint);
-      //     camera.setViewUp(...message.viewUp);
-
-      //     console.log(camera.getPosition());
-      //     console.log(camera.getFocalPoint());
-      //     console.log(camera.getViewUp());
-          
-      //     renderWindow.render(); 
-      //   }
-      // }
     } catch (err) {
       console.error('Failed to parse message:', err);
     }
@@ -187,7 +206,7 @@ function createOrientationMarker(){
   // create orientation widget
   const orientationWidget = vtkOrientationMarkerWidget.newInstance({
     actor: axes,
-    interactor: renderWindow.getInteractor(),
+    interactor: interactor,
   });
   orientationWidget.setEnabled(true);
   orientationWidget.setViewportCorner(
@@ -198,10 +217,12 @@ function createOrientationMarker(){
   orientationWidget.setMaxPixelSize(300);
 }
 
+let defaultCameraPosition = null;
+let defaultCameraFocalPoint = null;
+let defaultCameraviewUp = null;
+
 // Function to update the scene in response to received data
 function updateScene(fileData) {
-  console.log("Update Scene Camera position: ", camera.getPosition());
-
   // Make sure the fileData is an ArrayBuffer before passing it to vtkXMLPolyDataReader
   if (!(fileData instanceof ArrayBuffer)) {
     console.error('Expected ArrayBuffer but received:', fileData);
@@ -225,93 +246,33 @@ function updateScene(fileData) {
   // Reset the camera and render the scene
   renderer.addActor(actor);
   renderer.resetCamera();
+
+  defaultCameraPosition = camera.getPosition();
+  defaultCameraFocalPoint = camera.getFocalPoint();
+  defaultCameraviewUp = camera.getViewUp();
+
+  console.log('cam position: ', defaultCameraPosition);
+  console.log('cam focal: ', defaultCameraFocalPoint);
+  console.log('cam view up: ', defaultCameraviewUp);
+
   renderWindow.render();
 
   currentActor = actor;
-
-  const interactor = renderWindow.getInteractor();
-  const style = vtkInteractorStyleTrackballCamera.newInstance();
-  interactor.setInteractorStyle(style);
-
-  let actorStartPos = null;
-  let isDraggingActor = false;
-  let mouseStartPos = [0,0];
-
-  style.onInteractionEvent(() => {
-    // // const camera = renderer.getActiveCamera();
-
-    // const cameraState = {
-    //   type: 'camera-update',
-    //   position: camera.getPosition(),
-    //   focalPoint: camera.getFocalPoint(),
-    //   viewUp: camera.getViewUp(),
-    // };
-
-    // // send through WebSocket
-    // socket.send(JSON.stringify(cameraState));
-    if (isDraggingActor) {
-      const mousePos = renderWindow.getInteractor().getEventPosition();
-      const deltaX = mousePos[0] - mouseStartPos[0];
-      const deltaY = mousePos[1] - mouseStartPos[1];
-  
-      // Adjust actor's position based on mouse movement (scale the delta if needed)
-      const actorPos = currentActor.getPosition();
-      currentActor.setPosition(
-        actorStartPos[0] + deltaX * 0.01,
-        actorStartPos[1] - deltaY * 0.01,  // Negative Y for typical screen coordinates
-        actorPos[2]
-      );
-  
-      sendActorPosition();
-
-      renderWindow.render();
-    }
-  });
-
-  style.onButtonPress((callData) => {
-    if (callData.button === 0) {  // Left mouse button
-      // Check if the actor is clicked
-      const clickPos = renderWindow.getInteractor().getEventPosition();
-  
-      // Use a raycast or some logic to determine if the actor was clicked
-      // In this simple case, let's assume it's always clicked
-      isDraggingActor = true;
-      actorStartPos = currentActor.getPosition();
-      mouseStartPos = clickPos;  // Store the starting mouse position
-    }
-  });
-
-  style.onButtonRelease(() => {
-    isDraggingActor = false;
-    actorStartPos = null;
-    mouseStartPos = [0, 0];
-  });
+  console.log("Actor Orientation ", actor.getOrientation());
 }
 
 // Function to send updated actor position to WebSocket
 function sendActorPosition() {
   if (currentActor) {
-    const actorPos = currentActor.getPosition();
+    const actorOrient = currentActor.getOrientation();
     const actorState = {
       type: 'actor-update',
-      position: actorPos
+      orientation: actorOrient
     };
+    console.log('Actor orientation: ', actorOrient);
     socket.send(JSON.stringify(actorState));
   }
 }
-// const mouseEventHandler = (event) => {
-//   //handle mouse event and pass it to the remote server
-
-// }
-
-// remoteView.setRpcMouseEvent(mouseEventHandler);
-// remoteView.setRpcGestureEvent(gestureEventHandler);
-
-// function update() {
-//   const render = renderWindow.render;
-//   renderer.resetCamera();
-//   render();
-// }
 
 // ----------------------------------------------------------------------------
 // Example code
@@ -321,23 +282,11 @@ function sendActorPosition() {
 // this
 // ----------------------------------------------------------------------------
 
-// const coneSource = vtkConeSource.newInstance({ height: 100.0, radius: 50 });
-
-// const reader = vtkXMLPolyDataReader.newInstance();
-
-// const vtpReader = vtkXMLPolyDataReader.newInstance();
-
-
 function preventDefaults(e) {
   e.preventDefault();
   e.stopPropagation();
 }
 
-// const source = vtpReader.getOutputData(0);
-// const mapper = vtkMapper.newInstance();
-// const actor = vtkActor.newInstance();
-
-// actor.setMapper(mapper);
 
 function handleFile(e){
   preventDefaults(e);
@@ -352,19 +301,9 @@ function handleFile(e){
 
       // Directly send the ArrayBuffer over WebSocket without JSON
       socket.send(fileData);  // No need for JSON.stringify
-      //Broadacst the file data to other tabs
-      // sendDataToAllTabs({
-      //   type: 'file-upload', 
-      //   fileData: fileData
-      // });
 
       //Update the local scene with the uploaded file
       updateScene(fileData);
-      // vtpReader.parseAsArrayBuffer(fileReader.result);
-      // mapper.setInputData(vtpReader.getOutputData(0));
-      // renderer.addActor(actor)
-      // renderer.resetCamera();
-      // renderWindow.render();
     };
     fileReader.readAsArrayBuffer(file);
   }
@@ -395,17 +334,3 @@ vrbutton.addEventListener('click', (e) => {
     vrbutton.textContent = 'Send To VR';
   }
 });
-
-// -----------------------------------------------------------
-// Make some variables global so that you can inspect and
-// modify objects in your browser's developer console:
-// -----------------------------------------------------------
-
-// global.source = coneSource;
-// global.mapper = mapper;
-// global.actor = actor;
-// global.renderer = renderer;
-// global.renderWindow = renderWindow;
-
-// global.reader = reader;
-// global.fullScreenRenderer = fullScreenRenderer;
