@@ -77,6 +77,10 @@ const camera = renderer.getActiveCamera();
 let actorStartOrient = null;
 let isDraggingActor = false;
 let mouseStartPos = null;
+let axes = null
+let axesPosition = null;
+
+let updateCount = 0; //for debugging purposes
 
 interactor.onMouseMove((callData) => {
   if (isDraggingActor && currentActor) {
@@ -95,9 +99,14 @@ interactor.onMouseMove((callData) => {
     );
 
     sendActorPosition();
-    camera.setPosition(...defaultCameraPosition);
-    camera.setFocalPoint(...defaultCameraFocalPoint);
-    camera.setViewUp(...defaultCameraviewUp);
+
+    if(axes){
+      axes.setOrientation(...currentActor.getOrientation());
+      axes.setPosition(...axesPosition);
+    }
+
+    renderer.resetCameraClippingRange();
+
     renderWindow.render();
   }
 });
@@ -120,6 +129,8 @@ interactor.onLeftButtonRelease(() => {
 // ----------------------------------------------------------------------------
 
 let currentActor = null;
+
+let receiveCount = 0; //for debugging purposes
 
 function createRemoteSession(){
 
@@ -146,7 +157,11 @@ function createRemoteSession(){
         if (currentActor) {
           // Apply the new actor position received from WebSocket
           currentActor.setOrientation(...message.orientation);
+          axes.setOrientation(...currentActor.getOrientation());
+          renderer.resetCameraClippingRange();
           renderWindow.render();
+          receiveCount++;
+          console.log("updates received: ", receiveCount);
         }
       }
     } catch (err) {
@@ -167,7 +182,7 @@ function createRemoteSession(){
 
 function createOrientationMarker(){
   // create axes
-  const axes = vtkAnnotatedCubeActor.newInstance();
+  axes = vtkAnnotatedCubeActor.newInstance();
   axes.setDefaultStyle({
     text: '+X',
     fontStyle: 'bold',
@@ -202,6 +217,7 @@ function createOrientationMarker(){
     edgeColor: 'yellow',
   });
   axes.setZMinusFaceProperty({ text: '-Z', faceRotation: 45, edgeThickness: 0 });
+  axesPosition = axes.getPosition();
 
   // create orientation widget
   const orientationWidget = vtkOrientationMarkerWidget.newInstance({
@@ -212,7 +228,7 @@ function createOrientationMarker(){
   orientationWidget.setViewportCorner(
     vtkOrientationMarkerWidget.Corners.BOTTOM_RIGHT
   );
-  orientationWidget.setViewportSize(0.15);
+  orientationWidget.setViewportSize(0.10);
   orientationWidget.setMinPixelSize(100);
   orientationWidget.setMaxPixelSize(300);
 }
@@ -267,10 +283,12 @@ function sendActorPosition() {
     const actorOrient = currentActor.getOrientation();
     const actorState = {
       type: 'actor-update',
-      orientation: actorOrient
+      orientation: currentActor.getOrientation()
     };
     console.log('Actor orientation: ', actorOrient);
     socket.send(JSON.stringify(actorState));
+    updateCount++;
+    console.log("updates sent: ", updateCount);
   }
 }
 
