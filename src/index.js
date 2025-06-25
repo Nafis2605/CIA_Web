@@ -29,6 +29,10 @@ import '@kitware/vtk.js/IO/Core/DataAccessHelper/JSZipDataAccessHelper';
 
 import vtkResourceLoader from '@kitware/vtk.js/IO/Core/ResourceLoader';
 
+//Yjs setup
+import * as Y from 'yjs';
+import { WebsocketProvider } from 'y-websocket';
+
 // Custom UI controls, including button to start XR session
 import controlPanel from './controller.html';
 import vtkColorTransferFunction from '@kitware/vtk.js/Rendering/Core/ColorTransferFunction';
@@ -47,6 +51,15 @@ if (navigator.xr === undefined) {
 }
 
 // ----------------------------------------------------------------------------
+//  Set up Yjs doc + provider
+// ----------------------------------------------------------------------------
+
+const ydoc = new Y.Doc();
+const provider = new WebsocketProvider('ws://localhost:8080', 'vtk-room', ydoc);
+const yActor = ydoc.getMap('actor');
+const yFile = ydoc.getMap('fileData');
+
+// ----------------------------------------------------------------------------
 // Standard rendering code setup
 // ----------------------------------------------------------------------------
 
@@ -60,45 +73,43 @@ const XRHelper = vtkWebXRRenderWindowHelper.newInstance({
   drawControllersRay: true,
 });
 
-const remoteView = vtkRemoteView.newInstance({
-  container: fullScreenRenderer.getContainer(),
-  background: [0,0,0],
-});
+// const remoteView = vtkRemoteView.newInstance({
+//   container: fullScreenRenderer.getContainer(),
+//   background: [0,0,0],
+// });
 
-const socket = new WebSocket('ws://localhost:9001');
-socket.binaryType = 'arraybuffer'; // Set binaryType to 'arraybuffer' to receive binary data
+// const socket = new WebSocket('ws://localhost:9001');
+// socket.binaryType = 'arraybuffer'; // Set binaryType to 'arraybuffer' to receive binary data
 
-const remoteSession = createRemoteSession();
-remoteView.setSession(remoteSession);
+// const remoteSession = createRemoteSession();
+// remoteView.setSession(remoteSession);
 const interactor = renderWindow.getInteractor();
 
 const camera = renderer.getActiveCamera();
 
-let actorStartOrient = null;
+let currentActor = null;
 let isDraggingActor = false;
+
 let mouseStartPos = null;
+
 let axes = null
 let axesPosition = null;
 
-let updateCount = 0; //for debugging purposes
+let actorStartOrient = null;
+
+let isLocalFileLoad = false;
 
 interactor.onMouseMove((callData) => {
   if (isDraggingActor && currentActor) {
     const mousePos = callData.position;
-    console.log('mouse position: ', mousePos.x);
     const deltaX = mousePos.x - mouseStartPos.x;
     const deltaY = mousePos.y - mouseStartPos.y;
-    console.log("delta x: ", deltaX);
-    console.log("delta y: ", deltaY);
 
-    const actorOrient = actorStartOrient;
     currentActor.setOrientation(
-      actorOrient[0] - deltaY * 0.1,
-      actorOrient[1] + deltaX * 0.1, // flip Y
-      actorOrient[2]
+      actorStartOrient[0] - deltaY * 0.1,
+      actorStartOrient[1] + deltaX * 0.1, // flip Y
+      actorStartOrient[2]
     );
-
-    sendActorPosition();
 
     if(axes){
       axes.setOrientation(...currentActor.getOrientation());
@@ -106,79 +117,115 @@ interactor.onMouseMove((callData) => {
     }
 
     renderer.resetCameraClippingRange();
-
     renderWindow.render();
+
+    sendActorPosition();
   }
 });
 
 
 interactor.onLeftButtonPress((callData) => {
+  if (!currentActor)return;
     isDraggingActor = true;
     actorStartOrient = [...currentActor.getOrientation()];
-    console.log(actorStartOrient);
     mouseStartPos = callData.position;  // Store the starting mouse position
 });
 
 interactor.onLeftButtonRelease(() => {
   isDraggingActor = false;
   actorStartOrient = null;
-  mouseStartPos = [0, 0];
+  mouseStartPos = null;
+  renderer.resetCamera();
+
 });
+
+// ----------------------------------------------------------------------------
+// Yjs Observer: File Data
+// ----------------------------------------------------------------------------
+yFile.observe(event => {
+  if(isLocalFileLoad){
+    isLocalFileLoad = false;
+    return;
+  }
+
+  const b64 = yFile.get('polydata');
+  if (b64) {
+    const binary = Uint8Array.from(atob(b64), c => c.charCodeAt(0)).buffer;
+    updateScene(binary);
+  }
+});
+
+// ----------------------------------------------------------------------------
+// Yjs Observer: Actor Orientation
+// ----------------------------------------------------------------------------
+yActor.observe(event => {
+  if (!currentActor) return;
+
+  const orient = yActor.get('orientation');
+  if (orient) {
+    currentActor.setOrientation(...orient);
+
+    if (axes) {
+      axes.setOrientation(...orient);
+      axes.setPosition(...axesPosition);
+    }
+
+    renderer.resetCameraClippingRange();
+    renderWindow.render();
+  }
+});
+
 // ----------------------------------------------------------------------------
 // WebSocket Setup
 // ----------------------------------------------------------------------------
 
-let currentActor = null;
+// function createRemoteSession(){
 
-let receiveCount = 0; //for debugging purposes
+//   socket.onopen = function(){
+//     console.log('WebSocket connection established');
+//     // You can send or receive data here to update the remote view or trigger actions
+//   };
 
-function createRemoteSession(){
+//   socket.onmessage = function(event){
+//     // Handle incoming messages, update the renderering as necessary
+//     const data = event.data;
+//     console.log(data);
+//     // Make sure fileData is an ArrayBuffer before passing it to vtkXMLPolyDataReader
+//     if (data instanceof ArrayBuffer) {
+//       console.log('Received binary data (VTK file)');
+//       updateScene(data);
+//       return;
+//     } 
+//     // Try to parse JSON messages
+//     try {
+//       const message = JSON.parse(data);
 
-  socket.onopen = function(){
-    console.log('WebSocket connection established');
-    // You can send or receive data here to update the remote view or trigger actions
-  };
+//       if (message.type === 'actor-update') {
+//         if (currentActor) {
+//           // Apply the new actor position received from WebSocket
+//           currentActor.setOrientation(...message.orientation);
+//           axes.setOrientation(...currentActor.getOrientation());
+//           renderer.resetCameraClippingRange();
+//           renderWindow.render();
+//           receiveCount++;
+//           console.log("updates received: ", receiveCount);
+//         }
+//       }
+//     } catch (err) {
+//       console.error('Failed to parse message:', err);
+//     }
+//   };
 
-  socket.onmessage = function(event){
-    // Handle incoming messages, update the renderering as necessary
-    const data = event.data;
-    console.log(data);
-    // Make sure fileData is an ArrayBuffer before passing it to vtkXMLPolyDataReader
-    if (data instanceof ArrayBuffer) {
-      console.log('Received binary data (VTK file)');
-      updateScene(data);
-      return;
-    } 
-    // Try to parse JSON messages
-    try {
-      const message = JSON.parse(data);
+//   socket.onclose = function(){
+//     console.log('WebSocket connetion closed');
+//   };
 
-      if (message.type === 'actor-update') {
-        if (currentActor) {
-          // Apply the new actor position received from WebSocket
-          currentActor.setOrientation(...message.orientation);
-          axes.setOrientation(...currentActor.getOrientation());
-          renderer.resetCameraClippingRange();
-          renderWindow.render();
-          receiveCount++;
-          console.log("updates received: ", receiveCount);
-        }
-      }
-    } catch (err) {
-      console.error('Failed to parse message:', err);
-    }
-  };
+//   socket.onerror = function(error){
+//     console.error('WebSocket error: ', error);
+//   };
 
-  socket.onclose = function(){
-    console.log('WebSocket connetion closed');
-  };
-
-  socket.onerror = function(error){
-    console.error('WebSocket error: ', error);
-  };
-
-  return socket;
-}
+//   return socket;
+// }
 
 function createOrientationMarker(){
   // create axes
@@ -233,18 +280,9 @@ function createOrientationMarker(){
   orientationWidget.setMaxPixelSize(300);
 }
 
-let defaultCameraPosition = null;
-let defaultCameraFocalPoint = null;
-let defaultCameraviewUp = null;
 
 // Function to update the scene in response to received data
 function updateScene(fileData) {
-  // Make sure the fileData is an ArrayBuffer before passing it to vtkXMLPolyDataReader
-  if (!(fileData instanceof ArrayBuffer)) {
-    console.error('Expected ArrayBuffer but received:', fileData);
-    return;
-  }
-
   // Clear the current scene by removing all actors
   renderer.removeAllActors();  // This clears all actors from the scene
   
@@ -263,35 +301,31 @@ function updateScene(fileData) {
   renderer.addActor(actor);
   renderer.resetCamera();
 
-  defaultCameraPosition = camera.getPosition();
-  defaultCameraFocalPoint = camera.getFocalPoint();
-  defaultCameraviewUp = camera.getViewUp();
+  cameraStartPos = camera.getPosition();
+  cameraStartFocal = camera.getFocalPoint();
 
-  console.log('cam position: ', defaultCameraPosition);
-  console.log('cam focal: ', defaultCameraFocalPoint);
-  console.log('cam view up: ', defaultCameraviewUp);
+  // defaultCameraPosition = camera.getPosition();
+  // defaultCameraFocalPoint = camera.getFocalPoint();
+  // defaultCameraviewUp = camera.getViewUp();
+
+  // console.log('cam position: ', defaultCameraPosition);
+  // console.log('cam focal: ', defaultCameraFocalPoint);
+  // console.log('cam view up: ', defaultCameraviewUp);
 
   renderWindow.render();
 
   currentActor = actor;
-  console.log("Actor Orientation ", actor.getOrientation());
+  // console.log("Actor Orientation ", actor.getOrientation());
 }
 
 // Function to send updated actor position to WebSocket
-function sendActorPosition() {
+
+function sendActorPosition(){
   if (currentActor) {
-    const actorOrient = currentActor.getOrientation();
-    const actorState = {
-      type: 'actor-update',
-      orientation: currentActor.getOrientation()
-    };
-    console.log('Actor orientation: ', actorOrient);
-    socket.send(JSON.stringify(actorState));
-    updateCount++;
-    console.log("updates sent: ", updateCount);
+    const orient = currentActor.getOrientation();
+    yActor.set('orientation', orient);
   }
 }
-
 // ----------------------------------------------------------------------------
 // Example code
 // ----------------------------------------------------------------------------
@@ -299,6 +333,16 @@ function sendActorPosition() {
 // filter we create inline, for a simple cone you would not need
 // this
 // ----------------------------------------------------------------------------
+
+function arrayBufferToBase64(buffer) {
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
 
 function preventDefaults(e) {
   e.preventDefault();
@@ -309,22 +353,23 @@ function preventDefaults(e) {
 function handleFile(e){
   preventDefaults(e);
   const dataTransfer = e.dataTransfer;
-  const files = e.target.files || dataTransfer.files;
-  if (files.length > 0){
-    const file = files[0];
-    const fileReader = new FileReader();
+  const file = (e.target.files || dataTransfer.files)[0];
+  if (!file) return;
+  const fileReader = new FileReader();
 
-    fileReader.onload = function onLoad(e){
-      const fileData = fileReader.result;
+  fileReader.onload = function onLoad(e){
+    const fileData = fileReader.result;
+    const b64 = arrayBufferToBase64(fileData);
 
-      // Directly send the ArrayBuffer over WebSocket without JSON
-      socket.send(fileData);  // No need for JSON.stringify
+    isLocalFileLoad = true; //mark as a local change
+    //set the polydata to the fileData
+    //overwrite the polydata if it already exists
+    yFile.set('polydata', b64); 
 
-      //Update the local scene with the uploaded file
-      updateScene(fileData);
-    };
-    fileReader.readAsArrayBuffer(file);
-  }
+    //Update the local scene with the uploaded file
+    updateScene(fileData);
+  };
+  fileReader.readAsArrayBuffer(file);
 }
 
 // -----------------------------------------------------------
