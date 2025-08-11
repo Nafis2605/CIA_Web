@@ -301,9 +301,6 @@ function updateScene(fileData) {
   renderer.addActor(actor);
   renderer.resetCamera();
 
-  cameraStartPos = camera.getPosition();
-  cameraStartFocal = camera.getFocalPoint();
-
   // defaultCameraPosition = camera.getPosition();
   // defaultCameraFocalPoint = camera.getFocalPoint();
   // defaultCameraviewUp = camera.getViewUp();
