@@ -38,6 +38,7 @@ import controlPanel from './controller.html';
 import vtkColorTransferFunction from '@kitware/vtk.js/Rendering/Core/ColorTransferFunction';
 import { colorSpaceToWorking } from 'three/tsl';
 import vtkPolyData from '@kitware/vtk.js/Common/DataModel/PolyData';
+import { P } from '@kitware/vtk.js/Common/Core/Math/index';
 // Dynamically load WebXR polyfill from CDN for WebVR and Cardboard API backwards compatibility
 if (navigator.xr === undefined) {
   vtkResourceLoader
@@ -116,7 +117,6 @@ interactor.onMouseMove((callData) => {
       axes.setPosition(...axesPosition);
     }
 
-    renderer.resetCameraClippingRange();
     renderWindow.render();
 
     sendActorPosition();
@@ -135,8 +135,6 @@ interactor.onLeftButtonRelease(() => {
   isDraggingActor = false;
   actorStartOrient = null;
   mouseStartPos = null;
-  renderer.resetCamera();
-
 });
 
 // ----------------------------------------------------------------------------
@@ -169,63 +167,19 @@ yActor.observe(event => {
       axes.setOrientation(...orient);
       axes.setPosition(...axesPosition);
     }
+    const cameraPos = yActor.get('cameraPosition');
+    if(cameraPos){
+      camera.setPosition(...cameraPos);
+    }
+    const cameraFocal = yActor.get('cameraFocalPoint');
+    if(cameraFocal){
+      camera.setFocalPoint(...cameraFocal);
+    }
 
     renderer.resetCameraClippingRange();
     renderWindow.render();
   }
 });
-
-// ----------------------------------------------------------------------------
-// WebSocket Setup
-// ----------------------------------------------------------------------------
-
-// function createRemoteSession(){
-
-//   socket.onopen = function(){
-//     console.log('WebSocket connection established');
-//     // You can send or receive data here to update the remote view or trigger actions
-//   };
-
-//   socket.onmessage = function(event){
-//     // Handle incoming messages, update the renderering as necessary
-//     const data = event.data;
-//     console.log(data);
-//     // Make sure fileData is an ArrayBuffer before passing it to vtkXMLPolyDataReader
-//     if (data instanceof ArrayBuffer) {
-//       console.log('Received binary data (VTK file)');
-//       updateScene(data);
-//       return;
-//     } 
-//     // Try to parse JSON messages
-//     try {
-//       const message = JSON.parse(data);
-
-//       if (message.type === 'actor-update') {
-//         if (currentActor) {
-//           // Apply the new actor position received from WebSocket
-//           currentActor.setOrientation(...message.orientation);
-//           axes.setOrientation(...currentActor.getOrientation());
-//           renderer.resetCameraClippingRange();
-//           renderWindow.render();
-//           receiveCount++;
-//           console.log("updates received: ", receiveCount);
-//         }
-//       }
-//     } catch (err) {
-//       console.error('Failed to parse message:', err);
-//     }
-//   };
-
-//   socket.onclose = function(){
-//     console.log('WebSocket connetion closed');
-//   };
-
-//   socket.onerror = function(error){
-//     console.error('WebSocket error: ', error);
-//   };
-
-//   return socket;
-// }
 
 function createOrientationMarker(){
   // create axes
@@ -321,6 +275,10 @@ function sendActorPosition(){
   if (currentActor) {
     const orient = currentActor.getOrientation();
     yActor.set('orientation', orient);
+    const cameraPos = camera.getPosition();
+    const cameraFocal = camera.getFocalPoint();
+    yActor.set('cameraPosition', cameraPos);
+    yActor.set('cameraFocalPoint', cameraFocal);
   }
 }
 // ----------------------------------------------------------------------------
