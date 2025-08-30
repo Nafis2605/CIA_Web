@@ -71,7 +71,6 @@ const renderer = fullScreenRenderer.getRenderer();
 const renderWindow = fullScreenRenderer.getRenderWindow();
 const XRHelper = vtkWebXRRenderWindowHelper.newInstance({
   renderWindow: fullScreenRenderer.getApiSpecificRenderWindow(),
-  drawControllersRay: true,
 });
 
 // const remoteView = vtkRemoteView.newInstance({
@@ -175,7 +174,13 @@ yActor.observe(event => {
     if(cameraFocal){
       camera.setFocalPoint(...cameraFocal);
     }
+    renderer.resetCameraClippingRange();
+    renderWindow.render();
+  }
 
+  const rep = yActor.get('representation');
+  if(rep !== undefined){
+    currentActor.getProperty().setRepresentation(rep);
     renderer.resetCameraClippingRange();
     renderWindow.render();
   }
@@ -339,7 +344,8 @@ fileInput.addEventListener('change', handleFile);
 
 representationSelector.addEventListener('change', (e) => {
   const newRepValue = Number(e.target.value);
-  actor.getProperty().setRepresentation(newRepValue);
+  currentActor.getProperty().setRepresentation(newRepValue);
+  yActor.set('representation', newRepValue);
   renderWindow.render();
 });
 
