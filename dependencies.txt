@@ -4,4 +4,5 @@ npm install three
 npm install ws
 npm install file-loader raw-loader url-loader
 npm install -D css-loader style-loader
-
+npm install @tensorflow/tfjs
+npm install yjs y-websocket
