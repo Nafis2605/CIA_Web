@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@kitware/vtk.js": "^32.13.0",
+    "@tensorflow/tfjs": "^4.22.0",
     "three": "^0.175.0",
     "vtk.js": "^24.19.2",
     "webxr-polyfill": "^2.0.3",
