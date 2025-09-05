@@ -13,7 +13,7 @@ CIA_Web leverages **VTK.js**, **WebXR**, and **TensorFlow.js** to support multi-
 - [Node.js](https://nodejs.org/) (v16+ recommended)
 - [npm](https://www.npmjs.com/)
 
-### Installation
+### 📥 Installation
 
 1. Clone or download the repository, including:
    - `src/`
@@ -36,8 +36,7 @@ CIA_Web leverages **VTK.js**, **WebXR**, and **TensorFlow.js** to support multi-
 
 5. Open Developer Tools in Chrome: Right click > Inspect > WebXR
 
-## Accessing WebXR
-
+## 🥽 Accessing WebXR
 
 ### Supported Browsers
 - **Google Chrome** (Recommended)  
@@ -57,7 +56,7 @@ CIA_Web leverages **VTK.js**, **WebXR**, and **TensorFlow.js** to support multi-
 1. Click the **'Enter VR'** button.
 2. Put on your VR headset and enjoy the experience!
 
-## 📂 Project Structure
+### 📂 Project Structure
 
 ```
 CIA_Web/
