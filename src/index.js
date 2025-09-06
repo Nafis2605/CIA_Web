@@ -1315,6 +1315,7 @@ const ydoc = new Y.Doc();
 const provider = new WebsocketProvider('ws://localhost:8080', 'vtk-room', ydoc);
 const yActor = ydoc.getMap('actor');
 const yFile = ydoc.getMap('fileData');
+const yReduction = ydoc.getMap('reduction');
 
 let isLocalFileLoad = false;
 
@@ -1322,6 +1323,7 @@ let isLocalFileLoad = false;
 // ----------------------------------------------------------------------------
 // Yjs Observer: File Data
 // ----------------------------------------------------------------------------
+
 yFile.observe(event => {
   if(isLocalFileLoad){
     isLocalFileLoad = false;
@@ -1336,8 +1338,9 @@ yFile.observe(event => {
 });
 
 // ----------------------------------------------------------------------------
-// Yjs Observer: Actor Orientation
+// Yjs Observer: Actor Orientation and Representation
 // ----------------------------------------------------------------------------
+
 yActor.observe(event => {
   if (!currentActor) return;
 
@@ -1503,24 +1506,28 @@ function setup2DView() {
   // Force orthographic (parallel) projection for true 2D
   camera.setParallelProjection(true);
   camera.setParallelScale(maxRange * 0.55);
+
+  // ----------------
+  // DO NOT TOUCH INTERACTOR CODE BELOW: it doesn't work
+  // ----------------
   
   // Disable 3D interactions to keep it 2D
   // const interactor = renderWindow.getInteractor();
-  const interactorStyle = interactor.getInteractorStyle();
+  // const interactorStyle = interactor.getInteractorStyle();
   
-  // Store original interaction state
-  if (!window.original3DInteractionState) {
-    window.original3DInteractionState = {
-      leftButtonAction: interactorStyle.getLeftButtonAction(),
-      middleButtonAction: interactorStyle.getMiddleButtonAction(),
-      rightButtonAction: interactorStyle.getRightButtonAction()
-    };
-  }
+  // // Store original interaction state
+  // if (!window.original3DInteractionState) {
+  //   window.original3DInteractionState = {
+  //     leftButtonAction: interactorStyle.getLeftButtonAction(),
+  //     middleButtonAction: interactorStyle.getMiddleButtonAction(),
+  //     rightButtonAction: interactorStyle.getRightButtonAction()
+  //   };
+  // }
   
-  // Set 2D interaction style - only allow pan and zoom, no rotation
-  interactorStyle.setLeftButtonAction('Pan');
-  interactorStyle.setMiddleButtonAction('Zoom');
-  interactorStyle.setRightButtonAction('Pan');
+  // // Set 2D interaction style - only allow pan and zoom, no rotation
+  // interactorStyle.setLeftButtonAction('Pan');
+  // interactorStyle.setMiddleButtonAction('Zoom');
+  // interactorStyle.setRightButtonAction('Pan');
   
   // Force render
   renderWindow.render();
@@ -1535,18 +1542,22 @@ function restore3DView() {
   
   // Restore perspective projection
   camera.setParallelProjection(false);
+
+  // ----------------
+  // DO NOT TOUCH INTERACTOR CODE BELOW: it doesn't work
+  // ----------------
   
-  // Restore 3D interactions
-  if (window.original3DInteractionState) {
-    interactorStyle.setLeftButtonAction(window.original3DInteractionState.leftButtonAction);
-    interactorStyle.setMiddleButtonAction(window.original3DInteractionState.middleButtonAction);
-    interactorStyle.setRightButtonAction(window.original3DInteractionState.rightButtonAction);
-  } else {
-    // Default 3D interaction
-    interactorStyle.setLeftButtonAction('Rotate');
-    interactorStyle.setMiddleButtonAction('Zoom');
-    interactorStyle.setRightButtonAction('Pan');
-  }
+  // // Restore 3D interactions
+  // if (window.original3DInteractionState) {
+  //   interactorStyle.setLeftButtonAction(window.original3DInteractionState.leftButtonAction);
+  //   interactorStyle.setMiddleButtonAction(window.original3DInteractionState.middleButtonAction);
+  //   interactorStyle.setRightButtonAction(window.original3DInteractionState.rightButtonAction);
+  // } else {
+  //   // Default 3D interaction
+  //   interactorStyle.setLeftButtonAction('Rotate');
+  //   interactorStyle.setMiddleButtonAction('Zoom');
+  //   interactorStyle.setRightButtonAction('Pan');
+  // }
   
   logProgress('Restored 3D viewing mode (rotation enabled, perspective projection)');
 }
@@ -1555,7 +1566,7 @@ function restore3DView() {
 // Main Dimensionality Reduction Function
 // ----------------------------------------------------------------------------
 
-async function toggleDimensionalityReduction() {
+async function toggleDimensionalityReduction(isRemote = false) {
   if (!originalPointsData) {
     logError('No data loaded for processing');
     alert('Please load a VTP file first!');
@@ -1633,6 +1644,9 @@ async function toggleDimensionalityReduction() {
       
       applyReductionToPolyData(currentPolyData, reducedPoints);
       reductionApplied = true;
+
+      // Update the reduction state in other tabs
+      // sendReductionState();
       
       const newBounds = currentPolyData.getBounds();
       logProgress(`New bounds: X[${newBounds[0].toFixed(2)}, ${newBounds[1].toFixed(2)}] Y[${newBounds[2].toFixed(2)}, ${newBounds[3].toFixed(2)}] Z[${newBounds[4].toFixed(2)}, ${newBounds[5].toFixed(2)}]`);
@@ -1664,6 +1678,9 @@ async function toggleDimensionalityReduction() {
     points.setData(originalPointsData);
     currentPolyData.modified();
     reductionApplied = false;
+
+    // Sync reset with other tabs
+    // sendReductionState();
     
     // Reset to 3D perspective view when restoring original data
     restore3DView();
@@ -1679,10 +1696,67 @@ async function toggleDimensionalityReduction() {
   // Always reset camera after data changes
   renderer.resetCamera();
   renderWindow.render();
+
+  // Only broadcast if this toggle came from *local user*, not from Yjs
+  if (!isRemote) {
+    yReduction.set('state', {
+      applied: reductionApplied,
+      method: reductionMethod,
+      components: reductionComponents,
+    });
+  }
+
   
   logInfo('Visualization refreshed');
   logProgress(`Current state: ${reductionApplied ? `${reductionMethod.toUpperCase()} ${reductionComponents}D` : 'Original 3D'}`);
 }
+
+// ----------------------------------------------------------------------------
+// Yjs Observer: Toggle Reduction
+// ----------------------------------------------------------------------------
+
+
+yReduction.observe(event => {
+  // event.transaction.local === true if *this tab* made the change
+  if (event.transaction.local) {
+    logInfo('this is the host tab!');
+    // Don't run toggle here — we already applied it locally
+    return;
+  }
+
+  const state = yReduction.get('state');
+
+  logInfo("reduction observed from another tab!");
+
+  if(!state) return;
+
+
+  const applied = state.applied;
+  const method = state.method;
+  const components = state.components;
+
+  if (applied !== undefined && method && components) {
+    logInfo("if (applied !== undefined && method && components)");
+    if (applied && !reductionApplied) {
+      logInfo("if (applied && !reductionApplied)");
+      reductionMethod = method;
+      reductionComponents = components;
+      toggleDimensionalityReduction(true);
+    } else if (!applied && reductionApplied) {
+      logInfo("else if (!applied && reductionApplied)")
+      toggleDimensionalityReduction(true);
+    }
+    else{
+      logInfo("none of the above");
+      logInfo(`applied: ${applied} reductionApplied: ${reductionApplied}`)
+    }
+  }
+});
+
+
+// ----------------------------------------------------------------------------
+// Create an Orientation Marker
+// ----------------------------------------------------------------------------
 
 function createOrientationMarker(){
   // create axes
