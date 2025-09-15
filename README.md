@@ -34,6 +34,7 @@ CIA_Web leverages **VTK.js**, **WebXR**, and **TensorFlow.js** to support multi-
    
 4. Upload a **.vtp** file from the **vtp_files** folder to begin visualizing data.
 
+
 5. Open Developer Tools in Chrome: Right click > Inspect > WebXR
 
 ## 🥽 Accessing WebXR
