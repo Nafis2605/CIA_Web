@@ -1419,12 +1419,12 @@ interactor.onLeftButtonRelease(() => {
 
 function sendActorPosition(){
   if (currentActor) {
-    const orient = currentActor.getOrientation();
-    yActor.set('orientation', orient);
-    const cameraPos = camera.getPosition();
-    const cameraFocal = camera.getFocalPoint();
-    yActor.set('cameraPosition', cameraPos);
-    yActor.set('cameraFocalPoint', cameraFocal);
+      const orient = currentActor.getOrientation();
+      yActor.set('orientation', orient);
+      const cameraPos = camera.getPosition();
+      const cameraFocal = camera.getFocalPoint();
+      yActor.set('cameraPosition', cameraPos);
+      yActor.set('cameraFocalPoint', cameraFocal);
   }
 }
 
@@ -1574,6 +1574,14 @@ async function toggleDimensionalityReduction(isRemote = false) {
   }
   
   const currentPolyData = vtpReader.getOutputData(0);
+    // Only broadcast if this toggle came from *local user*, not from Yjs
+  if (!isRemote) {
+    yActor.set('orientation', currentActor.getOrientation());
+    yReduction.set('state', {
+      method: reductionMethod,
+      components: reductionComponents,
+    });
+  }
   
   if (!reductionApplied) {
     logInfo(`Starting ${reductionMethod.toUpperCase()} transformation...`);
@@ -1678,9 +1686,6 @@ async function toggleDimensionalityReduction(isRemote = false) {
     points.setData(originalPointsData);
     currentPolyData.modified();
     reductionApplied = false;
-
-    // Sync reset with other tabs
-    // sendReductionState();
     
     // Reset to 3D perspective view when restoring original data
     restore3DView();
@@ -1697,16 +1702,6 @@ async function toggleDimensionalityReduction(isRemote = false) {
   renderer.resetCamera();
   renderWindow.render();
 
-  // Only broadcast if this toggle came from *local user*, not from Yjs
-  if (!isRemote) {
-    yReduction.set('state', {
-      applied: reductionApplied,
-      method: reductionMethod,
-      components: reductionComponents,
-    });
-  }
-
-  
   logInfo('Visualization refreshed');
   logProgress(`Current state: ${reductionApplied ? `${reductionMethod.toUpperCase()} ${reductionComponents}D` : 'Original 3D'}`);
 }
@@ -1731,25 +1726,15 @@ yReduction.observe(event => {
   if(!state) return;
 
 
-  const applied = state.applied;
+  // const applied = state.applied;
   const method = state.method;
   const components = state.components;
 
-  if (applied !== undefined && method && components) {
-    logInfo("if (applied !== undefined && method && components)");
-    if (applied && !reductionApplied) {
-      logInfo("if (applied && !reductionApplied)");
-      reductionMethod = method;
-      reductionComponents = components;
-      toggleDimensionalityReduction(true);
-    } else if (!applied && reductionApplied) {
-      logInfo("else if (!applied && reductionApplied)")
-      toggleDimensionalityReduction(true);
-    }
-    else{
-      logInfo("none of the above");
-      logInfo(`applied: ${applied} reductionApplied: ${reductionApplied}`)
-    }
+  // if (applied !== undefined && method && components) {
+  if (method && components) {
+    reductionMethod = method;
+    reductionComponents = components;
+    toggleDimensionalityReduction(true);
   }
 });
 
@@ -2252,6 +2237,12 @@ async function initializeApplication() {
   // Setup UI controls
   setupDimensionalityReductionControls();
   
+  // Initialize collaborative cursor system
+  initializeCursorSystem(); // Add this line
+
+  // Setup UI controls
+  setupDimensionalityReductionControls();
+  
   logSuccess('Application initialized successfully');
   logInfo('Features available:');
   logProgress('  - VTP file loading and visualization');
@@ -2282,3 +2273,932 @@ window.performUMAP = performUMAP;
 window.extractPointsFromPolyData = extractPointsFromPolyData;
 window.logMemoryUsage = logMemoryUsage;
 window.cleanupTensors = cleanupTensors;
+// Add this to your existing index.js file
+
+// ----------------------------------------------------------------------------
+// Collaborative Cursor System
+// ----------------------------------------------------------------------------
+
+// Generate a unique user ID for this session
+const userId = 'user_' + Math.random().toString(36).substr(2, 9);
+const userColors = [
+  '#ff4444', '#44ff44', '#4444ff', '#ffff44', 
+  '#ff44ff', '#44ffff', '#ff8800', '#8800ff',
+  '#00ff88', '#ff0088', '#0088ff', '#88ff00'
+];
+
+// User name management
+let userName = localStorage.getItem('vtk-username') || '';
+const yUserNames = ydoc.getMap('userNames');
+
+// Yjs map for cursor positions
+const yCursors = ydoc.getMap('cursors');
+
+// ----------------------------------------------------------------------------
+// User Name Management
+// ----------------------------------------------------------------------------
+
+function showNameDialog() {
+  return new Promise((resolve) => {
+    // Create modal overlay
+    const overlay = document.createElement('div');
+    overlay.style.cssText = `
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      background: rgba(0, 0, 0, 0.7);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 10001;
+      font-family: Arial, sans-serif;
+    `;
+    
+    // Create dialog box
+    const dialog = document.createElement('div');
+    dialog.style.cssText = `
+      background: white;
+      padding: 30px;
+      border-radius: 12px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+      max-width: 400px;
+      width: 90%;
+      text-align: center;
+    `;
+    
+    const title = document.createElement('h3');
+    title.textContent = 'Set Your Display Name';
+    title.style.cssText = 'margin: 0 0 15px 0; color: #333; font-size: 20px;';
+    
+    const subtitle = document.createElement('p');
+    subtitle.textContent = 'This name will appear on your cursor for other users to see:';
+    subtitle.style.cssText = 'margin: 0 0 20px 0; color: #666; font-size: 14px;';
+    
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = 'Enter your name...';
+    input.value = userName;
+    input.style.cssText = `
+      width: 100%;
+      padding: 12px;
+      border: 2px solid #ddd;
+      border-radius: 6px;
+      font-size: 16px;
+      box-sizing: border-box;
+      margin-bottom: 20px;
+    `;
+    input.maxLength = 20;
+    
+    const buttonContainer = document.createElement('div');
+    buttonContainer.style.cssText = 'display: flex; gap: 10px; justify-content: center;';
+    
+    const confirmButton = document.createElement('button');
+    confirmButton.textContent = 'Confirm';
+    confirmButton.style.cssText = `
+      background: #4CAF50;
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 6px;
+      font-size: 16px;
+      cursor: pointer;
+      flex: 1;
+    `;
+    
+    const skipButton = document.createElement('button');
+    skipButton.textContent = 'Skip';
+    skipButton.style.cssText = `
+      background: #f44336;
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 6px;
+      font-size: 16px;
+      cursor: pointer;
+      flex: 1;
+    `;
+    
+    function closeDialog(name) {
+      document.body.removeChild(overlay);
+      resolve(name);
+    }
+    
+    confirmButton.addEventListener('click', () => {
+      const name = input.value.trim();
+      if (name) {
+        closeDialog(name);
+      } else {
+        input.style.borderColor = '#f44336';
+        input.placeholder = 'Please enter a name...';
+      }
+    });
+    
+    skipButton.addEventListener('click', () => {
+      closeDialog('');
+    });
+    
+    input.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        confirmButton.click();
+      }
+    });
+    
+    // Focus input after a short delay
+    setTimeout(() => input.focus(), 100);
+    
+    buttonContainer.appendChild(confirmButton);
+    buttonContainer.appendChild(skipButton);
+    
+    dialog.appendChild(title);
+    dialog.appendChild(subtitle);
+    dialog.appendChild(input);
+    dialog.appendChild(buttonContainer);
+    
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+  });
+}
+
+async function setupUserName() {
+  // If no name is stored, show dialog
+  if (!userName) {
+    userName = await showNameDialog();
+  }
+  
+  // Store the name locally
+  if (userName) {
+    localStorage.setItem('vtk-username', userName);
+    yUserNames.set(userId, userName);
+    logInfo(`User name set to: ${userName}`);
+  } else {
+    userName = `User ${userId.slice(-4)}`;
+    logInfo(`Using default name: ${userName}`);
+  }
+}
+
+// ----------------------------------------------------------------------------
+// User Name Management
+// ----------------------------------------------------------------------------
+
+// function showNameDialog() {
+//   return new Promise((resolve) => {
+//     // Create modal overlay
+//     const overlay = document.createElement('div');
+//     overlay.style.cssText = `
+//       position: fixed;
+//       top: 0;
+//       left: 0;
+//       width: 100vw;
+//       height: 100vh;
+//       background: rgba(0, 0, 0, 0.7);
+//       display: flex;
+//       align-items: center;
+//       justify-content: center;
+//       z-index: 10001;
+//       font-family: Arial, sans-serif;
+//     `;
+    
+//     // Create dialog box
+//     const dialog = document.createElement('div');
+//     dialog.style.cssText = `
+//       background: white;
+//       padding: 30px;
+//       border-radius: 12px;
+//       box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+//       max-width: 400px;
+//       width: 90%;
+//       text-align: center;
+//     `;
+    
+//     const title = document.createElement('h3');
+//     title.textContent = 'Set Your Display Name';
+//     title.style.cssText = 'margin: 0 0 15px 0; color: #333; font-size: 20px;';
+    
+//     const subtitle = document.createElement('p');
+//     subtitle.textContent = 'This name will appear on your cursor for other users to see:';
+//     subtitle.style.cssText = 'margin: 0 0 20px 0; color: #666; font-size: 14px;';
+    
+//     const input = document.createElement('input');
+//     input.type = 'text';
+//     input.placeholder = 'Enter your name...';
+//     input.value = userName;
+//     input.style.cssText = `
+//       width: 100%;
+//       padding: 12px;
+//       border: 2px solid #ddd;
+//       border-radius: 6px;
+//       font-size: 16px;
+//       box-sizing: border-box;
+//       margin-bottom: 20px;
+//     `;
+//     input.maxLength = 20;
+    
+//     const buttonContainer = document.createElement('div');
+//     buttonContainer.style.cssText = 'display: flex; gap: 10px; justify-content: center;';
+    
+//     const confirmButton = document.createElement('button');
+//     confirmButton.textContent = 'Confirm';
+//     confirmButton.style.cssText = `
+//       background: #4CAF50;
+//       color: white;
+//       border: none;
+//       padding: 10px 20px;
+//       border-radius: 6px;
+//       font-size: 16px;
+//       cursor: pointer;
+//       flex: 1;
+//     `;
+    
+//     const skipButton = document.createElement('button');
+//     skipButton.textContent = 'Skip';
+//     skipButton.style.cssText = `
+//       background: #f44336;
+//       color: white;
+//       border: none;
+//       padding: 10px 20px;
+//       border-radius: 6px;
+//       font-size: 16px;
+//       cursor: pointer;
+//       flex: 1;
+//     `;
+    
+//     function closeDialog(name) {
+//       document.body.removeChild(overlay);
+//       resolve(name);
+//     }
+    
+//     confirmButton.addEventListener('click', () => {
+//       const name = input.value.trim();
+//       if (name) {
+//         closeDialog(name);
+//       } else {
+//         input.style.borderColor = '#f44336';
+//         input.placeholder = 'Please enter a name...';
+//       }
+//     });
+    
+//     skipButton.addEventListener('click', () => {
+//       closeDialog('');
+//     });
+    
+//     input.addEventListener('keypress', (e) => {
+//       if (e.key === 'Enter') {
+//         confirmButton.click();
+//       }
+//     });
+    
+//     // Focus input after a short delay
+//     setTimeout(() => input.focus(), 100);
+    
+//     buttonContainer.appendChild(confirmButton);
+//     buttonContainer.appendChild(skipButton);
+    
+//     dialog.appendChild(title);
+//     dialog.appendChild(subtitle);
+//     dialog.appendChild(input);
+//     dialog.appendChild(buttonContainer);
+    
+//     overlay.appendChild(dialog);
+//     document.body.appendChild(overlay);
+//   });
+// }
+
+// async function setupUserName() {
+//   // If no name is stored, show dialog
+//   if (!userName) {
+//     userName = await showNameDialog();
+//   }
+  
+//   // Store the name locally
+//   if (userName) {
+//     localStorage.setItem('vtk-username', userName);
+//     yUserNames.set(userId, userName);
+//     logInfo(`User name set to: ${userName}`);
+//   } else {
+//     userName = `User ${userId.slice(-4)}`;
+//     logInfo(`Using default name: ${userName}`);
+//   }
+// }
+
+function updateUserName(newName) {
+  if (newName && newName.trim()) {
+    userName = newName.trim();
+    localStorage.setItem('vtk-username', userName);
+    yUserNames.set(userId, userName);
+    logInfo(`User name updated to: ${userName}`);
+    
+    // Update own cursor label if it exists
+    const ownCursor = document.getElementById(`cursor-${userId}`);
+    if (ownCursor) {
+      const label = ownCursor.querySelector('div');
+      if (label) {
+        label.textContent = userName;
+      }
+    }
+  }
+}
+
+// Store active cursors
+const activeCursors = new Map();
+let isLocalMouseMove = false;
+
+// ----------------------------------------------------------------------------
+// Cursor Visual Elements
+// ----------------------------------------------------------------------------
+
+function createCursorElement(userId, color, displayName) {
+  try {
+    const cursor = document.createElement('div');
+    cursor.id = `cursor-${userId}`;
+    cursor.style.cssText = `
+      position: fixed;
+      width: 20px;
+      height: 20px;
+      background: ${color};
+      border: 2px solid white;
+      border-radius: 50%;
+      pointer-events: none;
+      z-index: 10000;
+      transform: translate(-50%, -50%);
+      transition: all 0.1s ease;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+    `;
+    
+    // Add user label
+    const label = document.createElement('div');
+    label.style.cssText = `
+      position: absolute;
+      top: 25px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: ${color};
+      color: white;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-family: Arial, sans-serif;
+      white-space: nowrap;
+      font-weight: bold;
+      max-width: 120px;
+      text-overflow: ellipsis;
+      overflow: hidden;
+    `;
+    label.textContent = displayName || userId.replace('user_', 'User ');
+    
+    cursor.appendChild(label);
+    
+    // Verify document.body exists before appending
+    if (document.body) {
+      document.body.appendChild(cursor);
+    } else {
+      logError('Cannot create cursor: document.body not available');
+      return null;
+    }
+    
+    return cursor;
+  } catch (error) {
+    logError(`Failed to create cursor element for ${userId}: ${error.message}`);
+    return null;
+  }
+}
+
+function getUserColor(userId) {
+  // Create consistent color based on user ID
+  const hash = userId.split('').reduce((a, b) => {
+    a = ((a << 5) - a) + b.charCodeAt(0);
+    return a & a;
+  }, 0);
+  return userColors[Math.abs(hash) % userColors.length];
+}
+
+// ----------------------------------------------------------------------------
+// Mouse Tracking
+// ----------------------------------------------------------------------------
+
+let lastMousePosition = { x: 0, y: 0, timestamp: 0 };
+let mouseMoveTimeout = null;
+
+function trackMouse() {
+  document.addEventListener('mousemove', (event) => {
+    if (isLocalMouseMove) return;
+    
+    const now = Date.now();
+    lastMousePosition = {
+      x: event.clientX,
+      y: event.clientY,
+      timestamp: now
+    };
+    
+    // Throttle updates to prevent overwhelming the network
+    if (mouseMoveTimeout) {
+      clearTimeout(mouseMoveTimeout);
+    }
+    
+    mouseMoveTimeout = setTimeout(() => {
+      updateMyCursor();
+    }, 50); // Update every 50ms max
+  });
+  
+  // Handle mouse leave
+  document.addEventListener('mouseleave', () => {
+    hideMyCursor();
+  });
+  
+  // Handle window focus/blur
+  window.addEventListener('blur', () => {
+    hideMyCursor();
+  });
+  
+  window.addEventListener('focus', () => {
+    if (lastMousePosition.timestamp > 0) {
+      updateMyCursor();
+    }
+  });
+}
+
+function updateMyCursor() {
+  if (!lastMousePosition || lastMousePosition.timestamp === 0) return;
+  
+  yCursors.set(userId, {
+    x: lastMousePosition.x,
+    y: lastMousePosition.y,
+    timestamp: lastMousePosition.timestamp,
+    color: getUserColor(userId),
+    active: true
+  });
+}
+
+function hideMyCursor() {
+  yCursors.set(userId, {
+    x: 0,
+    y: 0,
+    timestamp: Date.now(),
+    color: getUserColor(userId),
+    active: false
+  });
+}
+
+// ----------------------------------------------------------------------------
+// Cursor Synchronization
+// ----------------------------------------------------------------------------
+
+yCursors.observe((event) => {
+  try {
+    event.changes.keys.forEach((change, key) => {
+      if (key === userId) return; // Skip own cursor
+      
+      try {
+        const cursorData = yCursors.get(key);
+        if (!cursorData) {
+          // Cursor removed
+          removeCursor(key);
+          return;
+        }
+        
+        if (!cursorData.active) {
+          // Hide cursor
+          hideCursor(key);
+          return;
+        }
+        
+        // Validate cursor data
+        if (typeof cursorData.x !== 'number' || typeof cursorData.y !== 'number') {
+          logWarning(`Invalid cursor data for ${key}:`, cursorData);
+          return;
+        }
+        
+        // Update or create cursor
+        updateRemoteCursor(key, cursorData);
+      } catch (innerError) {
+        logError(`Error processing cursor update for ${key}: ${innerError.message}`);
+      }
+    });
+  } catch (error) {
+    logError(`Error in cursor observer: ${error.message}`);
+  }
+});
+
+function updateRemoteCursor(userId, data) {
+  let cursorData = activeCursors.get(userId);
+  let cursorElement = cursorData ? cursorData.element : null;
+  
+  // Get display name for this user
+  const displayName = yUserNames.get(userId) || userId.replace('user_', 'User ');
+  
+  if (!cursorElement || !cursorElement.parentNode) {
+    // Create new cursor element
+    cursorElement = createCursorElement(userId, data.color, displayName);
+    if (!cursorElement) {
+      logError(`Failed to create cursor element for ${userId}`);
+      return;
+    }
+    
+    activeCursors.set(userId, {
+      element: cursorElement,
+      lastUpdate: data.timestamp,
+      displayName: displayName
+    });
+  }
+  
+  // Update display name if it changed
+  const currentData = activeCursors.get(userId);
+  if (currentData && currentData.displayName !== displayName) {
+    const label = cursorElement.querySelector('div');
+    if (label) {
+      label.textContent = displayName;
+    }
+    currentData.displayName = displayName;
+  }
+  
+  // Safely update position
+  try {
+    if (cursorElement && cursorElement.style) {
+      cursorElement.style.left = data.x + 'px';
+      cursorElement.style.top = data.y + 'px';
+      cursorElement.style.display = 'block';
+      
+      // Update last seen timestamp
+      const cursorInfo = activeCursors.get(userId);
+      if (cursorInfo) {
+        cursorInfo.lastUpdate = data.timestamp;
+      }
+      
+      // Add activity indicator
+      cursorElement.style.transform = 'translate(-50%, -50%) scale(1.2)';
+      setTimeout(() => {
+        if (cursorElement && cursorElement.parentNode && cursorElement.style) {
+          cursorElement.style.transform = 'translate(-50%, -50%) scale(1)';
+        }
+      }, 150);
+    }
+  } catch (error) {
+    logError(`Error updating cursor for ${userId}: ${error.message}`);
+    // Clean up potentially corrupted cursor
+    removeCursor(userId);
+  }
+}
+
+function hideCursor(userId) {
+  try {
+    const cursor = activeCursors.get(userId);
+    if (cursor && cursor.element && cursor.element.style) {
+      cursor.element.style.display = 'none';
+    }
+  } catch (error) {
+    logWarning(`Error hiding cursor for ${userId}: ${error.message}`);
+  }
+}
+
+function removeCursor(userId) {
+  try {
+    const cursor = activeCursors.get(userId);
+    if (cursor && cursor.element) {
+      if (cursor.element.parentNode) {
+        cursor.element.parentNode.removeChild(cursor.element);
+      }
+      activeCursors.delete(userId);
+    }
+  } catch (error) {
+    logWarning(`Error removing cursor for ${userId}: ${error.message}`);
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Cursor Cleanup
+// ----------------------------------------------------------------------------
+
+// Clean up stale cursors every 30 seconds
+setInterval(() => {
+  const now = Date.now();
+  const STALE_THRESHOLD = 30000; // 30 seconds
+  
+  activeCursors.forEach((cursor, userId) => {
+    if (now - cursor.lastUpdate > STALE_THRESHOLD) {
+      logProgress(`Removing stale cursor for ${userId}`);
+      removeCursor(userId);
+    }
+  });
+  
+  // Also clean up from Yjs
+  const allCursors = yCursors.toJSON();
+  Object.keys(allCursors).forEach(userId => {
+    const cursorData = allCursors[userId];
+    if (now - cursorData.timestamp > STALE_THRESHOLD) {
+      yCursors.delete(userId);
+    }
+  });
+});
+// Export functions for external use
+window.initializeCursorSystem = initializeCursorSystem;
+window.updateMyCursor = updateMyCursor;
+window.hideMyCursor = hideMyCursor;
+window.showNameDialog = showNameDialog;
+window.updateUserName = updateUserName;
+
+// ----------------------------------------------------------------------------
+// Cursor Controls UI
+// ----------------------------------------------------------------------------
+
+function addCursorControls() {
+  const controlTable = document.querySelector('table');
+  
+  // Name input row
+  const nameRow = document.createElement('tr');
+  const nameCell = document.createElement('td');
+  
+  const nameContainer = document.createElement('div');
+  nameContainer.style.cssText = 'display: flex; gap: 5px; align-items: center;';
+  
+  const nameInput = document.createElement('input');
+  nameInput.type = 'text';
+  nameInput.placeholder = 'Your name...';
+  nameInput.value = userName;
+  nameInput.maxLength = 20;
+  nameInput.style.cssText = 'flex: 1; padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px;';
+  
+  const nameButton = document.createElement('button');
+  nameButton.textContent = 'Set';
+  nameButton.style.cssText = 'background: #2196F3; color: white; border: none; padding: 6px 12px; border-radius: 4px; font-size: 12px; cursor: pointer;';
+  
+  nameButton.addEventListener('click', () => {
+    const newName = nameInput.value.trim();
+    if (newName) {
+      updateUserName(newName);
+      nameButton.textContent = '✓';
+      nameButton.style.background = '#4CAF50';
+      setTimeout(() => {
+        nameButton.textContent = 'Set';
+        nameButton.style.background = '#2196F3';
+      }, 1000);
+    }
+  });
+  
+  nameInput.addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') {
+      nameButton.click();
+    }
+  });
+  
+  nameContainer.appendChild(nameInput);
+  nameContainer.appendChild(nameButton);
+  nameCell.appendChild(nameContainer);
+  nameRow.appendChild(nameCell);
+  controlTable.appendChild(nameRow);
+  
+  // Cursor toggle row
+  const cursorRow = document.createElement('tr');
+  const cursorCell = document.createElement('td');
+  
+  const cursorContainer = document.createElement('div');
+  cursorContainer.style.cssText = 'display: flex; gap: 8px; align-items: center;';
+  
+  const cursorToggle = document.createElement('button');
+  cursorToggle.textContent = 'Hide My Cursor';
+  cursorToggle.style.cssText = 'flex: 1; background: #4CAF50; color: white; border: none; padding: 8px; border-radius: 4px; cursor: pointer;';
+  
+  let cursorVisible = true;
+  cursorToggle.addEventListener('click', () => {
+    cursorVisible = !cursorVisible;
+    
+    if (cursorVisible) {
+      cursorToggle.textContent = 'Hide My Cursor';
+      cursorToggle.style.background = '#4CAF50';
+      updateMyCursor();
+    } else {
+      cursorToggle.textContent = 'Show My Cursor';
+      cursorToggle.style.background = '#f44336';
+      hideMyCursor();
+    }
+    
+    logInfo(`Cursor visibility: ${cursorVisible ? 'visible' : 'hidden'}`);
+  });
+  
+  const cursorCount = document.createElement('span');
+  cursorCount.style.cssText = 'font-size: 12px; color: #666; font-weight: bold;';
+  cursorCount.textContent = '0 users';
+  
+  cursorContainer.appendChild(cursorToggle);
+  cursorContainer.appendChild(cursorCount);
+  cursorCell.appendChild(cursorContainer);
+  cursorRow.appendChild(cursorCell);
+  controlTable.appendChild(cursorRow);
+  
+  // User list row
+  const userListRow = document.createElement('tr');
+  const userListCell = document.createElement('td');
+  
+  const userListContainer = document.createElement('div');
+  userListContainer.style.cssText = `
+    background: #f5f5f5;
+    padding: 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    max-height: 80px;
+    overflow-y: auto;
+    border: 1px solid #ddd;
+  `;
+  
+  const userListTitle = document.createElement('div');
+  userListTitle.textContent = 'Active Users:';
+  userListTitle.style.cssText = 'font-weight: bold; margin-bottom: 4px; color: #333;';
+  
+  const userList = document.createElement('div');
+  userList.id = 'active-user-list';
+  
+  userListContainer.appendChild(userListTitle);
+  userListContainer.appendChild(userList);
+  userListCell.appendChild(userListContainer);
+  userListRow.appendChild(userListCell);
+  controlTable.appendChild(userListRow);
+  
+  // Update user list and cursor count periodically
+  setInterval(() => {
+    const count = activeCursors.size;
+    cursorCount.textContent = `${count} user${count === 1 ? '' : 's'}`;
+    cursorCount.style.color = count > 0 ? '#4CAF50' : '#666';
+    
+    // Update user list
+    const userListDiv = document.getElementById('active-user-list');
+    if (userListDiv) {
+      userListDiv.innerHTML = '';
+      
+      if (count === 0) {
+        userListDiv.textContent = 'No other users online';
+        userListDiv.style.color = '#999';
+        userListDiv.style.fontStyle = 'italic';
+      } else {
+        userListDiv.style.fontStyle = 'normal';
+        activeCursors.forEach((cursor, userId) => {
+          const userItem = document.createElement('div');
+          const displayName = yUserNames.get(userId) || userId.replace('user_', 'User ');
+          const userColor = getUserColor(userId);
+          
+          userItem.style.cssText = `
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 2px;
+            padding: 2px 4px;
+            border-radius: 3px;
+            background: rgba(0,0,0,0.05);
+          `;
+          
+          const colorDot = document.createElement('div');
+          colorDot.style.cssText = `
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: ${userColor};
+            border: 1px solid white;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.2);
+          `;
+          
+          const nameSpan = document.createElement('span');
+          nameSpan.textContent = displayName;
+          nameSpan.style.cssText = 'color: #333;';
+          
+          userItem.appendChild(colorDot);
+          userItem.appendChild(nameSpan);
+          userListDiv.appendChild(userItem);
+        });
+      }
+    }
+  }, 1000);
+  
+  logSuccess('Collaborative cursor controls added');
+}
+
+// ----------------------------------------------------------------------------
+// Enhanced Mouse Interaction for 3D Scene
+// ----------------------------------------------------------------------------
+
+// Track mouse position within the VTK.js render window
+let vtkMousePosition = { x: 0, y: 0 };
+
+function enhanceVTKInteraction() {
+  // Get the VTK.js container
+  const vtkContainer = fullScreenRenderer.getContainer();
+  
+  if (vtkContainer) {
+    vtkContainer.addEventListener('mousemove', (event) => {
+      const rect = vtkContainer.getBoundingClientRect();
+      vtkMousePosition = {
+        x: event.clientX,
+        y: event.clientY,
+        relativeX: (event.clientX - rect.left) / rect.width,
+        relativeY: (event.clientY - rect.top) / rect.height
+      };
+    });
+    
+    // Add visual indicator for 3D interaction
+    vtkContainer.addEventListener('mouseenter', () => {
+      if (document.getElementById(`cursor-${userId}`)) {
+        document.getElementById(`cursor-${userId}`).style.borderColor = '#00ff00';
+      }
+    });
+    
+    vtkContainer.addEventListener('mouseleave', () => {
+      if (document.getElementById(`cursor-${userId}`)) {
+        document.getElementById(`cursor-${userId}`).style.borderColor = 'white';
+      }
+    });
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Initialization
+// ----------------------------------------------------------------------------
+
+function initializeCursorSystem() {
+  try {
+    logInfo(`Initializing collaborative cursors for user: ${userId}`);
+    
+    // Verify required dependencies
+    if (!ydoc || !yCursors) {
+      logError('Yjs not properly initialized - cursor system cannot start');
+      return false;
+    }
+    
+    if (!document.body) {
+      logError('Document not ready - deferring cursor system initialization');
+      // Try again after DOM is ready
+      document.addEventListener('DOMContentLoaded', () => {
+        initializeCursorSystem();
+      });
+      return false;
+    }
+    
+    // Set up user name first
+    setupUserName();
+    
+    // Set up mouse tracking
+    trackMouse();
+    
+    // Add cursor controls to UI (with delay to ensure table exists)
+    setTimeout(() => {
+      try {
+        addCursorControls();
+      } catch (error) {
+        logWarning(`Could not add cursor controls: ${error.message}`);
+      }
+    }, 1000);
+    
+    // Enhance VTK interaction
+    enhanceVTKInteraction();
+    
+    // Send initial cursor position after a short delay
+    setTimeout(() => {
+      if (lastMousePosition.timestamp > 0) {
+        updateMyCursor();
+      }
+    }, 2000); // Increased delay to allow name setup
+    
+    logSuccess('Collaborative cursor system initialized');
+    logProgress(`Your cursor color: ${getUserColor(userId)}`);
+    logProgress(`Your display name: ${userName || 'Default'}`);
+    logProgress('Move your mouse to see your cursor appear for other users');
+    
+    return true;
+  } catch (error) {
+    logError(`Failed to initialize cursor system: ${error.message}`);
+    return false;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Cleanup on page unload
+// ----------------------------------------------------------------------------
+
+window.addEventListener('beforeunload', () => {
+  hideMyCursor();
+  // Remove user name from shared state
+  if (yUserNames) {
+    yUserNames.delete(userId);
+  }
+});
+
+// Also clean up user names in the periodic cleanup
+setInterval(() => {
+  const now = Date.now();
+  const STALE_THRESHOLD = 30000; // 30 seconds
+  
+  activeCursors.forEach((cursor, userId) => {
+    if (now - cursor.lastUpdate > STALE_THRESHOLD) {
+      logProgress(`Removing stale cursor for ${userId}`);
+      removeCursor(userId);
+    }
+  });
+  
+  // Also clean up from Yjs
+  const allCursors = yCursors.toJSON();
+  Object.keys(allCursors).forEach(userId => {
+    const cursorData = allCursors[userId];
+    if (now - cursorData.timestamp > STALE_THRESHOLD) {
+      yCursors.delete(userId);
+      // Also remove from user names
+      yUserNames.delete(userId);
+    }
+  });
+}, 30000);
