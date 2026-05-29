@@ -2208,13 +2208,205 @@ representationSelector.addEventListener('change', (e) => {
   renderWindow.render();
 });
 
-vrbutton.addEventListener('click', (e) => {
-  if (vrbutton.textContent === 'Send To VR') {
-    XRHelper.startXR(XrSessionTypes.InlineVr);
-    vrbutton.textContent = 'Return From VR';
+// ----------------------------------------------------------------------------
+// VR Overlay UI (in-headset menu for Meta Quest 2)
+// ----------------------------------------------------------------------------
+
+function createVROverlay() {
+  // The overlay div is rendered as a flat HTML panel inside the Quest 2 headset
+  const overlay = document.createElement('div');
+  overlay.id = 'vr-overlay';
+  overlay.style.cssText = `
+    display: none;
+    position: fixed;
+    bottom: 0; left: 0; right: 0;
+    width: 100%;
+    box-sizing: border-box;
+    background: rgba(10, 10, 30, 0.92);
+    color: #ffffff;
+    font-family: Arial, sans-serif;
+    padding: 24px 32px 28px;
+    z-index: 99999;
+    border-top: 3px solid #5c6bc0;
+  `;
+
+  overlay.innerHTML = `
+    <div style="display:flex; align-items:center; margin-bottom:18px; gap:12px;">
+      <span style="font-size:28px;">🥽</span>
+      <span style="font-size:22px; font-weight:bold; letter-spacing:1px;">VR Mode — CIA Visualizer</span>
+      <button id="vr-exit-btn" style="
+        margin-left:auto;
+        background:#ef5350; color:white; border:none;
+        padding:14px 28px; font-size:18px; border-radius:8px; cursor:pointer;
+        font-weight:bold; min-width:120px; min-height:52px;">
+        ✖ Exit VR
+      </button>
+    </div>
+    <div style="display:flex; flex-wrap:wrap; gap:14px; align-items:center;">
+      <div style="display:flex; flex-direction:column; gap:6px;">
+        <label style="font-size:14px; color:#90caf9; font-weight:bold;">DISPLAY MODE</label>
+        <select id="vr-representation" style="
+          background:#1a237e; color:white; border:2px solid #5c6bc0;
+          padding:12px 16px; font-size:18px; border-radius:8px; min-width:200px; min-height:52px;">
+          <option value="0">Points</option>
+          <option value="1">Wireframe</option>
+          <option value="2" selected>Surface</option>
+        </select>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:6px;">
+        <label style="font-size:14px; color:#90caf9; font-weight:bold;">REDUCTION METHOD</label>
+        <select id="vr-method" style="
+          background:#1a237e; color:white; border:2px solid #5c6bc0;
+          padding:12px 16px; font-size:18px; border-radius:8px; min-width:200px; min-height:52px;">
+          <option value="pca" selected>PCA</option>
+          <option value="tsne">t-SNE</option>
+          <option value="umap">UMAP</option>
+        </select>
+      </div>
+      <button id="vr-toggle-reduction" style="
+        background:#1565c0; color:white; border:2px solid #42a5f5;
+        padding:12px 22px; font-size:18px; border-radius:8px; cursor:pointer;
+        font-weight:bold; min-height:52px; align-self:flex-end;">
+        ⚡ Toggle Reduction
+      </button>
+      <button id="vr-reset-camera" style="
+        background:#2e7d32; color:white; border:2px solid #66bb6a;
+        padding:12px 22px; font-size:18px; border-radius:8px; cursor:pointer;
+        font-weight:bold; min-height:52px; align-self:flex-end;">
+        🎯 Reset Camera
+      </button>
+    </div>
+    <div id="vr-status" style="
+      margin-top:14px; font-size:14px; color:#b0bec5;
+      padding:8px 12px; background:rgba(255,255,255,0.05);
+      border-radius:6px; border-left:3px solid #5c6bc0;">
+      Point your controller ray at a button and press the trigger to interact.
+    </div>
+  `;
+
+  document.body.appendChild(overlay);
+
+  // Wire up overlay controls
+  document.getElementById('vr-exit-btn').addEventListener('click', () => {
+    stopVRSession();
+  });
+
+  document.getElementById('vr-representation').addEventListener('change', (e) => {
+    const val = Number(e.target.value);
+    if (currentActor) {
+      currentActor.getProperty().setRepresentation(val);
+      renderWindow.render();
+    }
+    // Sync with the main panel selector too
+    if (representationSelector) representationSelector.value = String(val);
+  });
+
+  document.getElementById('vr-method').addEventListener('change', (e) => {
+    reductionMethod = e.target.value;
+    document.getElementById('vr-status').textContent =
+      `Reduction method set to ${reductionMethod.toUpperCase()}. Press "Toggle Reduction" to apply.`;
+  });
+
+  document.getElementById('vr-toggle-reduction').addEventListener('click', () => {
+    document.getElementById('vr-status').textContent = 'Running reduction… please wait.';
+    toggleDimensionalityReduction().then(() => {
+      document.getElementById('vr-status').textContent =
+        reductionApplied
+          ? `${reductionMethod.toUpperCase()} active. Press again to restore original.`
+          : 'Original data restored.';
+    }).catch(err => {
+      document.getElementById('vr-status').textContent = `Error: ${err.message}`;
+    });
+  });
+
+  document.getElementById('vr-reset-camera').addEventListener('click', () => {
+    renderer.resetCamera();
+    renderWindow.render();
+    document.getElementById('vr-status').textContent = 'Camera reset to default view.';
+  });
+
+  return overlay;
+}
+
+// ----------------------------------------------------------------------------
+// VR Session Management
+// ----------------------------------------------------------------------------
+
+let activeXRSession = null;
+
+async function startVRSession() {
+  if (navigator.xr === undefined) {
+    alert('WebXR is not supported in this browser.\n\nOn Meta Quest 2 via Oculus Link: open Chrome on your PC and navigate to http://localhost:8080');
+    return;
+  }
+
+  const overlayEl = document.getElementById('vr-overlay');
+
+  // Build session options — request DOM overlay so the menu shows in VR
+  const sessionInit = {
+    optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking', 'dom-overlay'],
+    domOverlay: { root: overlayEl },
+  };
+
+  try {
+    const supported = await navigator.xr.isSessionSupported('immersive-vr');
+    if (!supported) {
+      alert(
+        'Immersive VR is not supported on this device/browser.\n\n' +
+        'Meta Quest 2 via Oculus Link: make sure Oculus Link is active and\n' +
+        'open this page in Chrome on your PC, then click "Enter VR".'
+      );
+      return;
+    }
+
+    const session = await navigator.xr.requestSession('immersive-vr', sessionInit);
+    activeXRSession = session;
+
+    overlayEl.style.display = 'block';
+    vrbutton.textContent = 'Exit VR';
+
+    session.addEventListener('end', () => {
+      activeXRSession = null;
+      overlayEl.style.display = 'none';
+      vrbutton.textContent = 'Enter VR 🥽';
+      logInfo('VR session ended');
+    });
+
+    // Hand off the session to VTK.js
+    await XRHelper.enterXR(session);
+    logSuccess('VR session started — rendering in headset');
+
+  } catch (err) {
+    logError(`VR session failed: ${err.message}`);
+    // Graceful fallback — try VTK.js default path
+    try {
+      XRHelper.startXR(XrSessionTypes.HmdVR);
+      vrbutton.textContent = 'Exit VR';
+    } catch (fallbackErr) {
+      logError(`Fallback VR also failed: ${fallbackErr.message}`);
+      alert(`Could not start VR: ${err.message}`);
+    }
+  }
+}
+
+function stopVRSession() {
+  if (activeXRSession) {
+    activeXRSession.end().catch(() => {});
+    activeXRSession = null;
   } else {
-    XRHelper.stopXR();
-    vrbutton.textContent = 'Send To VR';
+    try { XRHelper.stopXR(); } catch (_) {}
+  }
+  vrbutton.textContent = 'Enter VR 🥽';
+  const overlayEl = document.getElementById('vr-overlay');
+  if (overlayEl) overlayEl.style.display = 'none';
+}
+
+vrbutton.textContent = 'Enter VR 🥽';
+vrbutton.addEventListener('click', () => {
+  if (vrbutton.textContent === 'Exit VR') {
+    stopVRSession();
+  } else {
+    startVRSession();
   }
 });
 
@@ -2236,7 +2428,10 @@ async function initializeApplication() {
   
   // Setup UI controls
   setupDimensionalityReductionControls();
-  
+
+  // Build VR overlay menu for Meta Quest 2
+  createVROverlay();
+
   // Initialize collaborative cursor system
   initializeCursorSystem(); // Add this line
   

@@ -40,10 +40,17 @@ module.exports = {
         static: {
         directory: path.join(__dirname, 'dist'),  // Serve static files from 'dist'
         },
-        compress: true,  // Enable gzip compression
-        port: 8080,  // The port to run the server on
-        open: true,  // Automatically open the browser
-        hot: true,  // Enable Hot Module Replacement
+        compress: true,       // Enable gzip compression
+        port: 8080,           // The port to run the server on
+        host: '0.0.0.0',      // Listen on all interfaces so Meta Quest 2 can connect via LAN IP
+        allowedHosts: 'all',  // Allow any host header (needed for Quest 2 browser access)
+        open: true,           // Automatically open the browser
+        hot: true,            // Enable Hot Module Replacement
+        // Headers required for SharedArrayBuffer (used by some WebXR polyfills)
+        headers: {
+          'Cross-Origin-Opener-Policy': 'same-origin',
+          'Cross-Origin-Embedder-Policy': 'require-corp',
+        },
     },
     plugins: [
         new HtmlWebpackPlugin({
