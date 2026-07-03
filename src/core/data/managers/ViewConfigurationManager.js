@@ -218,6 +218,7 @@ export class ViewConfigurationManager extends BaseManager {
       sharedWith: serverView.shared_with || [],
       savedByUser: serverView.saved_by_user,
       camera: serverView.camera,
+      visualization: serverView.visualization,
       filters: serverView.filters || [],
       widgets: serverView.widgets || [],
       colorMaps: serverView.color_maps,
@@ -259,7 +260,8 @@ export class ViewConfigurationManager extends BaseManager {
       shared_with: view.sharedWith,
       saved_by_user: view.savedByUser,
       camera: view.camera,
-      time: view.time || null,   // DR2.5: time-series playback state (ignored by server until DB migration)
+      visualization: view.visualization || null,
+      time: view.time || null,   // DR2.5: time-series playback state
       filters: view.filters,
       widgets: view.widgets,
       color_maps: view.colorMaps,
@@ -672,6 +674,22 @@ export class ViewConfigurationManager extends BaseManager {
 
     // Propagate to views that are linked to this one (followers)
     this._propagateCameraToLinkedViews(viewId, cameraState);
+  }
+
+  /**
+   * Update shared visualization state (opacity, representation, transform,
+   * colormap, slice, windowLevel, pointSize, lineWidth, activeArray, glyph).
+   * Persists to ViewConfiguration.visualization and queues a server sync.
+   * Safe to call on every change — throttled by _syncToServer (100ms).
+   */
+  updateVisualization(viewId, patch) {
+    const view = this._viewConfigs.get(viewId);
+    if (!view) return;
+
+    view.updateVisualization(patch);
+    this._syncToServer(view);
+
+    this._emit("visualizationChanged", { viewId, visualization: patch });
   }
 
   /**

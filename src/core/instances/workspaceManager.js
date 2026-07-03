@@ -315,6 +315,14 @@ class WorkspaceManager {
           state.colorMaps = view.colorMaps;
         }
 
+        if (view.visualization) {
+          state.visualization = view.visualization;
+        }
+
+        if (Array.isArray(view.widgets) && view.widgets.length > 0) {
+          state.widgets = view.widgets;
+        }
+
         // Only apply if there's state to apply
         if (Object.keys(state).length > 0) {
           log.debug(`Applying remote view state to instance ${instanceId}`);

@@ -2215,7 +2215,10 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
             this._emitToolsUpdate(instanceId);
             if (!this._isApplyingRemoteState) {
               const vId = this.instances.get(instanceId)?.viewConfigId;
-              if (vId) syncVisualizationToYjs(vId, getUserId(), { opacity: value });
+              if (vId) {
+                syncVisualizationToYjs(vId, getUserId(), { opacity: value });
+                getViewConfigurationManager()?.updateVisualization(vId, { opacity: value });
+              }
             }
           },
         },
@@ -2238,7 +2241,10 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
             this._emitToolsUpdate(instanceId);
             if (!this._isApplyingRemoteState) {
               const vId = this.instances.get(instanceId)?.viewConfigId;
-              if (vId) syncVisualizationToYjs(vId, getUserId(), { representation: "surface" });
+              if (vId) {
+                syncVisualizationToYjs(vId, getUserId(), { representation: "surface" });
+                getViewConfigurationManager()?.updateVisualization(vId, { representation: "surface" });
+              }
             }
           },
         },
@@ -2255,7 +2261,10 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
             this._emitToolsUpdate(instanceId);
             if (!this._isApplyingRemoteState) {
               const vId = this.instances.get(instanceId)?.viewConfigId;
-              if (vId) syncVisualizationToYjs(vId, getUserId(), { representation: "wireframe" });
+              if (vId) {
+                syncVisualizationToYjs(vId, getUserId(), { representation: "wireframe" });
+                getViewConfigurationManager()?.updateVisualization(vId, { representation: "wireframe" });
+              }
             }
           },
         },
@@ -2272,7 +2281,10 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
             this._emitToolsUpdate(instanceId);
             if (!this._isApplyingRemoteState) {
               const vId = this.instances.get(instanceId)?.viewConfigId;
-              if (vId) syncVisualizationToYjs(vId, getUserId(), { representation: "points" });
+              if (vId) {
+                syncVisualizationToYjs(vId, getUserId(), { representation: "points" });
+                getViewConfigurationManager()?.updateVisualization(vId, { representation: "points" });
+              }
             }
           },
         },
@@ -2757,7 +2769,10 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
                 this._emitToolsUpdate(instanceId);
                 if (!this._isApplyingRemoteState) {
                   const vId = this.instances.get(instanceId)?.viewConfigId;
-                  if (vId) syncVisualizationToYjs(vId, getUserId(), { activeArray: null });
+                  if (vId) {
+                    syncVisualizationToYjs(vId, getUserId(), { activeArray: null });
+                    getViewConfigurationManager()?.updateVisualization(vId, { activeArray: null });
+                  }
                 }
               },
             },
@@ -2772,7 +2787,10 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
                 this._emitToolsUpdate(instanceId);
                 if (!this._isApplyingRemoteState) {
                   const vId = this.instances.get(instanceId)?.viewConfigId;
-                  if (vId) syncVisualizationToYjs(vId, getUserId(), { activeArray: array.name, activeArrayType: array.type });
+                  if (vId) {
+                    syncVisualizationToYjs(vId, getUserId(), { activeArray: array.name, activeArrayType: array.type });
+                    getViewConfigurationManager()?.updateVisualization(vId, { activeArray: array.name, activeArrayType: array.type });
+                  }
                 }
               },
             })),
@@ -2798,7 +2816,10 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
                 this._emitToolsUpdate(instanceId);
                 if (!this._isApplyingRemoteState) {
                   const vId = this.instances.get(instanceId)?.viewConfigId;
-                  if (vId) syncVisualizationToYjs(vId, getUserId(), { colormap: cmapName });
+                  if (vId) {
+                    syncVisualizationToYjs(vId, getUserId(), { colormap: cmapName });
+                    getViewConfigurationManager()?.updateVisualization(vId, { colormap: cmapName });
+                  }
                 }
               },
             })),
@@ -2824,7 +2845,11 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
         this._emitToolsUpdate(instanceId);
         if (!this._isApplyingRemoteState) {
           const vId = this.instances.get(instanceId)?.viewConfigId;
-          if (vId) syncVisualizationToYjs(vId, getUserId(), { glyph: vtkGlyphFeature.getConfigForSync(instanceId) });
+          if (vId) {
+            const glyphConfig = vtkGlyphFeature.getConfigForSync(instanceId);
+            syncVisualizationToYjs(vId, getUserId(), { glyph: glyphConfig });
+            getViewConfigurationManager()?.updateVisualization(vId, { glyph: glyphConfig });
+          }
         }
       };
 
@@ -4208,6 +4233,48 @@ console.log('Tools:', tools);
           property.setRepresentation(state.visualization.representation);
         }
 
+        if (state.visualization.pointSize !== undefined) {
+          instanceTools.setPointSize(instanceId, state.visualization.pointSize);
+        }
+
+        if (state.visualization.lineWidth !== undefined) {
+          instanceTools.setLineWidth(instanceId, state.visualization.lineWidth);
+        }
+
+        // Transform: position/rotation/scale (each optional, sent independently
+        // by whichever InstanceToolsPanel handler changed)
+        if (state.visualization.transform) {
+          try {
+            const { position, rotation, scale } = state.visualization.transform;
+            if (position) instanceTools.setPosition(instanceId, ...position);
+            if (rotation) instanceTools.setRotation(instanceId, ...rotation);
+            if (scale) instanceTools.setScale(instanceId, ...scale);
+          } catch (e) {
+            log.warn("applySharedState: failed to apply transform", e);
+          }
+        }
+
+        // Slice orientation/position (units match InstanceToolsPanel: position is a 0-100 percentage)
+        if (state.visualization.slice) {
+          try {
+            const { orientation, position } = state.visualization.slice;
+            if (orientation) instanceTools.setSliceOrientation(instanceId, orientation);
+            if (position !== undefined) instanceTools.setSlicePosition(instanceId, position);
+          } catch (e) {
+            log.warn("applySharedState: failed to apply slice state", e);
+          }
+        }
+
+        // Window/level (CT/MRI intensity windowing)
+        if (state.visualization.windowLevel) {
+          try {
+            const { window, level } = state.visualization.windowLevel;
+            instanceTools.setWindowLevel(instanceId, window, level);
+          } catch (e) {
+            log.warn("applySharedState: failed to apply window/level", e);
+          }
+        }
+
         // Scalar coloring: colormap change
         if (state.visualization.colormap !== undefined) {
           try {
@@ -4281,10 +4348,30 @@ console.log('Tools:', tools);
         }
       }
 
-      // Apply widget states (when implemented)
-      // if (state.widgets) {
-      //   this._applyWidgetStates(instanceData, state.widgets);
-      // }
+      // Apply widget activation toggles (ruler/angle/plane). Diff against
+      // current state rather than blindly re-toggling — these are toggles,
+      // not idempotent setters, so re-applying an already-matching state
+      // would flip them the wrong way.
+      if (Array.isArray(state.widgets)) {
+        const instanceId = instanceData.instanceId;
+        const toggleFor = {
+          line: () => instanceTools.toggleRulerMeasurement?.(instanceId),
+          angle: () => instanceTools.toggleAngleMeasurement?.(instanceId),
+          plane: () => instanceTools.toggleClippingPlane?.(instanceId),
+        };
+        for (const widget of state.widgets) {
+          const toggle = toggleFor[widget.type];
+          if (!toggle) continue;
+          const currentlyActive = instanceTools.isWidgetActive?.(instanceId, widget.type) || false;
+          if (currentlyActive !== !!widget.active) {
+            try {
+              toggle();
+            } catch (e) {
+              log.warn(`applySharedState: failed to toggle widget ${widget.type}`, e);
+            }
+          }
+        }
+      }
 
       // Apply filter states (when implemented)
       // if (state.filters) {
