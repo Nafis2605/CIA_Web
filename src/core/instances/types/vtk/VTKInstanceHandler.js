@@ -3138,6 +3138,20 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
 
       const thresholdEnabled = thresholdState.enabled;
 
+      // Shared helper so every threshold mutation syncs to collaborators the
+      // same way glyph/colormap/opacity do (declarative params only).
+      const syncThreshold = () => {
+        this._emitToolsUpdate(instanceId);
+        if (!this._isApplyingRemoteState) {
+          const vId = this.instances.get(instanceId)?.viewConfigId;
+          if (vId) {
+            const thresholdConfig = vtkThresholdFeature.getConfigForSync(instanceId);
+            syncVisualizationToYjs(vId, getUserId(), { threshold: thresholdConfig });
+            getViewConfigurationManager()?.updateVisualization(vId, { threshold: thresholdConfig });
+          }
+        }
+      };
+
       tools.push({
         id: "threshold-filter",
         type: "menu",
@@ -3153,18 +3167,27 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
             active: thresholdEnabled,
             onClick: () => {
               vtkThresholdFeature.toggleThreshold(instanceId);
-              this._emitToolsUpdate(instanceId);
+              syncThreshold();
             },
           },
           ...(thresholdEnabled ? [
             { type: "separator" },
-            { id: "thresh-between", label: "Between", active: thresholdState.mode === 'between', onClick: () => { vtkThresholdFeature.setMode(instanceId, 'between'); this._emitToolsUpdate(instanceId); } },
-            { id: "thresh-above", label: "Above", active: thresholdState.mode === 'above', onClick: () => { vtkThresholdFeature.setMode(instanceId, 'above'); this._emitToolsUpdate(instanceId); } },
-            { id: "thresh-below", label: "Below", active: thresholdState.mode === 'below', onClick: () => { vtkThresholdFeature.setMode(instanceId, 'below'); this._emitToolsUpdate(instanceId); } },
+            { id: "thresh-between", label: "Between", active: thresholdState.mode === 'between', onClick: () => { vtkThresholdFeature.setMode(instanceId, 'between'); syncThreshold(); } },
+            { id: "thresh-above", label: "Above", active: thresholdState.mode === 'above', onClick: () => { vtkThresholdFeature.setMode(instanceId, 'above'); syncThreshold(); } },
+            { id: "thresh-below", label: "Below", active: thresholdState.mode === 'below', onClick: () => { vtkThresholdFeature.setMode(instanceId, 'below'); syncThreshold(); } },
             { type: "separator" },
-            { id: "thresh-full", label: "Full Range", onClick: () => { vtkThresholdFeature.setRange(instanceId, thresholdState.scalarRange[0], thresholdState.scalarRange[1]); this._emitToolsUpdate(instanceId); } },
-            { id: "thresh-upper", label: "Upper Half", onClick: () => { const mid = (thresholdState.scalarRange[0] + thresholdState.scalarRange[1]) / 2; vtkThresholdFeature.setRange(instanceId, mid, thresholdState.scalarRange[1]); this._emitToolsUpdate(instanceId); } },
-            { id: "thresh-lower", label: "Lower Half", onClick: () => { const mid = (thresholdState.scalarRange[0] + thresholdState.scalarRange[1]) / 2; vtkThresholdFeature.setRange(instanceId, thresholdState.scalarRange[0], mid); this._emitToolsUpdate(instanceId); } },
+            { id: "thresh-full", label: "Full Range", onClick: () => { vtkThresholdFeature.setRange(instanceId, thresholdState.scalarRange[0], thresholdState.scalarRange[1]); syncThreshold(); } },
+            { id: "thresh-upper", label: "Upper Half", onClick: () => { const mid = (thresholdState.scalarRange[0] + thresholdState.scalarRange[1]) / 2; vtkThresholdFeature.setRange(instanceId, mid, thresholdState.scalarRange[1]); syncThreshold(); } },
+            { id: "thresh-lower", label: "Lower Half", onClick: () => { const mid = (thresholdState.scalarRange[0] + thresholdState.scalarRange[1]) / 2; vtkThresholdFeature.setRange(instanceId, thresholdState.scalarRange[0], mid); syncThreshold(); } },
+            ...(thresholdState.availableArrays.length > 1 ? [
+              { type: "separator" },
+              ...thresholdState.availableArrays.map((arr) => ({
+                id: `thresh-array-${arr.name}`,
+                label: `${arr.name} (${arr.type})`,
+                active: thresholdState.selectedArray === arr.name,
+                onClick: () => { vtkThresholdFeature.selectArray(instanceId, arr.name); syncThreshold(); },
+              })),
+            ] : []),
           ] : []),
         ],
       });
@@ -4309,6 +4332,16 @@ console.log('Tools:', tools);
             log.warn("applySharedState: failed to apply glyph config", e);
           }
         }
+
+        // Threshold filter: declarative params applied via feature reconciliation
+        if (state.visualization.threshold !== undefined) {
+          try {
+            vtkThresholdFeature.applyRemoteConfig(instanceId, state.visualization.threshold);
+            this._emitToolsUpdate(instanceId);
+          } catch (e) {
+            log.warn("applySharedState: failed to apply threshold config", e);
+          }
+        }
       }
 
       // 🆕 Apply reduction state
@@ -4372,11 +4405,6 @@ console.log('Tools:', tools);
           }
         }
       }
-
-      // Apply filter states (when implemented)
-      // if (state.filters) {
-      //   this._applyFilterStates(instanceData, state.filters);
-      // }
 
       // Trigger render to show the changes (gated by isPaused)
       this._requestRender(instanceData, "remote-state");
@@ -5105,13 +5133,25 @@ console.log('Tools:', tools);
 
     const { renderer } = vrContext.sceneObjects;
 
+    // Accept either a plain {origin, direction} ray or an XRRigidTransform
+    // (what the VR tools receive as controller.targetRay). For a transform,
+    // the ray points down its -Z axis.
+    let origin = ray.origin;
+    let dir = ray.direction;
+    if ((!origin || !dir) && ray.position && ray.matrix) {
+      const m = ray.matrix;
+      origin = ray.position;
+      dir = { x: -m[8], y: -m[9], z: -m[10] };
+    }
+    if (!origin || !dir) return null;
+
     // Create VTK picker
     const picker = vtkCellPicker.newInstance();
     picker.setTolerance(0.001);
 
     // Convert ray to VTK format
-    const p1 = [ray.origin.x, ray.origin.y, ray.origin.z];
-    const direction = [ray.direction.x, ray.direction.y, ray.direction.z];
+    const p1 = [origin.x, origin.y, origin.z];
+    const direction = [dir.x, dir.y, dir.z];
     const p2 = [
       p1[0] + direction[0] * 1000,
       p1[1] + direction[1] * 1000,

@@ -144,4 +144,38 @@ describe("VTKInstanceHandler.applySharedState — new visualization branches", (
       expect(toggleRuler).not.toHaveBeenCalled();
     });
   });
+
+  describe("threshold filter sync", () => {
+    it("routes visualization.threshold to vtkThresholdFeature.applyRemoteConfig", async () => {
+      const { vtkThresholdFeature } = await import("../features/VTKThresholdFeature.js");
+      const applyRemote = vi
+        .spyOn(vtkThresholdFeature, "applyRemoteConfig")
+        .mockImplementation(() => {});
+
+      const config = { enabled: true, mode: "between", minValue: 0.2, maxValue: 0.8, selectedArray: "pressure" };
+      await handler.applySharedState(
+        instanceData,
+        { visualization: { threshold: config } },
+        "remote-user"
+      );
+
+      expect(applyRemote).toHaveBeenCalledWith("inst-1", config);
+    });
+
+    it("survives a throwing threshold apply without aborting the rest", async () => {
+      const { vtkThresholdFeature } = await import("../features/VTKThresholdFeature.js");
+      vi.spyOn(vtkThresholdFeature, "applyRemoteConfig").mockImplementation(() => {
+        throw new Error("boom");
+      });
+      const setPointSize = vi.spyOn(instanceTools, "setPointSize").mockImplementation(() => {});
+
+      await handler.applySharedState(
+        instanceData,
+        { visualization: { threshold: { enabled: true }, pointSize: 4 } },
+        "remote-user"
+      );
+
+      expect(setPointSize).toHaveBeenCalledWith("inst-1", 4);
+    });
+  });
 });

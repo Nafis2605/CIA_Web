@@ -25,6 +25,7 @@ class ServerSyncService {
     this.viewConfigurationManager = null;
     this.canvasManager = null;
     this.subsetManager = null;
+    this.annotationManager = null;
     this.pendingProjectId = null;
     this._authUnsubscribe = null;
     // DR1: workspace + user scope for watermark management
@@ -72,6 +73,14 @@ class ServerSyncService {
    */
   setSubsetManager(subsetManager) {
     this.subsetManager = subsetManager;
+  }
+
+  /**
+   * Set the AnnotationManager reference
+   * Called by appInitializer after AnnotationManager is initialized
+   */
+  setAnnotationManager(annotationManager) {
+    this.annotationManager = annotationManager;
   }
 
   connect() {
@@ -153,16 +162,64 @@ class ServerSyncService {
       }
     });
 
-    // Annotation events
-    this.on("annotation:created", (msg) =>
-      log.info(`Annotation created on ${msg.fileId}`)
-    );
-    this.on("annotation:updated", (msg) =>
-      log.info(`Annotation updated: ${msg.annotation.id}`)
-    );
-    this.on("annotation:deleted", (msg) =>
-      log.info(`Annotation deleted: ${msg.annotationId}`)
-    );
+    // Annotation events - forward to AnnotationManager and dispatch window
+    // events for the useServerSyncEvents('annotation', ...) hook path
+    this.on("annotation:created", (msg) => {
+      log.info(`Annotation created on ${msg.fileId}`);
+      this._advanceWatermark(msg.syncEventId);
+      // Skip echo of our own creation - the creator already added it locally
+      const myUserId = sessionManager.getUserId?.() || this._userId;
+      if (msg.actorUserId && myUserId && msg.actorUserId === myUserId) {
+        log.debug(`Skipping own annotation:created echo`);
+        return;
+      }
+      if (this.annotationManager) {
+        this.annotationManager.handleServerBroadcast("annotation:created", msg);
+      }
+      window.dispatchEvent(
+        new CustomEvent("ws:annotation:created", { detail: msg })
+      );
+    });
+    this.on("annotation:updated", (msg) => {
+      log.info(`Annotation updated: ${msg.annotation?.id}`);
+      this._advanceWatermark(msg.syncEventId);
+      if (this.annotationManager) {
+        this.annotationManager.handleServerBroadcast("annotation:updated", msg);
+      }
+      window.dispatchEvent(
+        new CustomEvent("ws:annotation:updated", { detail: msg })
+      );
+    });
+    this.on("annotation:deleted", (msg) => {
+      log.info(`Annotation deleted: ${msg.annotationId}`);
+      this._advanceWatermark(msg.syncEventId);
+      if (this.annotationManager) {
+        this.annotationManager.handleServerBroadcast("annotation:deleted", msg);
+      }
+      window.dispatchEvent(
+        new CustomEvent("ws:annotation:deleted", { detail: msg })
+      );
+    });
+
+    // Saved-filter events - dispatch window events for useServerSyncEvents('filter', ...)
+    this.on("filter:created", (msg) => {
+      log.info(`Filter created: ${msg.filter?.name || msg.filter?.id}`);
+      window.dispatchEvent(
+        new CustomEvent("ws:filter:created", { detail: msg })
+      );
+    });
+    this.on("filter:updated", (msg) => {
+      log.info(`Filter updated: ${msg.filter?.id}`);
+      window.dispatchEvent(
+        new CustomEvent("ws:filter:updated", { detail: msg })
+      );
+    });
+    this.on("filter:deleted", (msg) => {
+      log.info(`Filter deleted: ${msg.filterId}`);
+      window.dispatchEvent(
+        new CustomEvent("ws:filter:deleted", { detail: msg })
+      );
+    });
 
     // View events - forward to ViewConfigurationManager
     this.on("view:created", (msg) => {

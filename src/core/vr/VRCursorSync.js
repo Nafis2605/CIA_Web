@@ -35,6 +35,7 @@ export class VRCursorSync {
 
     // Render callbacks per view
     this._renderCallbacks = new Map(); // viewId -> callback
+    this._handCallbacks = new Set(); // callbacks for remote hand pose updates
 
     // Cached remote cursors
     this._remoteCursors = new Map(); // odUserId -> cursorData
@@ -331,13 +332,27 @@ export class VRCursorSync {
   }
 
   /**
+   * Register a callback for remote hand pose updates.
+   * Callback signature: (userId, hand, handData|null)
+   * @returns {Function} Unsubscribe function
+   */
+  onHandUpdate(callback) {
+    if (typeof callback !== "function") return () => {};
+    this._handCallbacks.add(callback);
+    return () => this._handCallbacks.delete(callback);
+  }
+
+  /**
    * Notify hand tracking callbacks
    */
   _notifyHandCallbacks(odUserId, hand, handData) {
-    // TODO: Implement hand tracking callbacks
-    log.debug(
-      "VRCursorSync._notifyHandCallbacks() - STUB: Not fully implemented"
-    );
+    this._handCallbacks.forEach((cb) => {
+      try {
+        cb(odUserId, hand, handData);
+      } catch (error) {
+        log.error("Hand callback error:", error);
+      }
+    });
   }
 
   // ===========================================================================
@@ -373,6 +388,7 @@ export class VRCursorSync {
 
     // Clear callbacks
     this._renderCallbacks.clear();
+    this._handCallbacks.clear();
     this._remoteCursors.clear();
 
     // Clear references
