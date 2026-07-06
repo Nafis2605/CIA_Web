@@ -1594,6 +1594,7 @@ export class ViewConfigurationManager extends BaseManager {
     const view = this._viewConfigs.get(viewId);
     if (!view?.hasConflict) return;
 
+    const conflictBackup = view.conflict;
     view.hasConflict = false;
     view.conflict = null;
 
@@ -1612,8 +1613,13 @@ export class ViewConfigurationManager extends BaseManager {
       view.pendingServerSync = false;
       log.info(`Conflict resolved (force overwrite) for view ${viewId}`);
     } catch (error) {
+      // Restore the conflict so the dialog can offer another resolution path,
+      // and propagate so the caller (ConflictResolutionDialog) can surface it.
       log.error(`Force overwrite failed for view ${viewId}:`, error);
+      view.hasConflict = true;
+      view.conflict = conflictBackup;
       view.pendingServerSync = true;
+      throw error;
     }
   }
 
@@ -1635,7 +1641,10 @@ export class ViewConfigurationManager extends BaseManager {
       this.resolveConflictUseServer(viewId);
       log.info(`Conflict resolved (save as copy) for view ${viewId}`);
     } catch (error) {
+      // Conflict state is untouched (duplicate failed before any resolution),
+      // so re-throw for the dialog to report and keep its options open.
       log.error(`Save-as-copy failed for view ${viewId}:`, error);
+      throw error;
     }
   }
 

@@ -282,6 +282,7 @@ export class AnnotationManager extends BaseManager {
     if (!annotation?.hasConflict) return;
 
     const clientObj = annotation.conflict?.clientObject || {};
+    const conflictBackup = annotation.conflict;
     annotation.hasConflict = false;
     annotation.conflict = null;
 
@@ -294,7 +295,11 @@ export class AnnotationManager extends BaseManager {
       if (newRevision != null) annotation.revision = Number(newRevision);
       this._log.info(`Conflict resolved (force overwrite) for annotation ${annotationId}`);
     } catch (err) {
+      // Restore conflict state and propagate so the dialog can report failure.
       this._log.error(`Force overwrite failed for annotation ${annotationId}:`, err);
+      annotation.hasConflict = true;
+      annotation.conflict = conflictBackup;
+      throw err;
     }
 
     if (dataset) {

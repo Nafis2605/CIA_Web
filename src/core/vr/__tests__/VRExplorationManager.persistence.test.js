@@ -5,7 +5,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("@Utils/logger.js", () => {
   const mkLog = () => ({ info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() });
-  return { vr: mkLog(), createLogger: () => mkLog() };
+  return { vr: mkLog(), app: mkLog(), createLogger: () => mkLog() };
 });
 
 vi.mock("@Core/vr/VRManager.js", () => ({

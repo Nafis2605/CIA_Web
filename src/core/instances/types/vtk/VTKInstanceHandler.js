@@ -33,6 +33,7 @@ import { vtkThresholdPointsFeature } from "@VTK/features/VTKThresholdPointsFeatu
 import { vtkAnnotationWidgetsFeature } from "@VTK/features/VTKAnnotationWidgetsFeature";
 import { vtkResliceCursorFeature } from "@VTK/features/VTKResliceCursorFeature";
 import { vtkMeasurementWidgetsFeature } from "@VTK/features/VTKMeasurementWidgetsFeature";
+import { vtkAnnotationLinesFeature } from "@VTK/features/VTKAnnotationLinesFeature";
 import { vtkImplicitPlaneFeature } from "@VTK/features/VTKImplicitPlaneFeature";
 import { vtkImageCroppingFeature } from "@VTK/features/VTKImageCroppingFeature";
 import { vtkCleanPolyDataFeature } from "@VTK/features/VTKCleanPolyDataFeature";
@@ -41,10 +42,42 @@ import { vtkInstanceCursors } from "@VTK/collaboration/VTKInstanceCursors.js";
 import { getViewConfigurationManager } from "@Init/appInitializer.js";
 import {
   syncCameraToYjs,
-  syncVisualizationToYjs,
+  syncVisualizationToYjs as _syncVisualizationToYjs,
   syncManipulatorToYjs,
 } from "@Collaboration/yjs/yjsSetup.js";
 import { getUserId, getUserName } from "@Collaboration/presence/userManagement.js";
+import { metricsService } from "@Services/metrics/metricsService.js";
+
+/**
+ * Thin instrumentation wrapper around syncVisualizationToYjs. Stamps the
+ * outgoing patch with a `_syncOriginTs` (this client's send-time, ms epoch)
+ * so the receiving side (applySharedState, below) can compute an end-to-end
+ * apply-latency delta. Falls back to the plain (uninstrumented) call if
+ * anything here throws — instrumentation must never break the Y.js sync
+ * path. See src/services/metrics/metricsService.js for the latency-metrics
+ * module and its clock-skew caveat.
+ * @param {string} viewId
+ * @param {string} userId
+ * @param {Object} vizState
+ */
+function syncVisualizationToYjs(viewId, userId, vizState) {
+  try {
+    return _syncVisualizationToYjs(viewId, userId, {
+      ...vizState,
+      _syncOriginTs: Date.now(),
+    });
+  } catch (err) {
+    // Instrumentation failure — fall back to uninstrumented call so sync
+    // itself is unaffected.
+    try {
+      return _syncVisualizationToYjs(viewId, userId, vizState);
+    } catch {
+      // If even the fallback throws, let it propagate as it would have
+      // without instrumentation (original behavior).
+      throw err;
+    }
+  }
+}
 
 // Raycasting and cursor collaboration
 import {
@@ -363,6 +396,7 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
     await vtkAnnotationWidgetsFeature.cleanup(instanceId);
     await vtkResliceCursorFeature.cleanup(instanceId);
     await vtkMeasurementWidgetsFeature.cleanup(instanceId);
+    await vtkAnnotationLinesFeature.cleanup(instanceId);
     await vtkImplicitPlaneFeature.cleanup(instanceId);
     await vtkImageCroppingFeature.cleanup(instanceId);
     await vtkCleanPolyDataFeature.cleanup(instanceId);
@@ -843,6 +877,7 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
     await vtkAnnotationWidgetsFeature.initialize(instanceId, instanceData);
     await vtkResliceCursorFeature.initialize(instanceId, instanceData);
     await vtkMeasurementWidgetsFeature.initialize(instanceId, instanceData);
+    await vtkAnnotationLinesFeature.initialize(instanceId, instanceData);
     await vtkImplicitPlaneFeature.initialize(instanceId, instanceData);
     await vtkImageCroppingFeature.initialize(instanceId, instanceData);
     await vtkCleanPolyDataFeature.initialize(instanceId, instanceData);
@@ -3012,6 +3047,20 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
       const sliceState = vtkSliceFeature.getState(instanceId);
       const sliceEnabled = sliceState?.enabled || false;
 
+      // Shared helper so every slice-plane mutation syncs to collaborators
+      // and persists into the view configuration the same way glyph/threshold do.
+      const syncSlicePlane = () => {
+        this._emitToolsUpdate(instanceId);
+        if (!this._isApplyingRemoteState) {
+          const vId = this.instances.get(instanceId)?.viewConfigId;
+          if (vId) {
+            const sliceConfig = vtkSliceFeature.getConfigForSync(instanceId);
+            syncVisualizationToYjs(vId, getUserId(), { slicePlane: sliceConfig });
+            getViewConfigurationManager()?.updateVisualization(vId, { slicePlane: sliceConfig });
+          }
+        }
+      };
+
       tools.push({
         id: "slice-viewing",
         type: "menu",
@@ -3034,14 +3083,14 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
                   instanceData.imageData
                 );
               }
-              this._emitToolsUpdate(instanceId);
+              syncSlicePlane();
             },
           },
           ...(sliceEnabled ? [
             { type: "separator" },
-            { id: "slice-axial", label: "Axial (Z)", active: sliceState.sliceMode === 2, onClick: () => { vtkSliceFeature.setSliceMode(instanceId, 2); this._emitToolsUpdate(instanceId); } },
-            { id: "slice-coronal", label: "Coronal (Y)", active: sliceState.sliceMode === 1, onClick: () => { vtkSliceFeature.setSliceMode(instanceId, 1); this._emitToolsUpdate(instanceId); } },
-            { id: "slice-sagittal", label: "Sagittal (X)", active: sliceState.sliceMode === 0, onClick: () => { vtkSliceFeature.setSliceMode(instanceId, 0); this._emitToolsUpdate(instanceId); } },
+            { id: "slice-axial", label: "Axial (Z)", active: sliceState.sliceMode === 2, onClick: () => { vtkSliceFeature.setSliceMode(instanceId, 2); syncSlicePlane(); } },
+            { id: "slice-coronal", label: "Coronal (Y)", active: sliceState.sliceMode === 1, onClick: () => { vtkSliceFeature.setSliceMode(instanceId, 1); syncSlicePlane(); } },
+            { id: "slice-sagittal", label: "Sagittal (X)", active: sliceState.sliceMode === 0, onClick: () => { vtkSliceFeature.setSliceMode(instanceId, 0); syncSlicePlane(); } },
           ] : []),
         ],
       });
@@ -3098,6 +3147,20 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
 
       const clippingEnabled = clippingState.enabled;
 
+      // Shared helper so every clip-box mutation syncs to collaborators and
+      // persists into the view configuration the same way glyph/threshold do.
+      const syncClipBox = () => {
+        this._emitToolsUpdate(instanceId);
+        if (!this._isApplyingRemoteState) {
+          const vId = this.instances.get(instanceId)?.viewConfigId;
+          if (vId) {
+            const clipConfig = vtkClippingFeature.getConfigForSync(instanceId);
+            syncVisualizationToYjs(vId, getUserId(), { clipBox: clipConfig });
+            getViewConfigurationManager()?.updateVisualization(vId, { clipBox: clipConfig });
+          }
+        }
+      };
+
       tools.push({
         id: "clipping-plane",
         type: "menu",
@@ -3113,17 +3176,17 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
             active: clippingEnabled,
             onClick: () => {
               vtkClippingFeature.toggleClipping(instanceId);
-              this._emitToolsUpdate(instanceId);
+              syncClipBox();
             },
           },
           ...(clippingEnabled ? [
             { type: "separator" },
-            { id: "clip-x", label: "X-Axis (YZ)", active: clippingState.planePreset === 'x', onClick: () => { vtkClippingFeature.setPlanePreset(instanceId, 'x'); this._emitToolsUpdate(instanceId); } },
-            { id: "clip-y", label: "Y-Axis (XZ)", active: clippingState.planePreset === 'y', onClick: () => { vtkClippingFeature.setPlanePreset(instanceId, 'y'); this._emitToolsUpdate(instanceId); } },
-            { id: "clip-z", label: "Z-Axis (XY)", active: clippingState.planePreset === 'z', onClick: () => { vtkClippingFeature.setPlanePreset(instanceId, 'z'); this._emitToolsUpdate(instanceId); } },
+            { id: "clip-x", label: "X-Axis (YZ)", active: clippingState.planePreset === 'x', onClick: () => { vtkClippingFeature.setPlanePreset(instanceId, 'x'); syncClipBox(); } },
+            { id: "clip-y", label: "Y-Axis (XZ)", active: clippingState.planePreset === 'y', onClick: () => { vtkClippingFeature.setPlanePreset(instanceId, 'y'); syncClipBox(); } },
+            { id: "clip-z", label: "Z-Axis (XY)", active: clippingState.planePreset === 'z', onClick: () => { vtkClippingFeature.setPlanePreset(instanceId, 'z'); syncClipBox(); } },
             { type: "separator" },
-            { id: "clip-invert", label: clippingState.inverted ? "Normal Direction" : "Invert Direction", onClick: () => { vtkClippingFeature.invertClipping(instanceId); this._emitToolsUpdate(instanceId); } },
-            { id: "clip-reset", label: "Reset Plane", onClick: () => { vtkClippingFeature.resetPlane(instanceId); this._emitToolsUpdate(instanceId); } },
+            { id: "clip-invert", label: clippingState.inverted ? "Normal Direction" : "Invert Direction", onClick: () => { vtkClippingFeature.invertClipping(instanceId); syncClipBox(); } },
+            { id: "clip-reset", label: "Reset Plane", onClick: () => { vtkClippingFeature.resetPlane(instanceId); syncClipBox(); } },
           ] : []),
         ],
       });
@@ -4218,6 +4281,20 @@ console.log('Tools:', tools);
     // Set flag to prevent sync loops
     this._isApplyingRemoteState = true;
 
+    // Sync-latency instrumentation (send → apply). `state.visualization._syncOriginTs`
+    // is stamped by the syncVisualizationToYjs wrapper above at send time on the
+    // originating client. Same-machine multi-tab deltas are valid latency
+    // measurements; cross-machine deltas are subject to clock skew — see the
+    // caveat in src/services/metrics/metricsService.js. try/catch-safe no-op.
+    try {
+      const originTs = state?.visualization?._syncOriginTs;
+      if (typeof originTs === "number") {
+        metricsService.recordFromOrigin("yjs-visualization", originTs);
+      }
+    } catch {
+      // metrics must never break sync — ignore
+    }
+
     try {
       log.debug(`Applying remote state from user ${sourceUserId}`);
 
@@ -4340,6 +4417,30 @@ console.log('Tools:', tools);
             this._emitToolsUpdate(instanceId);
           } catch (e) {
             log.warn("applySharedState: failed to apply threshold config", e);
+          }
+        }
+
+        // Slice plane (volumetric slice viewer): full config applied via feature's
+        // own reconciliation logic. Distinct from the legacy visualization.slice
+        // {orientation, position} branch above, which drives InstanceToolsPanel's
+        // simpler slice controls.
+        if (state.visualization.slicePlane !== undefined) {
+          try {
+            vtkSliceFeature.applyRemoteConfig(instanceId, instanceData.imageData, state.visualization.slicePlane);
+            this._emitToolsUpdate(instanceId);
+          } catch (e) {
+            log.warn("applySharedState: failed to apply slice plane config", e);
+          }
+        }
+
+        // Clip box (interactive clipping plane): declarative params applied via
+        // feature reconciliation
+        if (state.visualization.clipBox !== undefined) {
+          try {
+            vtkClippingFeature.applyRemoteConfig(instanceId, state.visualization.clipBox);
+            this._emitToolsUpdate(instanceId);
+          } catch (e) {
+            log.warn("applySharedState: failed to apply clip box config", e);
           }
         }
       }

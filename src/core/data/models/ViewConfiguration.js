@@ -409,8 +409,13 @@ export class ViewConfiguration {
     // Shared per-view rendering state that doesn't have its own dedicated
     // container yet: opacity, representation, pointSize, lineWidth, colormap,
     // activeArray/activeArrayType, transform {position,rotation,scale}, slice
-    // {orientation,position}, windowLevel {window,level}, glyph. Merged shallowly
-    // per top-level key by updateVisualization(); handler interprets contents.
+    // {orientation,position}, windowLevel {window,level}, glyph, threshold,
+    // slicePlane (VTKSliceFeature.getConfigForSync — volumetric slice viewer:
+    // enabled/sliceMode/sliceIndex/windowWidth/windowLevel/interpolate),
+    // clipBox (VTKClippingFeature.getConfigForSync — interactive clipping
+    // plane: enabled/inverted/planePreset/plane{origin,normal}). Merged
+    // shallowly per top-level key by updateVisualization(); handler
+    // interprets contents.
     this.visualization = config.visualization || null;
     this.filters = config.filters || [];
     this.widgets = config.widgets || [];

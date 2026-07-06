@@ -21,6 +21,8 @@ import { getUserId, getUserName, getUserColor } from '@Collaboration/presence/us
 import { apiClient } from '@Services/apiClient.js';
 import { BaseManager } from '@Core/data/managers/BaseManager.js';
 import { vrAvatarSystem } from '@Core/instances/types/vtk/vr/VTKVRAvatars.js';
+import { vrSpatialUI } from '@Core/instances/types/vtk/vr/VTKVRSpatialUI.js';
+import { vrMultiViewGrid } from '@Core/vr/VRMultiViewGrid.js';
 
 class VRExplorationManager extends BaseManager {
   constructor() {
@@ -167,6 +169,14 @@ class VRExplorationManager extends BaseManager {
       vrAvatarSystem.initialize(avatarRenderer, session, vrContext);
     }
 
+    // Initialize the in-scene spatial tool menu. WebXR immersive sessions do
+    // not render the DOM, so this VTK panel — not the React VRWristMenu — is
+    // the guaranteed in-headset UI. It shares this manager as its source of
+    // truth (tool select / undo / isolation toggle / exit all route back here).
+    if (avatarRenderer) {
+      vrSpatialUI.initialize(avatarRenderer, this);
+    }
+
     // Emit event
     this._emit('explorationStarted', { session, instanceId });
 
@@ -290,6 +300,8 @@ class VRExplorationManager extends BaseManager {
 
     // Clean up sub-managers
     this._participantSync?.stop();
+    vrMultiViewGrid.disable();
+    vrSpatialUI.dispose();
     vrAvatarSystem.dispose();
     await this._toolManager?.cleanup();
     this._snapshotManager?.cleanup();
@@ -401,6 +413,21 @@ class VRExplorationManager extends BaseManager {
 
   getActiveTool() {
     return this._toolManager?.getActiveTool();
+  }
+
+  /**
+   * Undo the active tool's most recent action (e.g. remove the last VR
+   * annotation or measurement). Routes the resulting tool action through the
+   * same _handleToolAction path the controller A-button uses, so persistence
+   * and broadcast stay consistent. Invoked by the spatial menu's Undo button.
+   * @returns {boolean} true if something was undone
+   */
+  undoLastToolAction() {
+    const tool = this._toolManager?.getActiveTool?.();
+    const action = tool?.undoLast?.();
+    if (!action) return false;
+    this._handleToolAction(action);
+    return true;
   }
 
   getAvailableTools() {
@@ -537,6 +564,88 @@ class VRExplorationManager extends BaseManager {
   }
 
   // ===========================================================================
+  // MULTI-VIEW GRID MODE
+  // ===========================================================================
+  //
+  // Shows the workspace's OTHER open VTK views as a grid of datasets inside
+  // the active VR scene (proxy actors sharing the source views' mappers —
+  // see VRMultiViewGrid). Source views are never mutated, and the grid is
+  // strictly session-local: nothing is broadcast to other participants.
+
+  /**
+   * Enable grid mode: every other open VTK instance with loaded data appears
+   * as a scaled-down dataset in a grid in front of the user.
+   * @returns {boolean} true if the grid is now showing at least one view
+   */
+  enableGridMode() {
+    const ctx = this._activeContext?.vrContext;
+    const sceneObjects = ctx?.sceneObjects;
+    if (!sceneObjects?.renderer) {
+      log.warn('Cannot enable grid mode: no active VR context');
+      return false;
+    }
+
+    const activeInstanceId = this._activeContext.instance?.instanceId;
+    const others = [];
+    for (const instance of workspaceManager.getInstancesByType('vtk')) {
+      if (!instance || instance.instanceId === activeInstanceId) continue;
+      const data = instance.instanceData;
+      if (!data?.hasData) continue;
+
+      // Prefer the source renderer's full actor list (includes glyphs,
+      // annotation lines, etc.); fall back to the primary data actor.
+      let actors = [];
+      try {
+        actors = data.sceneObjects?.renderer?.getActors?.() || [];
+      } catch {
+        actors = [];
+      }
+      if (actors.length === 0 && data.sceneObjects?.actor) {
+        actors = [data.sceneObjects.actor];
+      }
+      if (actors.length > 0) {
+        others.push({ instanceId: instance.instanceId, actors });
+      }
+    }
+
+    const shown = vrMultiViewGrid.enable(sceneObjects, others);
+    this._emit('gridModeChanged', { enabled: shown > 0, viewCount: shown });
+    return shown > 0;
+  }
+
+  /**
+   * Disable grid mode and remove all proxy actors from the VR scene.
+   * @returns {boolean} always false (grid is now inactive)
+   */
+  disableGridMode() {
+    if (vrMultiViewGrid.isEnabled()) {
+      vrMultiViewGrid.disable();
+      this._emit('gridModeChanged', { enabled: false, viewCount: 0 });
+    }
+    return false;
+  }
+
+  /**
+   * Toggle grid mode.
+   * @returns {boolean} whether the grid is now enabled
+   */
+  toggleGridMode() {
+    return vrMultiViewGrid.isEnabled() ? this.disableGridMode() : this.enableGridMode();
+  }
+
+  isGridModeEnabled() {
+    return vrMultiViewGrid.isEnabled();
+  }
+
+  /**
+   * Highlight/grab a grid placement (instance id). Pass null to clear.
+   * @param {string|null} instanceId
+   */
+  setGridTarget(instanceId) {
+    vrMultiViewGrid.setTargeted(instanceId);
+  }
+
+  // ===========================================================================
   // SNAPSHOTS (delegated to VRSnapshotManager)
   // ===========================================================================
 
@@ -621,6 +730,9 @@ class VRExplorationManager extends BaseManager {
 
       // Update avatar system
       vrAvatarSystem.update(deltaTime, inputState);
+
+      // Update the in-scene tool menu (hover/tap hit-testing + head anchoring)
+      vrSpatialUI.update(inputState);
 
       // Let handler update VR rendering
       handler.updateVRExploration?.(vrContext, frame, inputState);
@@ -754,6 +866,9 @@ class VRExplorationManager extends BaseManager {
       case 'measurement-created':
         this._emit('measurementCreated', action.data);
         this._persistVRMeasurement(action.data);
+        break;
+      case 'measurement-removed':
+        this._emit('measurementRemoved', action.data);
         break;
       case 'slice-plane-updated':
         this._emit('slicePlaneUpdated', action.data);

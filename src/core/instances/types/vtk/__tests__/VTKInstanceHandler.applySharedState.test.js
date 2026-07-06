@@ -13,6 +13,7 @@ import { instanceTools } from "../vtkInstanceTools.js";
 function makeInstanceData(instanceId = "inst-1") {
   return {
     instanceId,
+    imageData: { fake: "imageData" },
     sceneObjects: {
       actor: {
         getProperty: () => ({
@@ -172,6 +173,74 @@ describe("VTKInstanceHandler.applySharedState — new visualization branches", (
       await handler.applySharedState(
         instanceData,
         { visualization: { threshold: { enabled: true }, pointSize: 4 } },
+        "remote-user"
+      );
+
+      expect(setPointSize).toHaveBeenCalledWith("inst-1", 4);
+    });
+  });
+
+  describe("slice plane sync", () => {
+    it("routes visualization.slicePlane to vtkSliceFeature.applyRemoteConfig", async () => {
+      const { vtkSliceFeature } = await import("../features/VTKSliceFeature.js");
+      const applyRemote = vi
+        .spyOn(vtkSliceFeature, "applyRemoteConfig")
+        .mockImplementation(() => {});
+
+      const config = { enabled: true, sliceMode: 2, sliceIndex: 10, windowWidth: 400, windowLevel: 200, interpolate: true };
+      await handler.applySharedState(
+        instanceData,
+        { visualization: { slicePlane: config } },
+        "remote-user"
+      );
+
+      expect(applyRemote).toHaveBeenCalledWith("inst-1", instanceData.imageData, config);
+    });
+
+    it("survives a throwing slice plane apply without aborting the rest", async () => {
+      const { vtkSliceFeature } = await import("../features/VTKSliceFeature.js");
+      vi.spyOn(vtkSliceFeature, "applyRemoteConfig").mockImplementation(() => {
+        throw new Error("boom");
+      });
+      const setPointSize = vi.spyOn(instanceTools, "setPointSize").mockImplementation(() => {});
+
+      await handler.applySharedState(
+        instanceData,
+        { visualization: { slicePlane: { enabled: true }, pointSize: 4 } },
+        "remote-user"
+      );
+
+      expect(setPointSize).toHaveBeenCalledWith("inst-1", 4);
+    });
+  });
+
+  describe("clip box sync", () => {
+    it("routes visualization.clipBox to vtkClippingFeature.applyRemoteConfig", async () => {
+      const { vtkClippingFeature } = await import("../features/VTKClippingFeature.js");
+      const applyRemote = vi
+        .spyOn(vtkClippingFeature, "applyRemoteConfig")
+        .mockImplementation(() => {});
+
+      const config = { enabled: true, inverted: false, planePreset: "x", plane: { origin: [0, 0, 0], normal: [1, 0, 0] } };
+      await handler.applySharedState(
+        instanceData,
+        { visualization: { clipBox: config } },
+        "remote-user"
+      );
+
+      expect(applyRemote).toHaveBeenCalledWith("inst-1", config);
+    });
+
+    it("survives a throwing clip box apply without aborting the rest", async () => {
+      const { vtkClippingFeature } = await import("../features/VTKClippingFeature.js");
+      vi.spyOn(vtkClippingFeature, "applyRemoteConfig").mockImplementation(() => {
+        throw new Error("boom");
+      });
+      const setPointSize = vi.spyOn(instanceTools, "setPointSize").mockImplementation(() => {});
+
+      await handler.applySharedState(
+        instanceData,
+        { visualization: { clipBox: { enabled: true }, pointSize: 4 } },
         "remote-user"
       );
 
