@@ -1,8 +1,6 @@
 // src/core/vr/VRCursorSync.js
 // Synchronizes cursor positions between desktop and VR users
 //
-// STUB: Structure only, implementation deferred per DEC-014
-//
 // Cross-Platform Cursor Visibility (DEC-017):
 // - Desktop cursors visible in VR as floating dots/rays
 // - VR controller pointers visible on desktop as projected rays
@@ -67,6 +65,11 @@ export class VRCursorSync {
     this._localUserName = userName;
     this._localUserColor = userColor;
 
+    // Idempotent: both the VR session (broadcast side) and desktop views
+    // (render side, VTKRemoteVRRays) call this — observers attach once.
+    if (this._observersAttached) return;
+    this._observersAttached = true;
+
     // Get Y.js maps
     this._yCursors = ydoc.getMap("vrCursors");
     this._yHands = ydoc.getMap("vrHands");
@@ -82,7 +85,7 @@ export class VRCursorSync {
    */
   _setupObservers() {
     // Cursor updates
-    this._yCursors.observe((event) => {
+    const cursorObserver = (event) => {
       event.changes.keys.forEach((change, odUserId) => {
         if (odUserId === this._localUserId) return; // Ignore own updates
 
@@ -95,10 +98,12 @@ export class VRCursorSync {
           this._notifyRenderCallbacks(odUserId, cursorData);
         }
       });
-    });
+    };
+    this._yCursors.observe(cursorObserver);
+    this._cursorObserverDisposer = () => this._yCursors?.unobserve(cursorObserver);
 
     // Hand tracking updates (separate for higher frequency)
-    this._yHands.observe((event) => {
+    const handObserver = (event) => {
       event.changes.keys.forEach((change, key) => {
         // Key format: odUserId_left or odUserId_right
         const [odUserId, hand] = key.split("_");
@@ -112,7 +117,9 @@ export class VRCursorSync {
           this._notifyHandCallbacks(odUserId, hand, handData);
         }
       });
-    });
+    };
+    this._yHands.observe(handObserver);
+    this._handObserverDisposer = () => this._yHands?.unobserve(handObserver);
   }
 
   // ===========================================================================
@@ -385,6 +392,17 @@ export class VRCursorSync {
     // Clear local cursor
     this.clearCursor();
     this.clearHands();
+
+    // Detach Y.js observers so a later initialize() can re-attach cleanly
+    try {
+      this._cursorObserverDisposer?.();
+      this._handObserverDisposer?.();
+    } catch {
+      // maps may already be gone
+    }
+    this._cursorObserverDisposer = null;
+    this._handObserverDisposer = null;
+    this._observersAttached = false;
 
     // Clear callbacks
     this._renderCallbacks.clear();

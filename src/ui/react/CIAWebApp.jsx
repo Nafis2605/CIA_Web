@@ -8,6 +8,7 @@ import React, { useEffect, useState, useCallback, useMemo } from "react";
 import { ui as log } from "@Utils/logger.js";
 import { sessionManager } from "@Core/session/sessionManager.js";
 import { authService } from "@Services/authService.js";
+import { followService } from "@Services/followService.js";
 import { presenceSystem } from "@Collaboration/presence/presenceSystem.js";
 
 // Layout
@@ -41,6 +42,7 @@ import { SessionPanel } from "@UI/react/components/panels/SessionPanel/SessionPa
 // Modals
 import { CreateRoomModal } from "@UI/react/components/modals/CreateRoomModal";
 import { DatasetSelectorModal } from "@UI/react/components/modals/DatasetSelectorModal";
+import { SnapshotPickerModal } from "@UI/react/components/modals/SnapshotPickerModal";
 import { DeleteViewDialog } from "@UI/react/components/modals/confirmations/DeleteViewDialog";
 
 // Sync conflict resolution (mounted globally so any manager's 'cia:sync-conflict' surfaces it)
@@ -81,6 +83,11 @@ export function CIAWebApp({ username, userId, projectId }) {
   useEffect(() => {
     setWorkspaceRoomId(currentRoomId || null);
   }, [currentRoomId]);
+
+  // Follow-user service: wire camera-feed + window-event subscriptions once.
+  useEffect(() => {
+    followService.init();
+  }, []);
 
   const resolvedWorkspaceRoomId = useMemo(
     () => workspaceRoomId || currentRoomId || sessionManager.getRoomId?.() || null,
@@ -440,6 +447,9 @@ export function CIAWebApp({ username, userId, projectId }) {
                         targetRow={datasetSelectorTarget?.row ?? 0}
                         targetCol={datasetSelectorTarget?.col ?? 0}
                       />
+
+                      {/* Global snapshot picker — opens on cia:show-snapshot-picker */}
+                      <SnapshotPickerModal />
 
                       <DeleteViewDialog
                         isOpen={deleteViewTarget !== null}

@@ -51,6 +51,7 @@ export { apiClient } from "./apiClient.js";
 export { DivergenceLevel, calculateDivergence, checkForServerReset, checkSyncStatus, clearSyncState, fetchServerStatus, performReconciliation, updateSyncState } from "./syncService.js";
 export { serverSync } from "./serverSync.js";
 export { replayService, REPLAY_EVENTS, REPLAY_SPEEDS } from "./replayService.js";
+export { followService } from "./followService.js";
 export { initializeStorageProvider, checkServerHealth, getStorageConfig } from "./storage/storageService.js";
 export { dataCache } from "./storage/dataCache.js";
 

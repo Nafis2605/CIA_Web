@@ -22,6 +22,7 @@ import { ydoc } from "@Collaboration/yjs/yjsSetup.js";
 import { instanceTypeRegistry } from "@Core/instances/types/instanceTypeRegistry.js";
 import { config } from "@Core/config/clientConfig.js";
 import { sessionManager } from "@Core/session/sessionManager.js";
+import cameraSharePolicy from "@Core/session/cameraSharePolicy.js";
 import { apiClient } from "@Services/apiClient.js";
 import { BaseManager } from "@Core/data/managers/BaseManager.js";
 
@@ -667,6 +668,14 @@ export class ViewConfigurationManager extends BaseManager {
     if (!view) return;
 
     view.updateCamera(cameraState);
+
+    // Personal-camera mode: keep the change local — no server persistence and
+    // no propagation to collaborators/linked views (see cameraSharePolicy).
+    if (!cameraSharePolicy.isCameraShared()) {
+      this._emit("cameraChanged", { viewId, camera: cameraState });
+      return;
+    }
+
     this._syncToServer(view);
 
     // Emit camera changed event for this view

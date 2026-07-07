@@ -23,6 +23,10 @@ import { BaseManager } from '@Core/data/managers/BaseManager.js';
 import { vrAvatarSystem } from '@Core/instances/types/vtk/vr/VTKVRAvatars.js';
 import { vrSpatialUI } from '@Core/instances/types/vtk/vr/VTKVRSpatialUI.js';
 import { vrMultiViewGrid } from '@Core/vr/VRMultiViewGrid.js';
+import { vtkClippingFeature, vtkSliceFeature } from '@Core/instances/types/vtk/features/index.js';
+import { pushSharedVisualizationUpdate } from '@Services/visualizationSyncService.js';
+import { vrCursorSync } from '@Core/vr/VRCursorSync.js';
+import { mapXRPointToData, controllerForward } from '@Core/vr/tools/vrPlaneMath.js';
 
 class VRExplorationManager extends BaseManager {
   constructor() {
@@ -169,6 +173,10 @@ class VRExplorationManager extends BaseManager {
       vrAvatarSystem.initialize(avatarRenderer, session, vrContext);
     }
 
+    // Pointer-ray broadcasting: desktop collaborators render this VR user's
+    // controller ray via vrCursorSync (consumed by VTKRemoteVRRays).
+    vrCursorSync.initialize(getUserId(), getUserName(), getUserColor(getUserId()));
+
     // Initialize the in-scene spatial tool menu. WebXR immersive sessions do
     // not render the DOM, so this VTK panel — not the React VRWristMenu — is
     // the guaranteed in-headset UI. It shares this manager as its source of
@@ -300,6 +308,7 @@ class VRExplorationManager extends BaseManager {
 
     // Clean up sub-managers
     this._participantSync?.stop();
+    vrCursorSync.clearCursor(); // remove this user's ray from collaborators' views
     vrMultiViewGrid.disable();
     vrSpatialUI.dispose();
     vrAvatarSystem.dispose();
@@ -728,6 +737,10 @@ class VRExplorationManager extends BaseManager {
         vrScale: vrContext.vrScale || 1.0,
       });
 
+      // Broadcast the active controller ray so desktop collaborators can see
+      // where this VR user is pointing (throttled inside vrCursorSync).
+      this._broadcastPointerRay(inputState, vrContext);
+
       // Update avatar system
       vrAvatarSystem.update(deltaTime, inputState);
 
@@ -746,6 +759,45 @@ class VRExplorationManager extends BaseManager {
 
     // Continue loop
     xrSession.requestAnimationFrame(this._onFrame);
+  }
+
+  /**
+   * Publish the local VR controller ray (in DATA space, so desktop views can
+   * render it directly) via vrCursorSync. Right hand wins when both present.
+   * Never throws — pointer visibility must not break the frame loop.
+   * @private
+   */
+  _broadcastPointerRay(inputState, vrContext) {
+    try {
+      const viewId = this._activeContext?.instance?.viewConfigId;
+      if (!viewId) return;
+
+      const hand = inputState.controllers?.right?.pose
+        ? 'right'
+        : inputState.controllers?.left?.pose
+          ? 'left'
+          : null;
+      if (!hand) return;
+
+      const pose = inputState.controllers[hand].pose;
+      if (!pose?.position || !pose?.orientation) return;
+
+      const origin = mapXRPointToData(
+        pose.position,
+        vrContext.vrScale || 1.0,
+        vrContext.vrOrigin || [0, 0, 0]
+      );
+      const dir = controllerForward(pose.orientation);
+
+      vrCursorSync.broadcastVRPointer(
+        viewId,
+        { x: origin[0], y: origin[1], z: origin[2] },
+        { x: dir[0], y: dir[1], z: dir[2] },
+        hand
+      );
+    } catch {
+      // pointer broadcast is cosmetic — never break the frame loop
+    }
   }
 
   _gatherInputState(frame) {
@@ -872,13 +924,51 @@ class VRExplorationManager extends BaseManager {
         break;
       case 'slice-plane-updated':
         this._emit('slicePlaneUpdated', action.data);
+        // Sync/persist only on gesture end — not every drag frame.
+        if (action.data?.final) {
+          this._syncVRVisualization('slicePlane');
+        }
         break;
       case 'probe-created':
+        // Probe results are intentionally session-local (transient inspection).
         this._emit('probeCreated', action.data);
         break;
       case 'clip-box-updated':
         this._emit('clipBoxUpdated', action.data);
+        if (action.data?.final) {
+          this._syncVRVisualization('clipBox');
+        }
         break;
+    }
+  }
+
+  /**
+   * Push a VR-manipulated visualization property (clipBox / slicePlane) to
+   * collaborators + persistence via the same channel the desktop menus use
+   * (visualizationSyncService → Y.js broadcast + ViewConfiguration).
+   * Fire-and-forget: must never block or break the XR frame loop.
+   * @param {'clipBox'|'slicePlane'} key
+   * @private
+   */
+  _syncVRVisualization(key) {
+    try {
+      const viewId = this._activeContext?.instance?.viewConfigId;
+      const instanceId = this._activeContext?.vrContext?.instanceId;
+      if (!viewId || !instanceId) return;
+
+      const config =
+        key === 'clipBox'
+          ? vtkClippingFeature.getConfigForSync(instanceId)
+          : vtkSliceFeature.getConfigForSync(instanceId);
+      if (!config) return;
+
+      Promise.resolve(
+        pushSharedVisualizationUpdate(viewId, { [key]: config })
+      ).catch((err) =>
+        log.warn(`VR ${key} sync failed: ${err?.message}`)
+      );
+    } catch (err) {
+      log.warn(`VR ${key} sync failed: ${err?.message}`);
     }
   }
 

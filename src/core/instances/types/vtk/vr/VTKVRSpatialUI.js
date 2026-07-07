@@ -36,6 +36,7 @@ import { VRSpatialMenuModel } from "@Core/vr/VRSpatialMenuModel.js";
 import vtkActor from "@kitware/vtk.js/Rendering/Core/Actor";
 import vtkMapper from "@kitware/vtk.js/Rendering/Core/Mapper";
 import vtkPlaneSource from "@kitware/vtk.js/Filters/Sources/PlaneSource";
+import vtkVectorText from "@kitware/vtk.js/Rendering/Core/VectorText";
 
 // Physical panel size in meters (WebXR world units before vrScale).
 const PANEL_WIDTH = 0.6;
@@ -49,6 +50,15 @@ const REANCHOR_DISTANCE = 0.5;
 const COLOR_IDLE = [0.14, 0.16, 0.22];
 const COLOR_HOVER = [0.24, 0.42, 0.62];
 const COLOR_ACTIVE = [0.16, 0.52, 0.5];
+const COLOR_LABEL = [0.95, 0.96, 1.0];
+
+// Text labels (vtkVectorText): character height in meters, and how far the
+// text floats in front of its button quad so it never z-fights.
+const LABEL_CHAR_HEIGHT = 0.018;
+const LABEL_LIFT = 0.003;
+// vtkVectorText's glyphs are ~0.7 units wide per character at unit height;
+// used to approximate the text width for centering.
+const LABEL_CHAR_ASPECT = 0.7;
 
 /**
  * VRSpatialUI — renders the in-session tool panel and routes ray taps back
@@ -93,8 +103,10 @@ export class VRSpatialUI {
     if (!this._renderer || !this._model) return;
     for (const region of this._model.getButtonLayout()) {
       const actor = this._createButtonActor();
-      this._buttonActors.set(region.id, { actor, region });
+      const label = this._createLabelActor(region.label);
+      this._buttonActors.set(region.id, { actor, region, labelActor: label });
       this._renderer.addActor(actor);
+      if (label) this._renderer.addActor(label);
     }
   }
 
@@ -113,6 +125,30 @@ export class VRSpatialUI {
     // Menu chrome must never be picked by the data-space tools.
     actor.setPickable(false);
     return actor;
+  }
+
+  /**
+   * 3D text label for a button (vtkVectorText polydata → actor). Returns null
+   * on failure — the button stays usable as an unlabeled quad.
+   * @private
+   */
+  _createLabelActor(text) {
+    try {
+      const source = vtkVectorText.newInstance();
+      source.setText(text || "");
+      const mapper = vtkMapper.newInstance();
+      mapper.setInputConnection(source.getOutputPort());
+      const actor = vtkActor.newInstance();
+      actor.setMapper(mapper);
+      actor.getProperty().setColor(...COLOR_LABEL);
+      actor.getProperty().setLighting(false);
+      actor.setVisibility(false);
+      actor.setPickable(false);
+      return actor;
+    } catch (err) {
+      log.warn(`VR menu label failed for "${text}": ${err?.message}`);
+      return null;
+    }
   }
 
   // ===========================================================================
@@ -200,7 +236,11 @@ export class VRSpatialUI {
     if (!a) return;
     const { center, right, up } = a;
 
-    for (const { actor, region } of this._buttonActors.values()) {
+    // Yaw the quads/labels so they face the same way the panel normal points
+    // (plane/text geometry natively faces +Z).
+    const yawDeg = (Math.atan2(a.normal[0], a.normal[2]) * 180) / Math.PI;
+
+    for (const { actor, region, labelActor } of this._buttonActors.values()) {
       // UV center → offset from panel center, in meters
       const ou = (region.cu - 0.5) * PANEL_WIDTH;
       const ov = (region.cv - 0.5) * PANEL_HEIGHT;
@@ -208,12 +248,29 @@ export class VRSpatialUI {
       const cy = center[1] + right[1] * ou + up[1] * ov;
       const cz = center[2] + right[2] * ou + up[2] * ov;
       actor.setPosition(cx, cy, cz);
+      actor.setOrientation(0, yawDeg, 0);
 
       // Scale unit plane to cell size (plane source spans [-0.5,0.5]).
       const w = (region.u1 - region.u0) * PANEL_WIDTH;
       const h = (region.v1 - region.v0) * PANEL_HEIGHT;
       actor.setScale(w, h, 1);
       actor.setVisibility(true);
+
+      if (labelActor) {
+        // Center the text on the cell: vtkVectorText anchors at its left
+        // baseline, so back up by half the approximate text width and half a
+        // character height, then lift slightly off the quad along the normal.
+        const s = LABEL_CHAR_HEIGHT;
+        const halfTextW = 0.5 * region.label.length * s * LABEL_CHAR_ASPECT;
+        labelActor.setPosition(
+          cx - right[0] * halfTextW + a.normal[0] * LABEL_LIFT,
+          cy - s * 0.5 + a.normal[1] * LABEL_LIFT,
+          cz - right[2] * halfTextW + a.normal[2] * LABEL_LIFT
+        );
+        labelActor.setOrientation(0, yawDeg, 0);
+        labelActor.setScale(s, s, s);
+        labelActor.setVisibility(true);
+      }
     }
   }
 
@@ -319,8 +376,9 @@ export class VRSpatialUI {
   dispose() {
     if (this._model) this._model.onSessionEnd();
     if (this._renderer) {
-      for (const { actor } of this._buttonActors.values()) {
+      for (const { actor, labelActor } of this._buttonActors.values()) {
         this._renderer.removeActor(actor);
+        if (labelActor) this._renderer.removeActor(labelActor);
       }
     }
     this._buttonActors.clear();

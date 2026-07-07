@@ -5309,6 +5309,9 @@ console.log('Tools:', tools);
     vrContext.controllerRenderer = new VRControllerRenderer(renderer, {
       vrScale,
       vrOrigin,
+      // Gaze reticle (Vision Pro transient-pointer): the renderer places a dot
+      // where the pinch would land, using the same picker the tools use.
+      raycast: (targetRay) => this.raycastVR(vrContext, targetRay),
     });
 
     log.debug("VR controller renderer initialized");

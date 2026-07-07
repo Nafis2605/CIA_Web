@@ -4,6 +4,7 @@
 import { generateInstanceId } from "@Utils/idGenerator.js";
 import { getHandlerForType } from "@Core/instances/types/instanceTypesInit.js";
 import { getUserId } from "@Collaboration/presence/userManagement.js";
+import cameraSharePolicy from "@Core/session/cameraSharePolicy.js";
 import {
   getDatasetManager,
   getViewConfigurationManager,
@@ -182,6 +183,14 @@ class WorkspaceManager {
    * @private
    */
   _handleYjsCameraUpdate(viewId, camera, sourceUserId) {
+    // Personal-camera mode: ignore collaborators' camera broadcasts — unless
+    // followService is actively driving the camera (follow overrides personal).
+    if (
+      !cameraSharePolicy.isCameraShared() &&
+      !cameraSharePolicy.getFollowOverride()
+    ) {
+      return;
+    }
     // Find all instances viewing this view
     for (const [instanceId, instance] of this.instances) {
       if (instance.viewConfigId !== viewId) continue;
