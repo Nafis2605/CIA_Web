@@ -22,28 +22,60 @@
 //
 // COORDINATE CONVENTION
 // The panel is a unit quad in "panel UV" space: u ∈ [0,1] left→right,
-// v ∈ [0,1] bottom→top. Buttons are laid out as a single horizontal row of
-// equal-width cells. VTKVRSpatialUI maps this UV space onto a world-space quad
+// v ∈ [0,1] bottom→top. Buttons are laid out in one or more equal-width
+// horizontal rows, stacked bottom→top by ascending `row` index (row 0 is the
+// bottom row). VTKVRSpatialUI maps this UV space onto a world-space quad
 // anchored in front of the head; the raycast hit it feeds back in is already
 // reduced to a (u, v) pair, so this module stays free of 3D math.
 
 import { vr as log } from "@Utils/logger.js";
 
 /**
- * Button descriptors, left→right. `kind` drives dispatch:
- *   - "tool":      toggles a VR tool (annotate/measure) via the manager
- *   - "action":    a one-shot command (undo)
- *   - "toggle":    a stateful toggle (isolation) reflected back from manager
- *   - "exit":      leave the VR session
- * @type {ReadonlyArray<{id:string,label:string,icon:string,kind:string,toolId?:string}>}
+ * Button descriptors, left→right within each row, rows bottom→top. `kind`
+ * drives dispatch:
+ *   - "tool":           toggles a VR tool (annotate/measure/clip) via the manager
+ *   - "action":         a one-shot command (undo)
+ *   - "toggle":         a stateful toggle (isolation/grid) reflected from manager
+ *   - "nav-mode":       cycles the locomotion mode (fly/teleport/walk)
+ *   - "nav-mode-set":   toggles a specific locomotion mode on/off (grab)
+ *   - "scale":          jumps to a fixed vrScale preset
+ *   - "representation": cycles surface→wireframe→points (same as desktop menu)
+ *   - "glyph-toggle":   toggles vector/scalar glyphs (same as desktop menu)
+ *   - "exit":           leave the VR session
+ * @type {ReadonlyArray<{id:string,label:string,icon:string,kind:string,toolId?:string,scaleValue?:number,row:number}>}
  */
 export const VR_MENU_BUTTONS = Object.freeze([
-  { id: "annotate", label: "Annotate", icon: "edit", kind: "tool", toolId: "annotate" },
-  { id: "measure", label: "Measure", icon: "ruler", kind: "tool", toolId: "measure" },
-  { id: "undo", label: "Undo", icon: "rotateCcw", kind: "action" },
-  { id: "isolation", label: "Isolate", icon: "expand", kind: "toggle" },
-  { id: "grid", label: "Grid", icon: "layoutGrid", kind: "toggle" },
-  { id: "exit", label: "Exit VR", icon: "doorOpen", kind: "exit" },
+  // Row 0 (bottom): tools, undo, isolation, grid, exit. annotate stays first
+  // and exit stays last (VTKVRSpatialUI and tests rely on that ordering).
+  { id: "annotate", label: "Annotate", icon: "edit", kind: "tool", toolId: "annotate", row: 0 },
+  { id: "measure", label: "Measure", icon: "ruler", kind: "tool", toolId: "measure", row: 0 },
+  { id: "clip", label: "Clip", icon: "crop", kind: "tool", toolId: "clip", row: 0 },
+  { id: "undo", label: "Undo", icon: "rotateCcw", kind: "action", row: 0 },
+  { id: "isolation", label: "Isolate", icon: "expand", kind: "toggle", row: 0 },
+  { id: "grid", label: "Grid", icon: "layoutGrid", kind: "toggle", row: 0 },
+  { id: "exit", label: "Exit VR", icon: "doorOpen", kind: "exit", row: 0 },
+  // Row 1 (above row 0): locomotion mode, scale presets, and appearance
+  // controls (representation cycle + glyph toggle — the same desktop
+  // implementations, so VR and desktop stay consistent). scaleValue matches
+  // VRScaleController's corrected preset numbers (small=overview, large=detail).
+  { id: "nav-mode", label: "Nav", icon: "compass", kind: "nav-mode", row: 1 },
+  // Toggles "grab" locomotion (pinch-and-drag to pull the data closer / push it
+  // away). Tapping again while active drops back to teleport.
+  { id: "move", label: "Move", icon: "move", kind: "nav-mode-set", mode: "grab", row: 1 },
+  { id: "scale-overview", label: "Overview", icon: "minimize", kind: "scale", scaleValue: 0.1, row: 1 },
+  { id: "scale-normal", label: "Normal", icon: "square", kind: "scale", scaleValue: 1.0, row: 1 },
+  { id: "scale-detail", label: "Detail", icon: "maximize", kind: "scale", scaleValue: 10.0, row: 1 },
+  { id: "representation", label: "Style", icon: "cube", kind: "representation", row: 1 },
+  { id: "glyphs", label: "Glyphs", icon: "arrowUpRight", kind: "glyph-toggle", row: 1 },
+  // Row 2 (top): collaborators + annotation label. Collaborators cycle
+  // through other session participants rather than a full per-user list
+  // (keeps the fixed-cell UV grid simple) — every tap still does something
+  // real, just "next collaborator" instead of "this specific collaborator".
+  { id: "goto-participant", label: "Go To", icon: "target", kind: "goto-participant", row: 2 },
+  { id: "follow-participant", label: "Follow", icon: "user", kind: "follow-participant", row: 2 },
+  // Cycles the annotate tool's pending preset label — the only VR
+  // text-entry mechanism (see ANNOTATION_LABEL_PRESETS in VRAnnotationTool.js).
+  { id: "annotation-label", label: "Label", icon: "tag", kind: "annotation-label", row: 2 },
 ]);
 
 // Fraction of each cell's width/height left as inner padding (per side).
@@ -65,6 +97,9 @@ export class VRSpatialMenuModel {
     this._activeToolId = null;
     this._isolated = false;
     this._gridEnabled = false;
+    // Cycle position through getOtherParticipants() for the Go To/Follow
+    // buttons — see _pickNextParticipant.
+    this._participantCycleIndex = -1;
   }
 
   // ===========================================================================
@@ -73,34 +108,52 @@ export class VRSpatialMenuModel {
 
   /**
    * Compute button hit regions in panel-UV space (u,v ∈ [0,1]).
-   * One equal-width horizontal row. Returned rects are inset by CELL_PADDING
-   * so adjacent buttons don't share an edge (avoids ambiguous hits).
+   * Buttons are grouped by `row` (row 0 = bottom), each row laid out as an
+   * equal-width horizontal strip, rows stacked bottom→top. Returned rects
+   * are inset by CELL_PADDING so adjacent buttons/rows don't share an edge
+   * (avoids ambiguous hits). With a single row this reduces to exactly the
+   * original one-row layout.
    *
    * @returns {Array<{id:string,label:string,icon:string,kind:string,
-   *   toolId?:string, u0:number,u1:number,v0:number,v1:number,
+   *   toolId?:string, row:number, u0:number,u1:number,v0:number,v1:number,
    *   cu:number,cv:number}>} cu/cv = cell center (for placing labels/icons)
    */
   getButtonLayout() {
-    const n = VR_MENU_BUTTONS.length;
-    const cellW = 1 / n;
-    const padU = cellW * CELL_PADDING;
-    const padV = CELL_PADDING;
+    const rows = new Map();
+    for (const btn of VR_MENU_BUTTONS) {
+      const rowId = btn.row ?? 0;
+      if (!rows.has(rowId)) rows.set(rowId, []);
+      rows.get(rowId).push(btn);
+    }
+    const rowIds = [...rows.keys()].sort((a, b) => a - b);
+    const rowH = 1 / rowIds.length;
 
-    return VR_MENU_BUTTONS.map((btn, i) => {
-      const u0 = i * cellW + padU;
-      const u1 = (i + 1) * cellW - padU;
-      const v0 = padV;
-      const v1 = 1 - padV;
-      return {
-        ...btn,
-        u0,
-        u1,
-        v0,
-        v1,
-        cu: (u0 + u1) / 2,
-        cv: (v0 + v1) / 2,
-      };
+    const layout = [];
+    rowIds.forEach((rowId, rowIndex) => {
+      const buttons = rows.get(rowId);
+      const n = buttons.length;
+      const cellW = 1 / n;
+      const padU = cellW * CELL_PADDING;
+      const padV = rowH * CELL_PADDING;
+      const vBase = rowIndex * rowH;
+
+      buttons.forEach((btn, i) => {
+        const u0 = i * cellW + padU;
+        const u1 = (i + 1) * cellW - padU;
+        const v0 = vBase + padV;
+        const v1 = vBase + rowH - padV;
+        layout.push({
+          ...btn,
+          u0,
+          u1,
+          v0,
+          v1,
+          cu: (u0 + u1) / 2,
+          cv: (v0 + v1) / 2,
+        });
+      });
     });
+    return layout;
   }
 
   // ===========================================================================
@@ -161,11 +214,117 @@ export class VRSpatialMenuModel {
         return this._undo();
       case "toggle":
         return btn.id === "grid" ? this._toggleGrid() : this._toggleIsolation();
+      case "nav-mode":
+        return this._cycleNavMode();
+      case "nav-mode-set":
+        return this._setNavMode(btn.mode);
+      case "scale":
+        return this._setScale(btn.scaleValue, btn.id);
+      case "goto-participant":
+        return this._gotoNextParticipant();
+      case "follow-participant":
+        return this._toggleFollowNextParticipant();
+      case "annotation-label":
+        return this._cycleAnnotationLabel();
+      case "representation":
+        return this._cycleRepresentation();
+      case "glyph-toggle":
+        return this._toggleGlyphs();
       case "exit":
         return this._exit();
       default:
         return { handled: false };
     }
+  }
+
+  /**
+   * Cycles fly → teleport → walk via the same VRNavigationController the
+   * launch modal's dropdown drives (VRExplorationManager.cycleNavigationMode).
+   */
+  _cycleNavMode() {
+    const mode = this._call("cycleNavigationMode");
+    return { handled: true, action: "nav-mode-changed", mode: mode ?? null };
+  }
+
+  /**
+   * Toggles a specific locomotion mode (grab). Tapping the Move button when
+   * grab is already active drops back to teleport, so the one button both
+   * enters and leaves "pull the data around" mode. Uses the same
+   * VRExplorationManager.setNavigationMode the launch modal's dropdown drives.
+   * @private
+   */
+  _setNavMode(mode) {
+    const current = this._call("getNavigationMode");
+    const next = current === mode ? "teleport" : mode;
+    this._call("setNavigationMode", next);
+    return { handled: true, action: "nav-mode-set", mode: next };
+  }
+
+  /** Jumps directly to a fixed vrScale (VRExplorationManager.setVRScale). */
+  _setScale(scaleValue, buttonId) {
+    this._call("setVRScale", scaleValue);
+    return { handled: true, action: "scale-changed", scaleValue, buttonId };
+  }
+
+  /**
+   * Advances to the next other participant (wrapping), for both Go To and
+   * Follow — a stable cycle order so repeated taps step through everyone
+   * rather than jumping around.
+   * @private
+   */
+  _pickNextParticipant() {
+    const others = this._call("getOtherParticipants") || [];
+    if (!others.length) return null;
+    this._participantCycleIndex = (this._participantCycleIndex + 1) % others.length;
+    return others[this._participantCycleIndex]?.odUserId ?? null;
+  }
+
+  _gotoNextParticipant() {
+    const userId = this._pickNextParticipant();
+    if (!userId) {
+      return { handled: true, action: "goto-participant", ok: false, reason: "no-participants" };
+    }
+    const ok = !!this._call("goToParticipant", userId);
+    return { handled: true, action: "goto-participant", userId, ok };
+  }
+
+  /** Toggles off if already following anyone; otherwise follows the next participant. */
+  _toggleFollowNextParticipant() {
+    if (this._call("isFollowingParticipant")) {
+      this._call("stopFollowing");
+      return { handled: true, action: "follow-participant", following: null };
+    }
+    const userId = this._pickNextParticipant();
+    if (!userId) {
+      return { handled: true, action: "follow-participant", following: null, reason: "no-participants" };
+    }
+    this._call("followParticipant", userId);
+    return { handled: true, action: "follow-participant", following: userId };
+  }
+
+  /** Advances the active tool's pending preset annotation label (see VRAnnotationTool.cycleLabel). */
+  _cycleAnnotationLabel() {
+    const label = this._call("cycleAnnotationLabel");
+    if (label == null) {
+      return { handled: true, action: "annotation-label-changed", label: null, reason: "no-active-tool" };
+    }
+    return { handled: true, action: "annotation-label-changed", label };
+  }
+
+  /**
+   * Cycles surface → wireframe → points through the same desktop
+   * implementation (VRExplorationManager.cycleRepresentation → instanceTools),
+   * so a VR tap and a desktop menu click are indistinguishable to collaborators.
+   */
+  _cycleRepresentation() {
+    const mode = this._call("cycleRepresentation");
+    return { handled: true, action: "representation-changed", mode: mode ?? null };
+  }
+
+  /** Toggles glyphs via the same desktop VTKGlyphFeature (VRExplorationManager.toggleGlyphs). */
+  _toggleGlyphs() {
+    const enabled = !!this._call("toggleGlyphs");
+    return { handled: true, action: "glyphs-toggled", enabled };
   }
 
   _activateTool(toolId) {
@@ -255,6 +414,7 @@ export class VRSpatialMenuModel {
     this._activeToolId = null;
     this._isolated = false;
     this._gridEnabled = false;
+    this._participantCycleIndex = -1;
     return this._visible;
   }
 
@@ -309,8 +469,61 @@ export class VRSpatialMenuModel {
       if (btn.kind === "tool") active = this._activeToolId === btn.toolId;
       else if (btn.id === "isolation") active = this._isolated;
       else if (btn.id === "grid") active = this._gridEnabled;
+      else if (btn.kind === "scale") active = this._call("getVRScale") === btn.scaleValue;
+      else if (btn.kind === "nav-mode-set") active = this._call("getNavigationMode") === btn.mode;
+      else if (btn.id === "follow-participant") active = !!this._call("isFollowingParticipant");
+      else if (btn.kind === "representation") {
+        const mode = this._call("getRepresentation");
+        active = !!mode && mode !== "surface";
+      } else if (btn.kind === "glyph-toggle") active = !!this._call("isGlyphsEnabled");
       return { id: btn.id, active };
     });
+  }
+
+  // ===========================================================================
+  // STATUS LINE
+  // ===========================================================================
+
+  /**
+   * A single text line for the geometry layer to render above the button
+   * rows: dataset name, current scale, and locomotion mode. Never throws —
+   * missing manager data just yields a shorter/blanker line.
+   * @returns {string}
+   */
+  getStatusLine() {
+    const name = this._call("getActiveDatasetName") || "Dataset";
+    const navMode = this._call("getNavigationMode");
+    const scale = this._call("getVRScale");
+
+    const parts = [name];
+    if (typeof scale === "number" && Number.isFinite(scale) && scale > 0) {
+      parts.push(this._formatScale(scale));
+    }
+    if (typeof navMode === "string" && navMode.length) {
+      parts.push(navMode[0].toUpperCase() + navMode.slice(1));
+    }
+
+    const followedId = this._call("isFollowingParticipant");
+    if (followedId) {
+      const others = this._call("getOtherParticipants") || [];
+      const target = others.find((p) => p.odUserId === followedId);
+      parts.push(`Following ${target?.userName || followedId}`);
+    }
+
+    if (this._activeToolId === "annotate") {
+      const pendingLabel = this._call("getPendingAnnotationLabel");
+      if (pendingLabel) parts.push(`Label: ${pendingLabel}`);
+    }
+
+    return parts.join("  •  ");
+  }
+
+  /** @private */
+  _formatScale(scale) {
+    if (scale >= 1) {
+      return `${scale % 1 === 0 ? scale.toFixed(0) : scale.toFixed(1)}x`;
+    }
+    return `1:${(1 / scale).toFixed(1)}`;
   }
 }
 

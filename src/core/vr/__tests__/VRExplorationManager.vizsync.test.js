@@ -1,7 +1,8 @@
 // src/core/vr/__tests__/VRExplorationManager.vizsync.test.js
-// VR clip/slice gestures must reach collaborators + persistence through the
-// same visualization-sync channel the desktop menus use — and only on gesture
-// end (final: true), never per drag frame.
+// VR visualization changes (clip gestures, representation cycling, glyph
+// toggling) must reach collaborators + persistence through the same
+// visualization-sync channel the desktop menus use — and for drag gestures,
+// only on gesture end (final: true), never per drag frame.
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("@Utils/logger.js", () => {
@@ -16,6 +17,7 @@ vi.mock("@Core/data/models/VRExplorationSession.js", () => ({
   VRExplorationSession: class {},
   PARTICIPATION_MODE: { VR_EXPLORER: "vr-explorer", DESKTOP_OBSERVER: "desktop-observer" },
   SESSION_STATUS: { ACTIVE: "active" },
+  EXPLORATION_MODES: { FLY: "fly", TELEPORT: "teleport", WALK: "walk" },
 }));
 vi.mock("@Core/vr/VRParticipantSync.js", () => ({ VRParticipantSync: class {} }));
 vi.mock("@Core/vr/tools/VRToolManager.js", () => ({ VRToolManager: class {} }));
@@ -49,10 +51,31 @@ vi.mock("@Services/apiClient.js", () => ({
 }));
 
 const mockClipConfig = { enabled: true, plane: { origin: [0, 0, 0], normal: [1, 0, 0] } };
-const mockSliceConfig = { enabled: true, sliceMode: 2, sliceIndex: 5 };
 vi.mock("@Core/instances/types/vtk/features/index.js", () => ({
   vtkClippingFeature: { getConfigForSync: vi.fn(() => mockClipConfig) },
-  vtkSliceFeature: { getConfigForSync: vi.fn(() => mockSliceConfig) },
+}));
+
+const mockGlyphConfig = { enabled: true, glyphType: "arrow" };
+const mockGlyphState = {
+  enabled: false,
+  vectorArrays: [{ name: "velocity" }],
+  scalarArrays: [],
+};
+vi.mock("@Core/instances/types/vtk/features/VTKGlyphFeature.js", () => ({
+  vtkGlyphFeature: {
+    getState: vi.fn(() => mockGlyphState),
+    enableGlyphs: vi.fn(),
+    disableGlyphs: vi.fn(),
+    getConfigForSync: vi.fn(() => mockGlyphConfig),
+  },
+  isGlyphFeatureAvailable: vi.fn(() => true),
+}));
+
+vi.mock("@VTK/vtkInstanceTools.js", () => ({
+  instanceTools: {
+    getRepresentation: vi.fn(() => "surface"),
+    setRepresentation: vi.fn(),
+  },
 }));
 
 const mockPush = vi.fn(() => Promise.resolve());
@@ -61,12 +84,21 @@ vi.mock("@Services/visualizationSyncService.js", () => ({
 }));
 
 import { vrExplorationManager } from "../VRExplorationManager.js";
+import { instanceTools } from "@VTK/vtkInstanceTools.js";
+import { vtkGlyphFeature } from "@Core/instances/types/vtk/features/VTKGlyphFeature.js";
 
-describe("VRExplorationManager — VR clip/slice visualization sync", () => {
+describe("VRExplorationManager — VR visualization sync (clip/representation/glyphs)", () => {
   beforeEach(() => {
     mockPush.mockClear();
+    vi.mocked(instanceTools.setRepresentation).mockClear();
+    vi.mocked(vtkGlyphFeature.enableGlyphs).mockClear();
+    mockGlyphState.enabled = false;
     vrExplorationManager._activeContext = {
-      instance: { viewConfigId: "view-1", instanceId: "inst-1" },
+      instance: {
+        viewConfigId: "view-1",
+        instanceId: "inst-1",
+        instanceData: { polydata: { fake: true } },
+      },
       vrContext: { instanceId: "inst-1" },
     };
   });
@@ -84,19 +116,33 @@ describe("VRExplorationManager — VR clip/slice visualization sync", () => {
       type: "clip-box-updated",
       data: { instanceId: "inst-1", final: false },
     });
-    vrExplorationManager._handleToolAction({
-      type: "slice-plane-updated",
-      data: { final: false },
-    });
     expect(mockPush).not.toHaveBeenCalled();
   });
 
-  it("pushes slicePlane config on final slice-plane-updated actions", () => {
-    vrExplorationManager._handleToolAction({
-      type: "slice-plane-updated",
-      data: { origin: [0, 0, 0], normal: [0, 1, 0], final: true },
-    });
-    expect(mockPush).toHaveBeenCalledWith("view-1", { slicePlane: mockSliceConfig });
+  it("cycleRepresentation renders via instanceTools AND pushes the representation patch", () => {
+    const next = vrExplorationManager.cycleRepresentation();
+    expect(next).toBe("wireframe"); // surface → wireframe
+    expect(instanceTools.setRepresentation).toHaveBeenCalledWith("inst-1", "wireframe");
+    expect(mockPush).toHaveBeenCalledWith("view-1", { representation: "wireframe" });
+  });
+
+  it("toggleGlyphs enables via vtkGlyphFeature AND pushes the glyph patch", () => {
+    const enabled = vrExplorationManager.toggleGlyphs();
+    expect(enabled).toBe(true);
+    expect(vtkGlyphFeature.enableGlyphs).toHaveBeenCalledWith(
+      "inst-1",
+      { fake: true },
+      { orientationArray: "velocity" }
+    );
+    expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig });
+  });
+
+  it("toggleGlyphs disables when already enabled and still pushes the patch", () => {
+    mockGlyphState.enabled = true;
+    const enabled = vrExplorationManager.toggleGlyphs();
+    expect(enabled).toBe(false);
+    expect(vtkGlyphFeature.disableGlyphs).toHaveBeenCalledWith("inst-1");
+    expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig });
   });
 
   it("no-ops without an active context and never throws", () => {
@@ -107,6 +153,8 @@ describe("VRExplorationManager — VR clip/slice visualization sync", () => {
         data: { final: true },
       })
     ).not.toThrow();
+    expect(vrExplorationManager.cycleRepresentation()).toBeNull();
+    expect(vrExplorationManager.toggleGlyphs()).toBe(false);
     expect(mockPush).not.toHaveBeenCalled();
   });
 

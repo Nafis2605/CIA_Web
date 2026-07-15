@@ -32,6 +32,7 @@ import { useViewGroups, useViewGroupLinks, useViewportSize } from '@UI/react/hoo
 import { useStatusBar } from '@UI/react/hooks/useStatusBar.js';
 import { useViewportSyncListener, dispatchMoveViewport, dispatchNavigateTo } from '@UI/react/hooks/useViewportSync';
 import { useLayoutContext } from '@UI/react/components/layout/ThreeEdgeLayout';
+import { useWebXRAvailability } from '@UI/react/components/organisms';
 import { useWorkspaces } from '@UI/react/hooks/useWorkspaces.js';
 import { useRoomActions } from '@UI/react/hooks/useRoomPresence.js';
 import { useRoomsTab } from '@UI/react/components/panels/RightPanel/tabs/RoomsTab/hooks/useRoomsTab.js';
@@ -40,6 +41,7 @@ import { getViewConfigurationManager, getDatasetManager } from '@Init/appInitial
 import { sessionManager } from '@Core/session/sessionManager.js';
 import { workspaceManager } from '@Core/instances/workspaceManager.js';
 import { vrManager } from '@Core/vr/VRManager.js';
+import { vrExplorationManager } from '@Core/vr/VRExplorationManager.js';
 import { workspace as log } from '@Utils/logger.js';
 import { normalizeInstanceToolsResult } from '@UI/react/utils/instanceTools.js';
 import { useCanvasHistory } from '@UI/react/store/canvasHistoryStore';
@@ -510,6 +512,7 @@ function CanvasWorkspaceInner({
     const layoutContext = useLayoutContext();
     const { isVR } = useAdaptive();
     const [isInImmersiveSession, setIsInImmersiveSession] = useState(() => vrManager.isInVR());
+    const { vrAvailable: isVRAvailable } = useWebXRAvailability();
     const setLeftDockedOpen = layoutContext?.setLeftOpen || (() => { });
     const setRightDockedOpen = layoutContext?.setRightOpen || (() => { });
     // Use sessionManager room ID as fallback project ID
@@ -2135,11 +2138,11 @@ function CanvasWorkspaceInner({
                 }}
                 onCopyView={handleDuplicateView}
                 onOpenSettings={handleViewSettings}
-                isVRAvailable={true}
+                isVRAvailable={isVRAvailable}
                 isInVR={isInImmersiveSession}
                 onToggleVR={async () => {
                     if (isInImmersiveSession) {
-                        await vrManager.exitVR();
+                        await vrExplorationManager.leaveSession();
                         return;
                     }
 
@@ -2148,19 +2151,19 @@ function CanvasWorkspaceInner({
                         return;
                     }
 
-                    const instance = workspaceManager.getInstanceByViewId(contextActiveView.id);
-                    const glContext = instance?.handler?.getWebGLContext?.();
-
-                    await vrManager.enterVR(glContext, {
-                        navigationMode: 'teleport',
-                        deviceProfile: 'generic',
-                        optionalFeatures: ['bounded-floor', 'local-floor', 'hand-tracking', 'layers'],
-                    });
+                    try {
+                        await vrExplorationManager.startForView(contextActiveView.id, {
+                            explorationMode: 'teleport',
+                        });
+                    } catch (err) {
+                        log.warn('Cannot enter VR:', err.message);
+                    }
                 }}
             />
         </div>
     ), [
         isInImmersiveSession,
+        isVRAvailable,
         activeCanvasId,
         contextActiveView,
         contextUpdateLink,
@@ -2185,9 +2188,7 @@ function CanvasWorkspaceInner({
             syncStatus={infoSyncStatus}
             onCanvasSizeChange={handleCanvasSizeChange}
             onViewportSizeChange={handleViewportSizeChange}
-            onOpenNavigator={() => {
-                // TODO: Open canvas navigator
-            }}
+            onOpenNavigator={null}
         />
     ), [
         canvasSize,

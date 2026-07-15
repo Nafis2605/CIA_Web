@@ -40,8 +40,11 @@
  */
 
 /**
- * All positions are in WebXR local-floor reference space (meters, Y-up).
- * RemoteAvatarController converts to VTK scene space before rendering.
+ * All limb positions are in the SENDER's own WebXR local-floor reference
+ * space (meters, Y-up) — each VR participant has a physically independent
+ * session/reference space, so vrScale/vrOrigin travel alongside the pose.
+ * RemoteAvatarController converts to VTK scene (data) space using THIS
+ * sender's transform, not the local viewer's own, before rendering.
  *
  * @typedef {Object} AvatarPose
  * @property {AvatarLimbPose} head
@@ -49,6 +52,8 @@
  * @property {AvatarLimbPose} rightHand
  * @property {AvatarPointer} pointer
  * @property {number} timestamp - Date.now()
+ * @property {number} vrScale - sender's vrScale at the time of this pose
+ * @property {number[]} vrOrigin - sender's vrOrigin [x,y,z] at the time of this pose
  */
 
 /**

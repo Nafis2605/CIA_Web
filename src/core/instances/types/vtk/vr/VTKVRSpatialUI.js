@@ -38,9 +38,11 @@ import vtkMapper from "@kitware/vtk.js/Rendering/Core/Mapper";
 import vtkPlaneSource from "@kitware/vtk.js/Filters/Sources/PlaneSource";
 import vtkVectorText from "@kitware/vtk.js/Rendering/Core/VectorText";
 
-// Physical panel size in meters (WebXR world units before vrScale).
+// Physical panel size in meters (WebXR world units before vrScale). Height
+// covers three button rows (0.14m each, matching the original single-row
+// size) — bump by 0.14 if VR_MENU_BUTTONS ever grows another row.
 const PANEL_WIDTH = 0.6;
-const PANEL_HEIGHT = 0.14;
+const PANEL_HEIGHT = 0.42;
 // Distance in front of head, and downward tilt so it clears the dataset.
 const PANEL_DISTANCE = 1.2;
 const PANEL_DROP = 0.35; // how far below eye-line the panel center sits
@@ -51,6 +53,7 @@ const COLOR_IDLE = [0.14, 0.16, 0.22];
 const COLOR_HOVER = [0.24, 0.42, 0.62];
 const COLOR_ACTIVE = [0.16, 0.52, 0.5];
 const COLOR_LABEL = [0.95, 0.96, 1.0];
+const COLOR_STATUS = [0.7, 0.76, 0.85];
 
 // Text labels (vtkVectorText): character height in meters, and how far the
 // text floats in front of its button quad so it never z-fights.
@@ -59,6 +62,10 @@ const LABEL_LIFT = 0.003;
 // vtkVectorText's glyphs are ~0.7 units wide per character at unit height;
 // used to approximate the text width for centering.
 const LABEL_CHAR_ASPECT = 0.7;
+
+// Status line: sits just above the panel's top edge.
+const STATUS_CHAR_HEIGHT = 0.02;
+const STATUS_MARGIN = 0.03;
 
 /**
  * VRSpatialUI — renders the in-session tool panel and routes ray taps back
@@ -76,6 +83,11 @@ export class VRSpatialUI {
     this._lastHeadPos = null;
     this._lastSelectPressed = false;
     this._hoverButtonId = null;
+    // Status line (dataset / scale / nav mode) — a single dynamic label kept
+    // separate from the static button labels since its text changes.
+    this._statusSource = null;
+    this._statusActor = null;
+    this._lastStatusText = null;
   }
 
   /**
@@ -107,6 +119,28 @@ export class VRSpatialUI {
       this._buttonActors.set(region.id, { actor, region, labelActor: label });
       this._renderer.addActor(actor);
       if (label) this._renderer.addActor(label);
+    }
+    this._buildStatusLabel();
+  }
+
+  /** @private */
+  _buildStatusLabel() {
+    try {
+      const source = vtkVectorText.newInstance();
+      source.setText("");
+      const mapper = vtkMapper.newInstance();
+      mapper.setInputConnection(source.getOutputPort());
+      const actor = vtkActor.newInstance();
+      actor.setMapper(mapper);
+      actor.getProperty().setColor(...COLOR_STATUS);
+      actor.getProperty().setLighting(false);
+      actor.setVisibility(false);
+      actor.setPickable(false);
+      this._statusSource = source;
+      this._statusActor = actor;
+      this._renderer.addActor(actor);
+    } catch (err) {
+      log.warn(`VR menu status label failed: ${err?.message}`);
     }
   }
 
@@ -159,9 +193,15 @@ export class VRSpatialUI {
    * @param {object} inputState - from VRExplorationManager._gatherInputState():
    *   { headPose:{position,orientation}, controllers:{ right:{ targetRay,
    *     triggerPressed, ... } } }
+   * @returns {{hovering:boolean, buttonId:string|null, hand:string}|null}
+   *   Input-arbitration result for the frame loop: whether the pointer is over
+   *   a menu button (so its pinch should NOT also drive nav/tools) and which
+   *   hand did the picking. Returns null when the menu is not initialized /
+   *   not visible / has no input — the frame loop treats that as "no menu
+   *   interaction this frame".
    */
   update(inputState) {
-    if (!this._model?.isVisible() || !inputState) return;
+    if (!this._model?.isVisible() || !inputState) return null;
 
     // Keep highlights aligned with the manager (tool may have changed via the
     // DOM menu, isolation via the B-button).
@@ -169,6 +209,7 @@ export class VRSpatialUI {
 
     this._updateAnchor(inputState.headPose);
     this._layoutButtons();
+    this._layoutStatus();
 
     const ray = this._pickRay(inputState);
     const hit = ray ? this._intersectPanel(ray.origin, ray.direction) : null;
@@ -182,6 +223,10 @@ export class VRSpatialUI {
     this._lastSelectPressed = selectPressed;
 
     this._applyColors();
+
+    // The picking hand mirrors _pickRay's preference (right, else left).
+    const hand = inputState.controllers?.right ? "right" : "left";
+    return { hovering: !!this._hoverButtonId, buttonId: this._hoverButtonId ?? null, hand };
   }
 
   /**
@@ -272,6 +317,49 @@ export class VRSpatialUI {
         labelActor.setVisibility(true);
       }
     }
+  }
+
+  /**
+   * Position the dataset/scale/nav-mode status line just above the panel's
+   * top edge. Text is only re-set on vtkVectorText when it actually changes
+   * (dirty-checked) — rebuilding the glyph polydata every frame would be
+   * wasteful for a value that's usually static between input events.
+   * @private
+   */
+  _layoutStatus() {
+    const a = this._panelAnchor;
+    if (!a || !this._statusActor || !this._statusSource) return;
+
+    const text = this._model.getStatusLine();
+    if (text !== this._lastStatusText) {
+      this._statusSource.setText(text);
+      this._lastStatusText = text;
+    }
+    if (!text) {
+      this._statusActor.setVisibility(false);
+      return;
+    }
+
+    const { center, right, up } = a;
+    const yawDeg = (Math.atan2(a.normal[0], a.normal[2]) * 180) / Math.PI;
+
+    const s = STATUS_CHAR_HEIGHT;
+    const topEdgeOv = 0.5 * PANEL_HEIGHT;
+    const ov = topEdgeOv + STATUS_MARGIN + s * 0.5;
+    const halfTextW = 0.5 * text.length * s * LABEL_CHAR_ASPECT;
+
+    const cx = center[0] + up[0] * ov;
+    const cy = center[1] + up[1] * ov;
+    const cz = center[2] + up[2] * ov;
+
+    this._statusActor.setPosition(
+      cx - right[0] * halfTextW + a.normal[0] * LABEL_LIFT,
+      cy - s * 0.5 + a.normal[1] * LABEL_LIFT,
+      cz - right[2] * halfTextW + a.normal[2] * LABEL_LIFT
+    );
+    this._statusActor.setOrientation(0, yawDeg, 0);
+    this._statusActor.setScale(s, s, s);
+    this._statusActor.setVisibility(true);
   }
 
   _applyColors() {
@@ -380,12 +468,16 @@ export class VRSpatialUI {
         this._renderer.removeActor(actor);
         if (labelActor) this._renderer.removeActor(labelActor);
       }
+      if (this._statusActor) this._renderer.removeActor(this._statusActor);
     }
     this._buttonActors.clear();
     this._panelAnchor = null;
     this._lastHeadPos = null;
     this._hoverButtonId = null;
     this._lastSelectPressed = false;
+    this._statusSource = null;
+    this._statusActor = null;
+    this._lastStatusText = null;
     this._renderer = null;
     this._model = null;
     log.debug("VR spatial UI disposed");

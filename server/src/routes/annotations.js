@@ -7,6 +7,7 @@ const router = express.Router();
 const { getUser, checkProjectAccess } = require("../middleware/auth");
 const { writeSyncEvent, buildSnapshot } = require("../services/syncEventService");
 const { diffObjects } = require("../utils/jsonDiff");
+const { isValidUUID } = require("../middleware/validateUUID");
 
 // ============================================================================
 // ANNOTATION ENDPOINTS
@@ -43,7 +44,11 @@ router.get("/", async (req, res, next) => {
     const values = [status];
     let paramIndex = 2;
 
-    // Filter by file
+    // Filter by file (built-in datasets use non-UUID ids like "builtin-lungs"
+    // and never have server-side annotations, so short-circuit to empty)
+    if (fileId && !isValidUUID(fileId)) {
+      return res.json({ annotations: [], count: 0, limit: parseInt(limit), offset: parseInt(offset) });
+    }
     if (fileId) {
       query += ` AND a.dataset_id = $${paramIndex++}`;
       values.push(fileId);

@@ -174,7 +174,7 @@ export class VRControllerRenderer {
   /**
    * Update controller positions from input state
    *
-   * @param {Object} inputState - Controller input state from VRSceneRenderer
+   * @param {Object} inputState - Controller input state from VRExplorationManager._gatherInputState
    */
   update(inputState) {
     for (const hand of ["left", "right"]) {

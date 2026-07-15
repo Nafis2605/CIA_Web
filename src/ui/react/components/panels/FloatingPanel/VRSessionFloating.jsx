@@ -14,6 +14,7 @@ import { useFloatingPanels } from "./FloatingPanelContext";
 import { VRSessionPanel } from "@UI/react/components/panels/VRSessionPanel";
 import { useVRSession } from "@UI/react/hooks/useVRSession";
 import { vrManager } from "@Core/vr/VRManager.js";
+import { getUserId } from "@Collaboration/presence/userManagement.js";
 
 // =============================================================================
 // CONSTANTS
@@ -206,7 +207,7 @@ export const VRSessionFloating = memo(function VRSessionFloating({
   // Don't render if not open
   if (!panelState) return null;
 
-  const currentUserId = localStorage.getItem("userId") || "anonymous";
+  const currentUserId = getUserId();
 
   return (
     <FloatingPanel

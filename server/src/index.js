@@ -143,14 +143,20 @@ const corsOptions = {
       return callback(null, true);
     }
 
+    // Allow 192.168.x.x for LAN/Vision Pro
+    if (origin.match(/^https?:\/\/192\.168\.\d+\.\d+(:\d+)?$/)) {
+      return callback(null, true);
+    }
+
     // Allow specific production origins if needed
-    const allowedOrigins = (process.env.CORS_ORIGINS || "")
+    const allowedOrigins = (process.env.CORS_ORIGINS || process.env.ALLOWED_ORIGINS || "")
       .split(",")
       .filter(Boolean);
     if (allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
 
+    console.log(`[CORS] Rejecting origin: ${origin}`);
     callback(new Error("Not allowed by CORS"));
   },
   credentials: true, // Allow cookies and auth headers

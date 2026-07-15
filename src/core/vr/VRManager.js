@@ -35,8 +35,6 @@ class VRManager extends BaseManager {
         "handDisconnected",
         "controllerConnected",
         "controllerDisconnected",
-        "selectStart",
-        "selectEnd",
       ],
       logCategory: "vr",
     });
@@ -71,8 +69,6 @@ class VRManager extends BaseManager {
     this._handleSelect = this._handleSelect.bind(this);
     this._handleSelectStart = this._handleSelectStart.bind(this);
     this._handleSelectEnd = this._handleSelectEnd.bind(this);
-    this._handleSqueezeStart = this._handleSqueezeStart.bind(this);
-    this._handleSqueezeEnd = this._handleSqueezeEnd.bind(this);
   }
 
   // ===========================================================================
@@ -204,11 +200,6 @@ class VRManager extends BaseManager {
       this._xrSession.addEventListener("select", this._handleSelect);
       this._xrSession.addEventListener("selectstart", this._handleSelectStart);
       this._xrSession.addEventListener("selectend", this._handleSelectEnd);
-      this._xrSession.addEventListener(
-        "squeezestart",
-        this._handleSqueezeStart
-      );
-      this._xrSession.addEventListener("squeezeend", this._handleSqueezeEnd);
 
       // Get reference space (try bounded-floor first, fall back to local-floor)
       try {
@@ -337,11 +328,6 @@ class VRManager extends BaseManager {
         this._handleSelectStart
       );
       this._xrSession.removeEventListener("selectend", this._handleSelectEnd);
-      this._xrSession.removeEventListener(
-        "squeezestart",
-        this._handleSqueezeStart
-      );
-      this._xrSession.removeEventListener("squeezeend", this._handleSqueezeEnd);
     }
 
     // Clear input sources
@@ -642,15 +628,9 @@ class VRManager extends BaseManager {
    * @private
    */
   _handleSelectStart(event) {
-    const data = this._inputSources.get(event.inputSource);
     // Track select state per source so gripless inputs (Vision Pro
     // transient-pointer) expose a trigger-equivalent without a gamepad.
     this._selectPressed.set(event.inputSource, true);
-    this._emit("selectStart", {
-      source: event.inputSource,
-      handedness: data?.handedness,
-      frame: event.frame,
-    });
   }
 
   /**
@@ -658,39 +638,7 @@ class VRManager extends BaseManager {
    * @private
    */
   _handleSelectEnd(event) {
-    const data = this._inputSources.get(event.inputSource);
     this._selectPressed.set(event.inputSource, false);
-    this._emit("selectEnd", {
-      source: event.inputSource,
-      handedness: data?.handedness,
-      frame: event.frame,
-    });
-  }
-
-  /**
-   * Handle squeeze start event (grip pressed)
-   * @private
-   */
-  _handleSqueezeStart(event) {
-    const data = this._inputSources.get(event.inputSource);
-    this._emit("squeezeStart", {
-      source: event.inputSource,
-      handedness: data?.handedness,
-      frame: event.frame,
-    });
-  }
-
-  /**
-   * Handle squeeze end event (grip released)
-   * @private
-   */
-  _handleSqueezeEnd(event) {
-    const data = this._inputSources.get(event.inputSource);
-    this._emit("squeezeEnd", {
-      source: event.inputSource,
-      handedness: data?.handedness,
-      frame: event.frame,
-    });
   }
 
   // ===========================================================================

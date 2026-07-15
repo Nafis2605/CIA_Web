@@ -2,7 +2,6 @@
 // Manages VR tool lifecycle and input routing
 
 import { vr as log } from '@Utils/logger.js';
-import { VRSlicePlaneTool } from './VRSlicePlaneTool.js';
 import { VRMeasureTool } from './VRMeasureTool.js';
 import { VRAnnotationTool } from './VRAnnotationTool.js';
 import { VRClipBoxTool } from './VRClipBoxTool.js';
@@ -16,18 +15,22 @@ export class VRToolManager {
 
     // Register available tools
     this._tools = new Map([
-      ['slice', new VRSlicePlaneTool()],
       ['measure', new VRMeasureTool()],
       ['annotate', new VRAnnotationTool()],
       ['clip', new VRClipBoxTool()],
       ['probe', new VRProbeTool()],
     ]);
 
-    // Context passed to tools
+    // Context passed to tools. `renderer` is exposed as a live getter (the
+    // VR scene renderer lives at vrContext.sceneObjects.renderer and may not
+    // exist yet at construction time) so tools can add actors lazily.
     this._toolContext = {
       handler: this._handler,
       vrContext: this._vrContext,
       manager: this,
+      get renderer() {
+        return this.vrContext?.sceneObjects?.renderer || null;
+      },
     };
   }
 
@@ -87,8 +90,14 @@ export class VRToolManager {
     // Let active tool handle input
     const action = this._activeTool.handleInput(inputState, frame);
 
-    // Render tool visuals
-    this._activeTool.render(this._vrContext.renderer);
+    // Render tool visuals. The VR scene renderer lives at
+    // vrContext.sceneObjects.renderer (NOT vrContext.renderer — that was
+    // always undefined, so tools rendered nothing). Only call render when it's
+    // actually available.
+    const renderer = this._vrContext?.sceneObjects?.renderer;
+    if (renderer) {
+      this._activeTool.render(renderer);
+    }
 
     return action;
   }

@@ -25,6 +25,7 @@ import { sessionManager } from "@Core/session/sessionManager.js";
 import cameraSharePolicy from "@Core/session/cameraSharePolicy.js";
 import { apiClient } from "@Services/apiClient.js";
 import { BaseManager } from "@Core/data/managers/BaseManager.js";
+import { isBuiltInDataset } from "@Core/data/managers/DatasetManager.js";
 
 export class ViewConfigurationManager extends BaseManager {
   constructor(config = {}) {
@@ -204,12 +205,69 @@ export class ViewConfigurationManager extends BaseManager {
   }
 
   /**
+   * Recover the datasetId for a view whose server row has a null dataset_id.
+   *
+   * Built-in sample datasets are persisted with dataset_id = NULL. The original
+   * builtin id is stashed in the `visualization.builtinDatasetId` field on
+   * create. For legacy rows written before that mechanism existed, fall back to
+   * matching the view name (case-insensitive, trailing ".vtp" stripped) against
+   * the names of registered built-in datasets. This heals existing corrupt rows
+   * without any SQL migration.
+   *
+   * @param {Object} serverView - Raw server view row (snake_case)
+   * @returns {string|null} A builtin dataset id, or null if none could be found
+   * @private
+   */
+  _recoverBuiltinDatasetId(serverView) {
+    // Primary: explicit id stashed in visualization JSONB on create.
+    const stashed = serverView.visualization?.builtinDatasetId;
+    if (typeof stashed === "string" && stashed) {
+      return stashed;
+    }
+
+    // Legacy fallback: match by name against registered built-in datasets.
+    const datasetManager =
+      (typeof window !== "undefined" &&
+        (window.CIA?.datasetManager ||
+          window.__CIA_MANAGERS?.datasetManager)) ||
+      null;
+    if (!datasetManager?.getAllDatasets) return null;
+
+    const rawName = serverView.name;
+    if (typeof rawName !== "string" || !rawName) return null;
+    const target = rawName.replace(/\.vtp$/i, "").trim().toLowerCase();
+
+    for (const dataset of datasetManager.getAllDatasets()) {
+      if (!isBuiltInDataset(dataset)) continue;
+      const candidate = (dataset.name || "")
+        .replace(/\.vtp$/i, "")
+        .trim()
+        .toLowerCase();
+      if (candidate && candidate === target) {
+        log.info(
+          `Recovered builtin datasetId ${dataset.id} for view "${rawName}" by name match`
+        );
+        return dataset.id;
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * Convert server response (snake_case) to client model (camelCase)
    */
   _serverToClientFormat(serverView) {
+    // Built-in datasets are stored with dataset_id = NULL. Restore the client
+    // datasetId so the viewport can locate the dataset (see loadViewData).
+    let datasetId = serverView.dataset_id;
+    if (!datasetId) {
+      datasetId = this._recoverBuiltinDatasetId(serverView);
+    }
+
     return {
       id: serverView.id,
-      datasetId: serverView.dataset_id,
+      datasetId,
       projectId: serverView.project_id,
       name: serverView.name,
       description: serverView.description,
@@ -329,6 +387,18 @@ export class ViewConfigurationManager extends BaseManager {
       }
     }
 
+    // Built-in datasets (id starts with "builtin-") are persisted server-side
+    // with dataset_id = NULL because they are not database rows. Stash the
+    // original builtin id inside the `visualization` JSONB so the round-trip
+    // can restore datasetId on rehydration (see _serverToClientFormat).
+    let visualization = viewConfig.visualization || null;
+    if (typeof datasetId === "string" && datasetId.startsWith("builtin-")) {
+      visualization = {
+        ...(viewConfig.visualization || {}),
+        builtinDatasetId: datasetId,
+      };
+    }
+
     // Prepare request body for server (using server's expected field names)
     const requestBody = {
       fileId: datasetId, // Server expects fileId, not datasetId
@@ -336,6 +406,7 @@ export class ViewConfigurationManager extends BaseManager {
       name: viewConfig.name || "Untitled View",
       description: viewConfig.description || "",
       camera,
+      visualization,
       filters: viewConfig.filters || [],
       widgets: viewConfig.widgets || [],
       colorMaps,

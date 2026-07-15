@@ -29,28 +29,30 @@ export const config = Object.freeze({
   /** Base URL for the API server */
   apiBaseUrl: resolveValue(
     "apiBaseUrl",
-    "__API_BASE_URL__",
+    typeof __API_BASE_URL__ !== "undefined" ? __API_BASE_URL__ : undefined,
     "http://localhost:3001/api"
   ),
 
-  /** WebSocket URL for Y.js collaboration server */
+  /** WebSocket URL for Y.js collaboration server. A path like "/yjs-ws" is
+   *  resolved against the page origin at connect time (ws/wss to match the
+   *  page protocol) — see the webpack devServer /yjs-ws proxy. */
   yjsWebSocketUrl: resolveValue(
     "yjsWebSocketUrl",
-    "__YJS_WS_URL__",
-    "ws://localhost:9001"
+    typeof __YJS_WS_URL__ !== "undefined" ? __YJS_WS_URL__ : undefined,
+    "/yjs-ws"
   ),
 
   /** LiveKit server URL for voice chat */
   liveKitUrl: resolveValue(
     "liveKitUrl",
-    "__LIVEKIT_URL__",
+    typeof __LIVEKIT_URL__ !== "undefined" ? __LIVEKIT_URL__ : undefined,
     "ws://localhost:7880"
   ),
 
   /** LiveKit token server URL */
   liveKitTokenUrl: resolveValue(
     "liveKitTokenUrl",
-    "__LIVEKIT_TOKEN_URL__",
+    typeof __LIVEKIT_TOKEN_URL__ !== "undefined" ? __LIVEKIT_TOKEN_URL__ : undefined,
     "http://localhost:3002"
   ),
 
@@ -61,7 +63,7 @@ export const config = Object.freeze({
   /** Default session/project ID for development */
   defaultSessionId: resolveValue(
     "defaultSessionId",
-    "__DEFAULT_SESSION_ID__",
+    typeof __DEFAULT_SESSION_ID__ !== "undefined" ? __DEFAULT_SESSION_ID__ : undefined,
     "00000000-0000-0000-0000-000000000001"
   ),
 
@@ -75,21 +77,37 @@ export const config = Object.freeze({
   /** Whether to use server storage (vs local-only mode) */
   useServerStorage: resolveValue(
     "useServerStorage",
-    "__USE_SERVER_STORAGE__",
+    typeof __USE_SERVER_STORAGE__ !== "undefined" ? __USE_SERVER_STORAGE__ : undefined,
     true
   ),
 
   /** Whether we're in development mode */
-  isDevelopment: resolveValue("isDevelopment", "__DEV__", true),
+  isDevelopment: resolveValue(
+    "isDevelopment",
+    typeof __DEV__ !== "undefined" ? __DEV__ : undefined,
+    true
+  ),
 
   /** Whether to enable debug logging */
-  debugEnabled: resolveValue("debugEnabled", "__DEBUG__", true),
+  debugEnabled: resolveValue(
+    "debugEnabled",
+    typeof __DEBUG__ !== "undefined" ? __DEBUG__ : undefined,
+    true
+  ),
 
   /** Whether to show multi-window / tiled workspace layout (false = single main workspace) */
-  enableMultiView: resolveValue("enableMultiView", "__ENABLE_MULTI_VIEW__", false),
+  enableMultiView: resolveValue(
+    "enableMultiView",
+    typeof __ENABLE_MULTI_VIEW__ !== "undefined" ? __ENABLE_MULTI_VIEW__ : undefined,
+    false
+  ),
 
   /** Application version (injected at build time) */
-  version: resolveValue("version", "__APP_VERSION__", "dev"),
+  version: resolveValue(
+    "version",
+    typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : undefined,
+    "dev"
+  ),
 
   // ---------------------------------------------------------------------------
   // Authentication (Keycloak)
@@ -98,35 +116,55 @@ export const config = Object.freeze({
   /** Keycloak server URL */
   keycloakUrl: resolveValue(
     "keycloakUrl",
-    "__KEYCLOAK_URL__",
+    typeof __KEYCLOAK_URL__ !== "undefined" ? __KEYCLOAK_URL__ : undefined,
     "http://localhost:8080"
   ),
 
   /** Keycloak realm name */
-  keycloakRealm: resolveValue("keycloakRealm", "__KEYCLOAK_REALM__", "cia-web"),
+  keycloakRealm: resolveValue(
+    "keycloakRealm",
+    typeof __KEYCLOAK_REALM__ !== "undefined" ? __KEYCLOAK_REALM__ : undefined,
+    "cia-web"
+  ),
 
   /** Keycloak client ID */
   keycloakClientId: resolveValue(
     "keycloakClientId",
-    "__KEYCLOAK_CLIENT_ID__",
+    typeof __KEYCLOAK_CLIENT_ID__ !== "undefined" ? __KEYCLOAK_CLIENT_ID__ : undefined,
     "cia-web-app"
   ),
 
   /** Dev bypass auth (skip Keycloak in development) */
-  devBypassAuth: resolveValue("devBypassAuth", "__DEV_BYPASS_AUTH__", false),
+  devBypassAuth: resolveValue(
+    "devBypassAuth",
+    typeof __DEV_BYPASS_AUTH__ !== "undefined" ? __DEV_BYPASS_AUTH__ : undefined,
+    false
+  ),
 
   // ---------------------------------------------------------------------------
   // Server-Side Rendering
   // ---------------------------------------------------------------------------
 
   /** Rendering mode: 'server' | 'local' | 'hybrid' */
-  renderMode: resolveValue("renderMode", "__RENDER_MODE__", "local"),
+  renderMode: resolveValue(
+    "renderMode",
+    typeof __RENDER_MODE__ !== "undefined" ? __RENDER_MODE__ : undefined,
+    "local"
+  ),
 
   /** Base HTTP URL of the Python VTK render server */
-  renderServerUrl: resolveValue("renderServerUrl", "__RENDER_SERVER_URL__", "http://localhost:7001"),
+  renderServerUrl: resolveValue(
+    "renderServerUrl",
+    typeof __RENDER_SERVER_URL__ !== "undefined" ? __RENDER_SERVER_URL__ : undefined,
+    "http://localhost:7001"
+  ),
 
   /** WebSocket URL for interactive frame streaming */
-  renderWsUrl: resolveValue("renderWsUrl", "__RENDER_WS_URL__", "/render-ws"),
+  renderWsUrl: resolveValue(
+    "renderWsUrl",
+    typeof __RENDER_WS_URL__ !== "undefined" ? __RENDER_WS_URL__ : undefined,
+    "/render-ws"
+  ),
 });
 
 // =============================================================================
@@ -136,21 +174,17 @@ export const config = Object.freeze({
 /**
  * Resolve a configuration value from multiple sources
  * Priority order:
- * 1. Webpack DefinePlugin (build-time)
+ * 1. Webpack DefinePlugin (build-time) — passed in already-resolved, since
+ *    DefinePlugin only replaces identifiers that appear literally in source;
+ *    it cannot rewrite a key name assembled at runtime (e.g. via eval), so
+ *    each call site above resolves its own `typeof __X__ !== 'undefined'`
+ *    check inline rather than deferring that to a shared helper.
  * 2. Window config object (runtime)
  * 3. Default fallback
  */
-function resolveValue(key, defineKey, defaultValue) {
-  // Try Webpack DefinePlugin first
-  try {
-    const defineValue = eval(
-      `typeof ${defineKey} !== 'undefined' ? ${defineKey} : undefined`
-    );
-    if (defineValue !== undefined && defineValue !== defineKey) {
-      return defineValue;
-    }
-  } catch (e) {
-    // DefinePlugin variable doesn't exist
+function resolveValue(key, defineValue, defaultValue) {
+  if (defineValue !== undefined) {
+    return defineValue;
   }
 
   // Try window config object

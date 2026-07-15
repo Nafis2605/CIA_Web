@@ -87,8 +87,9 @@ import {
   worldToScreen,
 } from "@VTK/utils/vtkRaycaster.js";
 import { vrManager } from "@Core/vr/VRManager.js";
+import { vrExplorationManager } from "@Core/vr/VRExplorationManager.js";
 import { VRControllerRenderer } from "@Core/vr/VRControllerRenderer.js";
-import { vrControllers } from "@VTK/vr/VTKVRController.js";
+import { VR_CLEAR_COLOR } from "@Core/vr/environment/VREnvironment.js";
 import {
   updateCursorWorldPosition,
   clearCursorWorldPosition,
@@ -122,7 +123,6 @@ import vtkSphereSource from "@kitware/vtk.js/Filters/Sources/SphereSource";
 import vtkConeSource from "@kitware/vtk.js/Filters/Sources/ConeSource";
 import vtkCubeSource from "@kitware/vtk.js/Filters/Sources/CubeSource";
 import vtkCylinderSource from "@kitware/vtk.js/Filters/Sources/CylinderSource";
-import vtkPlaneSource from "@kitware/vtk.js/Filters/Sources/PlaneSource";
 import vtkCellPicker from "@kitware/vtk.js/Rendering/Core/CellPicker";
 import "@kitware/vtk.js/Rendering/Profiles/Geometry";
 
@@ -4565,36 +4565,9 @@ console.log('Tools:', tools);
   /**
    * Check if this instance type supports VR
    */
-  supportsInstanceVR() {
-    return true; // VTK supports VR through WebXR
-  }
-
   /**
-   * Get VR capabilities
-   */
-  getVRCapabilities() {
-    return {
-      instanceVR: true,
-      applicationVR: false,
-
-      requirements: {
-        controllers: true,
-        handTracking: false,
-        roomScale: true,
-        minFPS: 90,
-      },
-
-      optional: {
-        eyeTracking: false,
-        haptics: true,
-        spatialAudio: false,
-      },
-    };
-  }
-
-  /**
-   * Get the WebGL context for this instance
-   * Used by VRButton to pass to VRManager
+   * Get the WebGL context for this instance.
+   * Used by vrExplorationManager.startExploration() to pass to VRManager.enterVR().
    */
   getWebGLContext(instanceId) {
     const instanceData = this.instances.get(instanceId);
@@ -4616,269 +4589,6 @@ console.log('Tools:', tools);
     return gl;
   }
 
-  /**
-   * Enter VR mode for this instance
-   *
-   * Sets up stereo rendering and controller visualization for WebXR
-   *
-   * @param {Object} instanceData - The instance data object
-   * @param {XRSession} xrSession - The active XR session from VRManager
-   * @returns {Object} VR context data
-   */
-  async enterInstanceVR(instanceData, xrSession) {
-    const { instanceId, sceneObjects } = instanceData;
-    log.info(`Entering VR for VTK instance ${instanceId}`);
-
-    if (!sceneObjects) {
-      throw new Error("Cannot enter VR: instance not initialized");
-    }
-
-    const { renderer, renderWindow, openGLRenderWindow, camera } = sceneObjects;
-
-    // Store original camera state for restoration
-    const originalCameraState = {
-      position: camera.getPosition(),
-      focalPoint: camera.getFocalPoint(),
-      viewUp: camera.getViewUp(),
-      parallelScale: camera.getParallelScale(),
-      clippingRange: camera.getClippingRange(),
-      viewAngle: camera.getViewAngle(),
-    };
-
-    // Get WebGL context
-    const canvas = openGLRenderWindow.getCanvas();
-    const gl =
-      canvas.getContext("webgl2", { xrCompatible: true }) ||
-      canvas.getContext("webgl", { xrCompatible: true });
-
-    if (!gl) {
-      throw new Error("Could not get WebGL context for VR");
-    }
-
-    // Make context XR compatible
-    await gl.makeXRCompatible();
-
-    // Create XR WebGL layer
-    const xrLayer = new XRWebGLLayer(xrSession, gl);
-
-    // Update session render state
-    await xrSession.updateRenderState({
-      baseLayer: xrLayer,
-    });
-
-    // Get reference space
-    const referenceSpace = vrManager.getReferenceSpace();
-
-    // Create VR data context
-    const vrData = {
-      xrSession,
-      xrLayer,
-      gl,
-      referenceSpace,
-      originalCameraState,
-      isActive: true,
-      frameHandler: null,
-      scaleMultiplier: 1.0, // Adjust if scene units != meters
-    };
-
-    // Calculate scene scale (VTK units to meters)
-    // If your data is in millimeters, set scaleMultiplier = 0.001
-    const bounds = renderer.computeVisiblePropBounds();
-    const diagonal = Math.sqrt(
-      Math.pow(bounds[1] - bounds[0], 2) +
-        Math.pow(bounds[3] - bounds[2], 2) +
-        Math.pow(bounds[5] - bounds[4], 2)
-    );
-
-    // Auto-scale: try to make the model about 1 meter in VR
-    if (diagonal > 0) {
-      vrData.scaleMultiplier = 1.0 / diagonal;
-      log.debug(
-        `VR scale multiplier: ${vrData.scaleMultiplier} (diagonal: ${diagonal})`
-      );
-    }
-
-    // Initialize controllers for this instance
-    vrControllers.initialize(instanceId, sceneObjects, xrSession);
-
-    // Store VR data on instance
-    instanceData.vrData = vrData;
-
-    // Subscribe to VRManager frame events
-    vrData.frameHandler = (frameData) => {
-      this._renderVRFrame(instanceData, vrData, frameData);
-    };
-    vrManager.on("frame", vrData.frameHandler);
-
-    log.info(`VR initialized for instance ${instanceId}`);
-    return vrData;
-  }
-
-  /**
-   * Render a VR frame (called ~90 times per second)
-   *
-   * Handles stereo rendering by rendering the scene twice,
-   * once for each eye with appropriate camera transforms.
-   *
-   * @private
-   */
-  _renderVRFrame(instanceData, vrData, frameData) {
-    if (!vrData.isActive) return;
-
-    const { frame, viewerPose, referenceSpace } = frameData;
-    const { xrSession, xrLayer, gl, scaleMultiplier } = vrData;
-    const { renderer, renderWindow, camera } = instanceData.sceneObjects;
-
-    if (!viewerPose) {
-      // No tracking - can't render
-      return;
-    }
-
-    // Bind XR framebuffer
-    gl.bindFramebuffer(gl.FRAMEBUFFER, xrLayer.framebuffer);
-
-    // Clear the framebuffer
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-
-    // Render for each eye (left and right)
-    for (const view of viewerPose.views) {
-      const viewport = xrLayer.getViewport(view);
-
-      // Set viewport for this eye
-      gl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
-
-      // Update VTK camera for this XR view
-      this._updateCameraForVRView(camera, view, scaleMultiplier);
-
-      // Render the scene
-      renderer.render();
-    }
-
-    // Update controller visualizations
-    vrControllers.updatePoses(instanceData.instanceId, frame, referenceSpace);
-  }
-
-  /**
-   * Update VTK camera to match an XR view (eye)
-   *
-   * Extracts position and orientation from the XR view transform
-   * and applies it to the VTK camera.
-   *
-   * @private
-   */
-  _updateCameraForVRView(camera, xrView, scaleMultiplier = 1.0) {
-    // Get the view transform (inverse gives us the camera position/orientation)
-    const viewMatrix = xrView.transform.inverse.matrix;
-
-    // Extract position from the 4x4 matrix
-    // Column-major order: position is at indices 12, 13, 14
-    const position = [
-      viewMatrix[12] / scaleMultiplier,
-      viewMatrix[13] / scaleMultiplier,
-      viewMatrix[14] / scaleMultiplier,
-    ];
-
-    // Extract forward direction from the matrix
-    // Forward is negative Z in WebXR (-column 2)
-    const forward = [-viewMatrix[8], -viewMatrix[9], -viewMatrix[10]];
-
-    // Extract up direction (column 1)
-    const up = [viewMatrix[4], viewMatrix[5], viewMatrix[6]];
-
-    // Calculate focal point (position + forward direction)
-    const focalDistance = camera.getDistance() || 1.0;
-    const focalPoint = [
-      position[0] + forward[0] * focalDistance,
-      position[1] + forward[1] * focalDistance,
-      position[2] + forward[2] * focalDistance,
-    ];
-
-    // Apply to VTK camera
-    camera.setPosition(...position);
-    camera.setFocalPoint(...focalPoint);
-    camera.setViewUp(...up);
-
-    // Set projection matrix from XR
-    // Note: VTK uses a different matrix format, so we need to convert
-    const projMatrix = xrView.projectionMatrix;
-    camera.setProjectionMatrix(projMatrix);
-  }
-
-  /**
-   * Exit VR mode for this instance
-   *
-   * Restores original camera state and cleans up VR resources
-   */
-  async exitInstanceVR(instanceData) {
-    const { instanceId, vrData, sceneObjects } = instanceData;
-
-    if (!vrData) {
-      log.warn(`No VR data to clean up for instance ${instanceId}`);
-      return;
-    }
-
-    log.info(`Exiting VR for VTK instance ${instanceId}`);
-
-    // Stop frame updates
-    vrData.isActive = false;
-
-    // Unsubscribe from VRManager frame events
-    if (vrData.frameHandler) {
-      vrManager.off("frame", vrData.frameHandler);
-      vrData.frameHandler = null;
-    }
-
-    // Clean up controllers
-    vrControllers.cleanup(instanceId);
-
-    // Restore original camera state
-    if (sceneObjects?.camera && vrData.originalCameraState) {
-      const camera = sceneObjects.camera;
-      const orig = vrData.originalCameraState;
-
-      camera.setPosition(...orig.position);
-      camera.setFocalPoint(...orig.focalPoint);
-      camera.setViewUp(...orig.viewUp);
-      camera.setParallelScale(orig.parallelScale);
-      camera.setClippingRange(...orig.clippingRange);
-      camera.setViewAngle(orig.viewAngle);
-
-      // Clear the projection matrix so VTK computes it normally
-      camera.setProjectionMatrix(null);
-    }
-
-    // Re-render to desktop view
-    this._requestRender(instanceData, "vr-exit");
-
-    // Clear VR data
-    instanceData.vrData = null;
-
-    log.info(`VR exited for instance ${instanceId}`);
-  }
-
-  /**
-   * Update VR state (called every frame while in VR)
-   * Most work is done in _renderVRFrame, but this can be used
-   * for additional per-frame updates
-   */
-  async updateInstanceVR(instanceData, vrData, frame) {
-    // Additional per-frame updates can go here
-    // The main rendering is handled by _renderVRFrame
-  }
-
-  /**
-   * Called when application enters VR mode
-   * Prepares instance for VR context (optimize rendering, etc.)
-   */
-  async onApplicationVREnter(instanceData, vrContext) {
-    log.debug(`Application VR enter for instance ${instanceData.instanceId}`);
-    // Could add optimizations here like:
-    // - Reduce polygon count
-    // - Disable expensive effects
-    // - Adjust LOD settings
-    return null;
-  }
-
   // ===========================================================================
   // VR EXPLORATION IMPLEMENTATION
   // ===========================================================================
@@ -4897,7 +4607,7 @@ console.log('Tools:', tools);
     return {
       supported: true,
       explorationModes: ["fly", "teleport", "walk", "scale"],
-      tools: ["slice", "measure", "annotate", "clip", "probe"],
+      tools: ["measure", "annotate", "clip", "probe"],
       maxRegionSize: null,
       supportsLiveSync: true,
       requiresPreprocessing: ["lod-generation"],
@@ -4931,9 +4641,18 @@ console.log('Tools:', tools);
   }
 
   /**
-   * Enter VR exploration mode
+   * Enter VR exploration mode.
+   *
+   * @param {Object} instanceData
+   * @param {Object} session
+   * @param {XRSession} xrSession - the session VRManager already opened
+   * @param {Object} xrResources - { gl, xrLayer, referenceSpace } already
+   *   set up by VRManager._setupWebGLLayer/enterVR — this handler no longer
+   *   creates its own WebGL context/XRWebGLLayer, since doing so raced a
+   *   second, unused XRWebGLLayer against the one VRManager already bound
+   *   as the session's baseLayer.
    */
-  async enterVRExploration(instanceData, session, xrSession) {
+  async enterVRExploration(instanceData, session, xrSession, xrResources) {
     const { instanceId, sceneObjects } = instanceData;
 
     log.info(`Entering VR exploration for instance ${instanceId}`);
@@ -4942,7 +4661,29 @@ console.log('Tools:', tools);
       throw new Error("Cannot enter VR exploration: instance not initialized");
     }
 
-    const { renderer, renderWindow, openGLRenderWindow, camera } = sceneObjects;
+    const { gl, xrLayer, referenceSpace } = xrResources || {};
+    if (!gl || !xrLayer || !referenceSpace) {
+      throw new Error(
+        "enterVRExploration requires { gl, xrLayer, referenceSpace } from VRManager"
+      );
+    }
+
+    const { renderer, camera, openGLRenderWindow } = sceneObjects;
+
+    // Defensive: ensure the renderer's own erase pass is ON so it repaints its
+    // (bright) background each render rather than leaving whatever was in the
+    // eye viewport. Combined with VREnvironment's bright background + the
+    // per-eye scissored re-clear in updateVRExploration, this is belt-and-
+    // suspenders against the reported black surround (R3).
+    renderer.setErase?.(true);
+
+    // Capture the pre-VR desktop GL drawing-buffer size so exitVRExploration
+    // can restore it — per-eye rendering resizes the OpenGL render window to
+    // each XR viewport, which would otherwise persist until the next resize.
+    const originalGLSize =
+      typeof openGLRenderWindow?.getSize === "function"
+        ? openGLRenderWindow.getSize()
+        : null;
 
     // Get dataset bounds
     const bounds = renderer.computeVisiblePropBounds();
@@ -4958,27 +4699,6 @@ console.log('Tools:', tools);
       viewAngle: camera.getViewAngle(),
     };
 
-    // Get WebGL context
-    const canvas = openGLRenderWindow.getCanvas();
-    const gl =
-      canvas.getContext("webgl2", { xrCompatible: true }) ||
-      canvas.getContext("webgl", { xrCompatible: true });
-
-    if (!gl) {
-      throw new Error("Could not get WebGL context for VR exploration");
-    }
-
-    // Make context XR compatible
-    await gl.makeXRCompatible();
-
-    // Create XR WebGL layer
-    const xrLayer = new XRWebGLLayer(xrSession, gl);
-
-    // Update session render state
-    await xrSession.updateRenderState({
-      baseLayer: xrLayer,
-    });
-
     // Create VR exploration context
     const vrContext = {
       instanceId,
@@ -4986,16 +4706,18 @@ console.log('Tools:', tools);
       xrSession,
       xrLayer,
       gl,
+      referenceSpace,
+      handler: this,
       sceneObjects,
       dataBounds,
       originalCameraState,
+      originalGLSize,
 
-      // VR state
+      // VR state — placement is finalized by
+      // VRExplorationManager._applyInitialPlacement right after this call
+      // returns; these are just safe pre-placement defaults.
       vrScale: session.defaultVRScale || 1.0,
       vrOrigin: [0, 0, 0],
-
-      // Slice planes
-      slicePlanes: new Map(),
 
       // Measurements
       measurements: [],
@@ -5016,41 +4738,78 @@ console.log('Tools:', tools);
   }
 
   /**
-   * Update VR exploration frame
+   * Update VR exploration frame. Synchronous — this runs once per XR frame
+   * (~90Hz), so it must never await; the reference space and viewerPose are
+   * already resolved by VRManager's frame loop and passed in.
    */
-  async updateVRExploration(vrContext, frame, inputState) {
-    const { sceneObjects, xrSession, xrLayer, gl, vrScale, vrOrigin } =
+  updateVRExploration(vrContext, frame, inputState, viewerPose) {
+    const { sceneObjects, xrLayer, gl, vrScale, vrOrigin, referenceSpace } =
       vrContext;
-    const { renderer, renderWindow, camera } = sceneObjects;
+    const { renderer, renderWindow, openGLRenderWindow, camera } = sceneObjects;
 
     if (!frame) return;
 
-    // Get reference space
-    let refSpace;
-    try {
-      refSpace = await xrSession.requestReferenceSpace("local-floor");
-    } catch (e) {
-      refSpace = await xrSession.requestReferenceSpace("local");
-    }
+    const pose = viewerPose || frame.getViewerPose(referenceSpace);
+    if (!pose) return;
 
-    const viewerPose = frame.getViewerPose(refSpace);
-    if (!viewerPose) return;
-
-    // Bind XR framebuffer
+    // Bind the XR framebuffer and clear it once for both eyes. The clear
+    // color matches VREnvironment's bright BG_BOTTOM so the surround reads as
+    // a light room rather than the default black gl.clear().
     gl.bindFramebuffer(gl.FRAMEBUFFER, xrLayer.framebuffer);
+    gl.clearColor(...VR_CLEAR_COLOR, 1.0);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LEQUAL);
 
-    // Render for each eye
-    for (const view of viewerPose.views) {
+    // Render for each eye (typically left and right).
+    for (const view of pose.views) {
       const viewport = xrLayer.getViewport(view);
-      gl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
 
-      // Update camera from VR view
+      // Update camera from this eye's XR view (position + projection matrix).
       this._updateCameraFromVRPose(camera, view, vrScale, vrOrigin);
 
-      // Render the scene
-      renderer.render();
+      // vtk.js derives gl.viewport internally from the renderer's fractional
+      // viewport × the OpenGL render window size, so a manual gl.viewport()
+      // would just be overwritten. Size the render window to the eye viewport
+      // and express the eye rectangle as fractional (xmin, ymin, xmax, ymax).
+      openGLRenderWindow.setSize(viewport.width, viewport.height);
+      renderer.setViewport(
+        viewport.x / xrLayer.framebufferWidth,
+        viewport.y / xrLayer.framebufferHeight,
+        (viewport.x + viewport.width) / xrLayer.framebufferWidth,
+        (viewport.y + viewport.height) / xrLayer.framebufferHeight
+      );
+
+      // vtk.js render passes can rebind framebuffers internally; re-bind the
+      // XR framebuffer immediately before rendering as cheap insurance.
+      gl.bindFramebuffer(gl.FRAMEBUFFER, xrLayer.framebuffer);
+
+      // NEVER-BLACK (R3): scissored bright re-clear of THIS eye's viewport
+      // immediately before rendering it. The single full-framebuffer clear at
+      // the top covers both eyes, but vtk.js's own erase pass repaints each eye
+      // rectangle with the renderer background, and that path has been observed
+      // to leave black under the custom XR projection. A per-eye scissored
+      // clear to the same bright VR_CLEAR_COLOR guarantees the surround is
+      // bright no matter what the renderer's erase does. Scissor is scoped
+      // tightly (enable → clear → disable) so it can't leak into vtk.js's own
+      // WebGL state, which it re-establishes each render() anyway.
+      gl.enable(gl.SCISSOR_TEST);
+      gl.scissor(viewport.x, viewport.y, viewport.width, viewport.height);
+      gl.clearColor(...VR_CLEAR_COLOR, 1.0);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      gl.disable(gl.SCISSOR_TEST);
+
+      // THE fix: render via the render *window* (vtkRenderer has no render()).
+      renderWindow.render();
     }
+
+    // Defensively disable the scissor test after the loop in case a render
+    // pass left it enabled — the desktop path assumes full-viewport clears.
+    gl.disable(gl.SCISSOR_TEST);
+
+    // Reset the renderer viewport so nothing downstream inherits a half-screen
+    // (per-eye) viewport.
+    renderer.setViewport(0, 0, 1, 1);
 
     // Update controller visuals
     this._updateVRExplorationControllers(vrContext, inputState);
@@ -5060,9 +4819,8 @@ console.log('Tools:', tools);
    * Exit VR exploration
    */
   async exitVRExploration(vrContext) {
-    const { instanceId, sceneObjects, originalCameraState, slicePlanes } =
-      vrContext;
-    const { camera, renderer, renderWindow } = sceneObjects;
+    const { instanceId, sceneObjects, originalCameraState } = vrContext;
+    const { camera, renderer, renderWindow, openGLRenderWindow } = sceneObjects;
 
     log.info(`Exiting VR exploration for instance ${instanceId}`);
 
@@ -5077,149 +4835,28 @@ console.log('Tools:', tools);
       camera.setProjectionMatrix(null);
     }
 
-    // Clean up slice planes
-    for (const [id, planeData] of slicePlanes) {
-      if (planeData.actor) {
-        renderer.removeActor(planeData.actor);
-      }
-    }
-    slicePlanes.clear();
-
     // Clean up controller visuals
     this._cleanupVRExplorationControllers(vrContext);
+
+    // Restore the desktop viewport and GL drawing-buffer size, both of which
+    // were mutated per-eye during VR rendering. Without this the desktop
+    // canvas would stay at the last eye's viewport/resolution until the next
+    // resize event.
+    renderer.setViewport(0, 0, 1, 1);
+    if (
+      vrContext.originalGLSize &&
+      typeof openGLRenderWindow?.setSize === "function"
+    ) {
+      openGLRenderWindow.setSize(...vrContext.originalGLSize);
+    }
 
     renderWindow.render();
 
     log.info(`VR exploration ended for instance ${instanceId}`);
 
     return {
-      finalSlicePlanes: Array.from(slicePlanes.values()),
       measurements: vrContext.measurements,
     };
-  }
-
-  // ===========================================================================
-  // VR SLICE PLANE SUPPORT
-  // ===========================================================================
-
-  /**
-   * Add a slice plane
-   */
-  async addSlicePlane(vrContext, plane) {
-    const { sceneObjects, slicePlanes, dataBounds } = vrContext;
-    const { renderer, renderWindow } = sceneObjects;
-
-    // Create VTK plane source
-    const planeSource = vtkPlaneSource.newInstance();
-
-    // Size plane based on data bounds
-    const size = this._computePlaneSize(dataBounds);
-    const halfSize = size / 2;
-
-    // Calculate plane corners based on origin and normal
-    const origin = plane.origin;
-    const normal = plane.normal;
-
-    // Create orthogonal vectors to the normal
-    const up = Math.abs(normal[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
-    const right = this._crossProduct(normal, up);
-    this._normalizeVector(right);
-    const actualUp = this._crossProduct(right, normal);
-    this._normalizeVector(actualUp);
-
-    // Set plane corners
-    planeSource.setOrigin(
-      origin[0] - right[0] * halfSize - actualUp[0] * halfSize,
-      origin[1] - right[1] * halfSize - actualUp[1] * halfSize,
-      origin[2] - right[2] * halfSize - actualUp[2] * halfSize
-    );
-    planeSource.setPoint1(
-      origin[0] + right[0] * halfSize - actualUp[0] * halfSize,
-      origin[1] + right[1] * halfSize - actualUp[1] * halfSize,
-      origin[2] + right[2] * halfSize - actualUp[2] * halfSize
-    );
-    planeSource.setPoint2(
-      origin[0] - right[0] * halfSize + actualUp[0] * halfSize,
-      origin[1] - right[1] * halfSize + actualUp[1] * halfSize,
-      origin[2] - right[2] * halfSize + actualUp[2] * halfSize
-    );
-
-    const mapper = vtkMapper.newInstance();
-    mapper.setInputConnection(planeSource.getOutputPort());
-
-    const actor = vtkActor.newInstance();
-    actor.setMapper(mapper);
-    actor.getProperty().setColor(...(plane.color || [1, 0.5, 0]));
-    actor.getProperty().setOpacity(plane.opacity || 0.5);
-    actor.getProperty().setRepresentationToSurface();
-
-    renderer.addActor(actor);
-
-    slicePlanes.set(plane.id, {
-      ...plane,
-      source: planeSource,
-      mapper,
-      actor,
-    });
-
-    renderWindow.render();
-  }
-
-  /**
-   * Update a slice plane
-   */
-  async updateSlicePlane(vrContext, plane) {
-    const planeData = vrContext.slicePlanes.get(plane.id);
-    if (!planeData) return;
-
-    const { dataBounds } = vrContext;
-    const size = this._computePlaneSize(dataBounds);
-    const halfSize = size / 2;
-
-    const origin = plane.origin;
-    const normal = plane.normal;
-
-    // Recalculate orthogonal vectors
-    const up = Math.abs(normal[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
-    const right = this._crossProduct(normal, up);
-    this._normalizeVector(right);
-    const actualUp = this._crossProduct(right, normal);
-    this._normalizeVector(actualUp);
-
-    // Update plane corners
-    planeData.source.setOrigin(
-      origin[0] - right[0] * halfSize - actualUp[0] * halfSize,
-      origin[1] - right[1] * halfSize - actualUp[1] * halfSize,
-      origin[2] - right[2] * halfSize - actualUp[2] * halfSize
-    );
-    planeData.source.setPoint1(
-      origin[0] + right[0] * halfSize - actualUp[0] * halfSize,
-      origin[1] + right[1] * halfSize - actualUp[1] * halfSize,
-      origin[2] + right[2] * halfSize - actualUp[2] * halfSize
-    );
-    planeData.source.setPoint2(
-      origin[0] - right[0] * halfSize + actualUp[0] * halfSize,
-      origin[1] - right[1] * halfSize + actualUp[1] * halfSize,
-      origin[2] - right[2] * halfSize + actualUp[2] * halfSize
-    );
-
-    planeData.source.modified();
-    Object.assign(planeData, plane);
-
-    vrContext.sceneObjects.renderWindow.render();
-  }
-
-  /**
-   * Remove a slice plane
-   */
-  async removeSlicePlane(vrContext, planeId) {
-    const planeData = vrContext.slicePlanes.get(planeId);
-    if (!planeData) return;
-
-    vrContext.sceneObjects.renderer.removeActor(planeData.actor);
-    vrContext.slicePlanes.delete(planeId);
-
-    vrContext.sceneObjects.renderWindow.render();
   }
 
   // ===========================================================================
@@ -5281,16 +4918,94 @@ console.log('Tools:', tools);
   }
 
   /**
-   * Get data value at position
+   * Get data value(s) at a data-space position by nearest-point lookup.
+   *
+   * Called by VRProbeTool._probeAtPosition with the same coordinate space that
+   * raycastVR returns (scene/data space). Finds the nearest polydata point via
+   * a linear scan (fine for interactive single-probe use) and returns its
+   * point-data array values.
+   *
+   * @param {Object} vrContext - VR context; polydata is read from
+   *   vrContext.sceneObjects.mapper.getInputData()
+   * @param {{x:number,y:number,z:number}|number[]} position - data-space probe point
+   * @returns {{pointId:number, distance:number, position:number[],
+   *   values:Object<string, number|number[]>}|null} null when there is no
+   *   polydata/points to probe.
    */
   probeDataVR(vrContext, position) {
-    if (!vrContext?.sceneObjects) return null;
+    if (!vrContext?.sceneObjects || !position) return null;
 
-    // For point data, we would find the nearest point and return its data
-    // For volume data, we would sample at the position
-    // This is a placeholder that would need to be implemented based on data type
+    const mapper = vrContext.sceneObjects.mapper;
+    const polyData =
+      typeof mapper?.getInputData === "function" ? mapper.getInputData() : null;
+    if (!polyData) return null;
 
-    return null;
+    const pointsObj =
+      typeof polyData.getPoints === "function" ? polyData.getPoints() : null;
+    const nPoints =
+      typeof pointsObj?.getNumberOfPoints === "function"
+        ? pointsObj.getNumberOfPoints()
+        : 0;
+    if (!nPoints) return null;
+
+    const coords = pointsObj.getData();
+    if (!coords || coords.length < nPoints * 3) return null;
+
+    const px = Array.isArray(position) ? position[0] : position.x;
+    const py = Array.isArray(position) ? position[1] : position.y;
+    const pz = Array.isArray(position) ? position[2] : position.z;
+
+    // Linear nearest-point scan (squared distance — no sqrt in the loop).
+    let bestId = -1;
+    let bestDistSq = Infinity;
+    for (let i = 0; i < nPoints; i++) {
+      const dx = coords[i * 3] - px;
+      const dy = coords[i * 3 + 1] - py;
+      const dz = coords[i * 3 + 2] - pz;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 < bestDistSq) {
+        bestDistSq = d2;
+        bestId = i;
+      }
+    }
+    if (bestId < 0) return null;
+
+    // Collect every point-data array's value(s) at the nearest point.
+    const values = {};
+    const pointData =
+      typeof polyData.getPointData === "function" ? polyData.getPointData() : null;
+    const nArrays =
+      typeof pointData?.getNumberOfArrays === "function"
+        ? pointData.getNumberOfArrays()
+        : 0;
+    for (let a = 0; a < nArrays; a++) {
+      const arr = pointData.getArrayByIndex(a);
+      if (!arr) continue;
+      const name =
+        (typeof arr.getName === "function" && arr.getName()) || `array${a}`;
+      const nComp =
+        typeof arr.getNumberOfComponents === "function"
+          ? arr.getNumberOfComponents()
+          : 1;
+      const raw = typeof arr.getData === "function" ? arr.getData() : null;
+      if (!raw) continue;
+      if (nComp === 1) {
+        values[name] = raw[bestId];
+      } else {
+        values[name] = Array.from(raw.slice(bestId * nComp, bestId * nComp + nComp));
+      }
+    }
+
+    return {
+      pointId: bestId,
+      distance: Math.sqrt(bestDistSq),
+      position: [
+        coords[bestId * 3],
+        coords[bestId * 3 + 1],
+        coords[bestId * 3 + 2],
+      ],
+      values,
+    };
   }
 
   // ===========================================================================
@@ -5349,7 +5064,7 @@ console.log('Tools:', tools);
    * @private
    */
   _updateCameraFromVRPose(camera, xrView, vrScale, vrOrigin) {
-    const viewMatrix = xrView.transform.inverse.matrix;
+    const viewMatrix = xrView.transform.matrix;
 
     // Extract position (column-major: indices 12, 13, 14)
     const position = [
@@ -5378,42 +5093,6 @@ console.log('Tools:', tools);
 
     // Set projection matrix from XR
     camera.setProjectionMatrix(xrView.projectionMatrix);
-  }
-
-  /**
-   * Compute plane size from data bounds
-   * @private
-   */
-  _computePlaneSize(bounds) {
-    const sizeX = bounds[1] - bounds[0];
-    const sizeY = bounds[3] - bounds[2];
-    const sizeZ = bounds[5] - bounds[4];
-    return Math.max(sizeX, sizeY, sizeZ) * 1.5;
-  }
-
-  /**
-   * Cross product of two vectors
-   * @private
-   */
-  _crossProduct(a, b) {
-    return [
-      a[1] * b[2] - a[2] * b[1],
-      a[2] * b[0] - a[0] * b[2],
-      a[0] * b[1] - a[1] * b[0],
-    ];
-  }
-
-  /**
-   * Normalize a vector in place
-   * @private
-   */
-  _normalizeVector(v) {
-    const len = Math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-    if (len > 0) {
-      v[0] /= len;
-      v[1] /= len;
-      v[2] /= len;
-    }
   }
 
   // ===========================================================================
@@ -5530,7 +5209,18 @@ console.log('Tools:', tools);
           return;
         }
 
-        if (!this._isApplyingRemoteState && instanceData.viewConfigId) {
+        // While this instance is the one being VR-explored,
+        // _updateCameraFromVRPose mutates this camera twice per XR frame
+        // (once per eye, ~180Hz) — broadcasting each of those to
+        // collaborators would spam the desktop yCameras channel and thrash
+        // per-move server persistence. VR presence already flows through
+        // VRParticipantSync (throttled, ~20fps) instead, so skip the
+        // desktop camera-share path entirely while that's true.
+        const isVRDrivingThisCamera =
+          vrExplorationManager.isExploring() &&
+          vrExplorationManager.getActiveContext()?.instance?.instanceId === instanceData.instanceId;
+
+        if (!isVRDrivingThisCamera && !this._isApplyingRemoteState && instanceData.viewConfigId) {
           const cameraState = {
             position: camera.getPosition(),
             focalPoint: camera.getFocalPoint(),

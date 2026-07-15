@@ -25,6 +25,7 @@ export const EXPLORATION_MODES = Object.freeze({
   TELEPORT: 'teleport', // Point and click locomotion
   WALK: 'walk',         // Room-scale physical movement
   SCALE: 'scale',       // Pinch to resize relative to data
+  GRAB: 'grab',         // Pinch-and-drag to pull the data closer / push it away
 });
 
 export const PARTICIPATION_MODE = Object.freeze({

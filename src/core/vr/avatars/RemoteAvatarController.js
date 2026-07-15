@@ -17,7 +17,7 @@ export class RemoteAvatarController {
   constructor(userInfo) {
     this._userInfo = userInfo;
     this._renderer = null;
-    this._vrContext = null; // holds vrScale and vrOrigin (mutated in place each frame)
+    this._vrContext = null; // local viewer's vrContext; NOT used for pose conversion (see _toScenePose)
 
     this._avatar = null;    // SimpleAvatarFallback or VRMAvatar
     this._usingVRM = false;
@@ -32,8 +32,9 @@ export class RemoteAvatarController {
 
   /**
    * @param {object} renderer - VTK.js renderer
-   * @param {object} vrContext - Reference to live vrContext from VRExplorationManager
-   *   (vrContext.vrScale and vrContext.vrOrigin are updated each frame)
+   * @param {object} vrContext - local viewer's vrContext, kept for future use;
+   *   pose placement uses the REMOTE user's own vrScale/vrOrigin instead (see
+   *   _toScenePose)
    */
   initialize(renderer, vrContext) {
     this._renderer = renderer;
@@ -154,6 +155,11 @@ export class RemoteAvatarController {
       rightHand: this._interpLimb(current.rightHand, target.rightHand, alpha),
       pointer: target.pointer, // don't interpolate pointer — snappy is better
       timestamp: target.timestamp,
+      // Sender's transform — always take the latest, no interpolation
+      // (it changes in discrete steps via isolation/scale presets, not
+      // something that benefits from smoothing like position does).
+      vrScale: target.vrScale,
+      vrOrigin: target.vrOrigin,
     };
   }
 
@@ -214,12 +220,19 @@ export class RemoteAvatarController {
 
   /**
    * Convert a pose from WebXR local-floor space (meters) to VTK scene space.
-   * Uses vrContext.vrScale and vrContext.vrOrigin (updated live by VRExplorationManager).
+   *
+   * Uses the REMOTE USER's OWN vrScale/vrOrigin (carried on the pose since
+   * AvatarNetworkSync._toPose), not this local viewer's this._vrContext —
+   * each participant has an independent WebXR session/reference space, so
+   * a remote user's head/hand positions are only meaningful once converted
+   * through THEIR transform. Falls back to identity if a pose predates this
+   * fields being broadcast.
    * @private
    */
   _toScenePose(pose) {
     if (!pose) return null;
-    const { vrScale = 1, vrOrigin = [0, 0, 0] } = this._vrContext || {};
+    const vrScale = typeof pose.vrScale === 'number' ? pose.vrScale : 1.0;
+    const vrOrigin = Array.isArray(pose.vrOrigin) ? pose.vrOrigin : [0, 0, 0];
 
     const toScene = (p) =>
       p

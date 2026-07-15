@@ -9,7 +9,7 @@
 
 import { vr as log } from '@Utils/logger.js';
 import { vrManager } from '@Core/vr/VRManager.js';
-import { VRExplorationSession, PARTICIPATION_MODE, SESSION_STATUS } from '@Core/data/models/VRExplorationSession.js';
+import { VRExplorationSession, PARTICIPATION_MODE, SESSION_STATUS, EXPLORATION_MODES } from '@Core/data/models/VRExplorationSession.js';
 import { VRParticipantSync } from '@Core/vr/VRParticipantSync.js';
 import { VRToolManager } from '@Core/vr/tools/VRToolManager.js';
 import { VRSnapshotManager } from '@Core/vr/VRSnapshotManager.js';
@@ -23,10 +23,13 @@ import { BaseManager } from '@Core/data/managers/BaseManager.js';
 import { vrAvatarSystem } from '@Core/instances/types/vtk/vr/VTKVRAvatars.js';
 import { vrSpatialUI } from '@Core/instances/types/vtk/vr/VTKVRSpatialUI.js';
 import { vrMultiViewGrid } from '@Core/vr/VRMultiViewGrid.js';
-import { vtkClippingFeature, vtkSliceFeature } from '@Core/instances/types/vtk/features/index.js';
+import { vtkClippingFeature } from '@Core/instances/types/vtk/features/index.js';
+import { vtkGlyphFeature, isGlyphFeatureAvailable } from '@Core/instances/types/vtk/features/VTKGlyphFeature.js';
+import { instanceTools } from '@VTK/vtkInstanceTools.js';
 import { pushSharedVisualizationUpdate } from '@Services/visualizationSyncService.js';
 import { vrCursorSync } from '@Core/vr/VRCursorSync.js';
 import { mapXRPointToData, controllerForward } from '@Core/vr/tools/vrPlaneMath.js';
+import { vrEnvironment } from '@Core/vr/environment/VREnvironment.js';
 
 class VRExplorationManager extends BaseManager {
   constructor() {
@@ -43,13 +46,37 @@ class VRExplorationManager extends BaseManager {
     this._controlManager = null;
     this._navigationController = null;
 
-    // Frame loop
-    this._isRunning = false;
+    // Frame loop — driven by vrManager's single XR rAF loop, not our own.
+    // _offFrame/_offSessionEnded hold the unsubscribe functions returned by
+    // vrManager.on(); _leaving guards against re-entrant leaveSession() calls
+    // (leaveSession -> vrManager.exitVR() -> "end" event -> our sessionEnded
+    // handler -> leaveSession again).
+    this._offFrame = null;
+    this._offSessionEnded = null;
+    this._leaving = false;
     this._lastFrameTime = 0;
 
     // Isolation mode (room-scale inspection)
     this._isolationBackup = null;
     this._lastIsolationButtonState = false;
+
+    // In-VR "follow a collaborator" — soft positional follow only, never
+    // touches head orientation (see followParticipant/_updateParticipantFollow).
+    this._followTargetUserId = null;
+
+    // One-shot: _applyInitialPlacement runs before any XR frame exists, so it
+    // has to assume the user faces reference-space -Z at session start. That
+    // assumption doesn't hold on every platform — set once the first real
+    // frame's viewerPose arrives, correcting placement to the user's actual
+    // head position/facing (see _applyPoseRelativePlacement).
+    this._needsPoseCorrection = false;
+
+    // One-shot: Vision Pro's transient-pointer input sources are grip-less
+    // and typically don't appear in xrSession.inputSources until the user
+    // pinches, so we can't tell at session start whether the platform is
+    // gripless — detection happens lazily in _onFrame on the first frame
+    // that reports a controller (see the input-profile check there).
+    this._inputProfileDetected = false;
 
     // Bind methods
     this._onFrame = this._onFrame.bind(this);
@@ -124,23 +151,46 @@ class VRExplorationManager extends BaseManager {
     this._snapshotManager = new VRSnapshotManager(session, getViewConfigurationManager());
     this._controlManager = new VRControlManager(session);
 
-    // Request XR session
-    log.debug('Requesting XR session...');
-    const xrSession = await navigator.xr.requestSession('immersive-vr', {
+    // Request XR session via VRManager — the sole owner of session lifecycle,
+    // reference space and the XRWebGLLayer. This must be the only place that
+    // ever calls navigator.xr.requestSession() for exploration; a competing
+    // session here was the root cause of VR entry rendering nothing.
+    const glContext = handler.getWebGLContext(instance.instanceId);
+    if (!glContext) {
+      throw new Error(
+        'Could not get a WebGL context for VR — is the dataset loaded and render mode set to local?'
+      );
+    }
+
+    log.debug('Requesting XR session via VRManager...');
+    await vrManager.enterVR(glContext, {
+      sessionId: session.id,
+      navigationMode: sessionConfig.explorationMode,
+      scale: sessionConfig.vrScale,
       requiredFeatures: ['local-floor'],
-      optionalFeatures: ['hand-tracking', 'bounded-floor'],
+      optionalFeatures: ['bounded-floor', 'hand-tracking', 'layers'],
     });
+    const xrSession = vrManager.getSession();
 
-    // Set up session end handler
-    xrSession.addEventListener('end', this._onSessionEnd);
-
-    // Enter VR exploration mode on handler
+    // Enter VR exploration mode on handler, handing it the already-configured
+    // gl/XRWebGLLayer/reference space instead of letting it create its own.
     log.debug('Entering VR exploration mode on handler...');
     const vrContext = await handler.enterVRExploration(
       instance.instanceData,
       session,
-      xrSession
+      xrSession,
+      {
+        gl: glContext,
+        xrLayer: vrManager.getXRLayer(),
+        referenceSpace: vrManager.getReferenceSpace(),
+      }
     );
+
+    // Auto-fit placement: never leave vrOrigin at [0,0,0] — scientific
+    // datasets are rarely centered on the data origin, so an unplaced
+    // dataset is invisible on entry. Uses the same math as enterIsolation().
+    this._applyInitialPlacement(vrContext, sessionConfig);
+    this._needsPoseCorrection = true;
 
     // Initialize tool manager with handler
     this._toolManager = new VRToolManager(handler, vrContext);
@@ -161,8 +211,10 @@ class VRExplorationManager extends BaseManager {
     // Start session
     session.start();
 
-    // Start frame loop
-    this._startFrameLoop(xrSession);
+    // Drive our frame work off VRManager's single XR frame loop instead of
+    // requesting our own animation frames.
+    this._offFrame = vrManager.on('frame', this._onFrame);
+    this._offSessionEnded = vrManager.on('sessionEnded', this._onSessionEnd);
 
     // Start participant sync
     this._participantSync.start();
@@ -171,6 +223,12 @@ class VRExplorationManager extends BaseManager {
     const avatarRenderer = vrContext.sceneObjects?.renderer;
     if (avatarRenderer) {
       vrAvatarSystem.initialize(avatarRenderer, session, vrContext);
+    }
+
+    // Spatial environment: floor grid + horizon, physically anchored so the
+    // user has depth/scale cues rather than a dataset floating in a void.
+    if (avatarRenderer) {
+      vrEnvironment.initialize(avatarRenderer, vrContext);
     }
 
     // Pointer-ray broadcasting: desktop collaborators render this VR user's
@@ -188,14 +246,36 @@ class VRExplorationManager extends BaseManager {
     // Emit event
     this._emit('explorationStarted', { session, instanceId });
 
-    // Dispatch window event for UI
-    window.dispatchEvent(new CustomEvent('cia:vr-session-started', {
-      detail: { sessionId: session.id, instanceId }
-    }));
-
     log.info('VR exploration started', { sessionId: session.id });
 
     return session;
+  }
+
+  /**
+   * Resolve a view configuration to its live instance and start VR
+   * exploration on it. This is the single entry point every "Enter VR" UI
+   * surface (launch modal, canvas footer toggle, header button, voice
+   * command) should call — no caller should ever talk to vrManager.enterVR()
+   * or navigator.xr.requestSession() directly.
+   *
+   * @param {string} viewConfigId
+   * @param {Object} [config] - see startExploration
+   * @returns {Promise<VRExplorationSession>}
+   */
+  async startForView(viewConfigId, config = {}) {
+    const instance = workspaceManager.getInstanceByViewConfigId(viewConfigId);
+    if (!instance) {
+      throw new Error('No open view found for VR exploration');
+    }
+    if (!instance.instanceData?.hasData) {
+      throw new Error('Load a dataset to explore in VR');
+    }
+    const handler = instance.handler;
+    if (!handler?.supportsVRExploration?.()) {
+      throw new Error('This view type does not support VR exploration');
+    }
+
+    return this.startExploration(instance.instanceId, config);
   }
 
   /**
@@ -235,38 +315,48 @@ class VRExplorationManager extends BaseManager {
   }
 
   /**
-   * Join an existing VR exploration session.
+   * Join an existing VR exploration session, given the already-fetched
+   * session record (callers listing sessions — e.g. VRExploreButton's
+   * session popover — already have this row from their GET /vr/sessions;
+   * avoid a redundant refetch here). Fields are the raw
+   * vr_exploration_sessions row shape (snake_case) returned by the server.
    *
-   * Registers the join with the server, then — if the session's view is open
-   * locally and a VR mode was requested — enters VR against that view using
-   * the shared startExploration path (with the server session's id, so
-   * avatar/participant Y.js state converges across clients).
+   * The join notification POST is bounded by a short timeout so a slow
+   * network never delays entering VR while WebXR user-activation is still
+   * fresh — same pattern as _tryRegisterSession. If the session's view is
+   * open locally and a VR mode was requested, enters VR against that view
+   * using the shared startExploration path (with the server session's id,
+   * so avatar/participant Y.js state converges across clients).
    *
-   * @param {string} sessionId - Server session id to join
+   * @param {Object} sessionRecord - server session row (id, view_configuration_id,
+   *   owner_user_name, default_exploration_mode, default_vr_scale, ...)
    * @param {string} mode - Participation mode (PARTICIPATION_MODE)
    * @returns {Promise<{joined: boolean, vrEntered: boolean, session?: object, reason?: string}>}
    */
-  async joinSession(sessionId, mode = PARTICIPATION_MODE.DESKTOP_OBSERVER) {
+  async joinSession(sessionRecord, mode = PARTICIPATION_MODE.DESKTOP_OBSERVER) {
+    const sessionId = sessionRecord?.id;
+    if (!sessionId) {
+      return { joined: false, vrEntered: false, reason: 'session-not-found' };
+    }
     log.info('Joining VR session...', { sessionId, mode });
 
-    // Register the join with the server
-    await apiClient.post(`/vr/sessions/${sessionId}/join`, { mode });
-
-    // Fetch the session record to resolve its view
-    const serverSession = await apiClient.get(`/vr/sessions/${sessionId}`);
-    if (!serverSession?.id) {
-      return { joined: false, vrEntered: false, reason: 'session-not-found' };
+    try {
+      const joinPost = apiClient.post(`/vr/sessions/${sessionId}/join`, { mode });
+      const timeout = new Promise((resolve) => setTimeout(() => resolve(null), 1500));
+      await Promise.race([joinPost, timeout]);
+    } catch (err) {
+      log.warn('VR session join notification failed (continuing):', err.message);
     }
 
     // Desktop observers are done: participant state flows via Y.js/WS
     const isVRMode = mode === PARTICIPATION_MODE.VR_EXPLORER;
     if (!isVRMode) {
       this._emit('sessionJoined', { sessionId, mode });
-      return { joined: true, vrEntered: false, session: serverSession };
+      return { joined: true, vrEntered: false, session: sessionRecord };
     }
 
     // VR modes need the session's view open locally
-    const viewConfigId = serverSession.view_configuration_id;
+    const viewConfigId = sessionRecord.view_configuration_id;
     const instance = viewConfigId
       ? workspaceManager.getInstanceByViewConfigId(viewConfigId)
       : null;
@@ -276,35 +366,45 @@ class VRExplorationManager extends BaseManager {
       return {
         joined: true,
         vrEntered: false,
-        session: serverSession,
+        session: sessionRecord,
         reason: 'view-not-open',
       };
     }
 
     // Enter VR against the shared session id
     await this.startExploration(instance.instanceId, {
-      serverSession,
+      serverSession: sessionRecord,
       participationMode: mode,
-      explorationMode: serverSession.default_exploration_mode,
-      vrScale: Number(serverSession.default_vr_scale) || 1.0,
+      explorationMode: sessionRecord.default_exploration_mode,
+      vrScale: Number(sessionRecord.default_vr_scale) || 1.0,
     });
 
     this._emit('sessionJoined', { sessionId, mode, vrEntered: true });
-    return { joined: true, vrEntered: true, session: serverSession };
+    return { joined: true, vrEntered: true, session: sessionRecord };
   }
 
   /**
    * Leave the current session
    */
   async leaveSession() {
-    if (!this._activeSession) return;
+    // Guard against re-entrancy: leaveSession() -> vrManager.exitVR() ->
+    // XRSession "end" event -> our sessionEnded handler -> leaveSession()
+    // again. Also covers the reverse: the headset/browser ends the session
+    // first (user removed headset), which fires sessionEnded and calls us
+    // here without anyone having called leaveSession() directly.
+    if (!this._activeSession || this._leaving) return;
+    this._leaving = true;
 
     const session = this._activeSession;
 
     log.info('Leaving VR session...', { sessionId: session.id });
 
-    // Stop frame loop
-    this._stopFrameLoop();
+    // Unsubscribe from VRManager events first so no further frame/end
+    // callbacks touch a partially torn-down context.
+    this._offFrame?.();
+    this._offFrame = null;
+    this._offSessionEnded?.();
+    this._offSessionEnded = null;
 
     // Clean up sub-managers
     this._participantSync?.stop();
@@ -312,6 +412,7 @@ class VRExplorationManager extends BaseManager {
     vrMultiViewGrid.disable();
     vrSpatialUI.dispose();
     vrAvatarSystem.dispose();
+    vrEnvironment.dispose(); // must run before the handler's final desktop render
     await this._toolManager?.cleanup();
     this._snapshotManager?.cleanup();
     this._controlManager?.cleanup();
@@ -322,13 +423,13 @@ class VRExplorationManager extends BaseManager {
       await this._activeContext.handler.exitVRExploration(this._activeContext.vrContext);
     }
 
-    // End XR session if still active
-    if (this._activeContext?.xrSession) {
-      try {
-        await this._activeContext.xrSession.end();
-      } catch (e) {
-        // Session may already be ended
-      }
+    // End the XR session via VRManager (the sole session owner). Safe to
+    // call even if the session already ended (e.g. we got here via the
+    // sessionEnded event) — exitVR() no-ops when there's no active session.
+    try {
+      await vrManager.exitVR();
+    } catch (e) {
+      // Session may already be ended
     }
 
     // End session
@@ -346,6 +447,8 @@ class VRExplorationManager extends BaseManager {
     this._activeContext = null;
     this._isolationBackup = null;
     this._lastIsolationButtonState = false;
+    this._followTargetUserId = null;
+    this._inputProfileDetected = false;
     this._participantSync = null;
     this._toolManager = null;
     this._snapshotManager = null;
@@ -358,6 +461,8 @@ class VRExplorationManager extends BaseManager {
     window.dispatchEvent(new CustomEvent('cia:vr-session-ended', {
       detail: { sessionId: session.id }
     }));
+
+    this._leaving = false;
   }
 
   // ===========================================================================
@@ -368,8 +473,95 @@ class VRExplorationManager extends BaseManager {
     return this._activeSession;
   }
 
+  /** Display name of the dataset in the active session, for spatial UI status text. */
+  getActiveDatasetName() {
+    const dataset = this._activeContext?.instance?.instanceData?.dataset;
+    return dataset?.filename || dataset?.name || null;
+  }
+
   getMyParticipant() {
     return this._activeSession?.getParticipant(getUserId());
+  }
+
+  /**
+   * Other participants in the active session (excluding self), for the
+   * spatial UI's collaborator go-to/follow controls.
+   * @returns {Array<import('@Core/data/models/VRExplorationSession.js').VRParticipant>}
+   */
+  getOtherParticipants() {
+    const session = this._activeSession;
+    if (!session) return [];
+    const selfId = getUserId();
+    return session.participants.filter((p) => p.odUserId !== selfId);
+  }
+
+  /**
+   * A participant's last known head position, converted from THEIR OWN
+   * physical XR space into shared data space using THEIR vrScale/vrOrigin
+   * (each VR participant has an independent WebXR reference space — same
+   * conversion as RemoteAvatarController._toScenePose / followService).
+   * @param {string} userId
+   * @returns {number[]|null} [x, y, z] in data space, or null if unknown
+   * @private
+   */
+  _getParticipantDataPosition(userId) {
+    const state = this._participantSync?.getParticipantState(userId);
+    const headPose = state?.headPose;
+    if (!headPose?.position) return null;
+
+    const theirScale = typeof state.vrScale === 'number' ? state.vrScale : 1.0;
+    const theirOrigin = Array.isArray(state.vrOrigin) ? state.vrOrigin : [0, 0, 0];
+    return mapXRPointToData(headPose.position, theirScale, theirOrigin);
+  }
+
+  /**
+   * One-shot: move the local vrOrigin so the target participant sits ~1.5m
+   * in front of the user at chest height (same convention as
+   * _computeAutoPlacement/enterIsolation). Keeps this user's own vrScale.
+   * @param {string} userId
+   * @returns {boolean} true if the target's position was known and applied
+   */
+  goToParticipant(userId) {
+    const ctx = this._activeContext?.vrContext;
+    if (!ctx) return false;
+    const targetPos = this._getParticipantDataPosition(userId);
+    if (!targetPos) return false;
+
+    const vrScale = ctx.vrScale || 1.0;
+    ctx.vrOrigin = [
+      targetPos[0],
+      targetPos[1] - 1.4 / vrScale,
+      targetPos[2] + 1.5 / vrScale,
+    ];
+    this._emit('wentToParticipant', { userId });
+    return true;
+  }
+
+  /**
+   * Start soft positional follow of a participant: every frame, vrOrigin
+   * lerps toward standing near their current position. Head orientation is
+   * NEVER touched — the user keeps free head-look at all times (a hard
+   * spectator lock is a motion-sickness hazard). Any local locomotion
+   * input this frame cancels follow, mirroring followService's desktop
+   * auto-unfollow-on-manual-move semantics.
+   * @param {string} userId
+   * @returns {boolean} true if a live session is active
+   */
+  followParticipant(userId) {
+    if (!this._activeContext?.vrContext || !userId) return false;
+    this._followTargetUserId = userId;
+    this._emit('followingParticipantChanged', { userId });
+    return true;
+  }
+
+  stopFollowing() {
+    if (!this._followTargetUserId) return;
+    this._followTargetUserId = null;
+    this._emit('followingParticipantChanged', { userId: null });
+  }
+
+  isFollowingParticipant() {
+    return this._followTargetUserId;
   }
 
   async updateParticipantMode(newMode) {
@@ -443,6 +635,27 @@ class VRExplorationManager extends BaseManager {
     return this._toolManager?.getAvailableTools() || [];
   }
 
+  /**
+   * Advance the active tool's pending annotation label to the next preset
+   * (VRAnnotationTool.cycleLabel — the only VR text-entry mechanism, see
+   * ANNOTATION_LABEL_PRESETS). No-ops if the active tool doesn't support
+   * labels. Invoked by the spatial menu's "Label" button.
+   * @returns {string|null} the newly-selected label, or null if unsupported
+   */
+  cycleAnnotationLabel() {
+    const tool = this._toolManager?.getActiveTool?.();
+    if (typeof tool?.cycleLabel !== 'function') return null;
+    const label = tool.cycleLabel();
+    this._emit('annotationLabelChanged', { label });
+    return label;
+  }
+
+  /** @returns {string|null} the label the next placed annotation will carry */
+  getPendingAnnotationLabel() {
+    const tool = this._toolManager?.getActiveTool?.();
+    return typeof tool?.getPendingLabel === 'function' ? tool.getPendingLabel() : null;
+  }
+
   // ===========================================================================
   // NAVIGATION (delegated to VRNavigationController)
   // ===========================================================================
@@ -480,6 +693,92 @@ class VRExplorationManager extends BaseManager {
   }
 
   // ===========================================================================
+  // VISUALIZATION (representation cycling + glyph toggle)
+  // ===========================================================================
+  //
+  // These drive the SAME desktop implementations the InstanceToolsPanel uses
+  // (instanceTools / vtkGlyphFeature) and push the SAME visualizationSyncService
+  // patch its menus push, so an in-VR change is indistinguishable from a desktop
+  // one to every collaborator (and persists identically for late joiners).
+
+  /**
+   * Cycle the active dataset's surface representation
+   * surface → wireframe → points → surface, mirroring the desktop Appearance
+   * menu. Renders locally via instanceTools.setRepresentation AND pushes the
+   * `representation` field to collaborators + persistence.
+   * @returns {string|null} the new representation, or null if no active dataset
+   */
+  cycleRepresentation() {
+    const instanceId = this._activeContext?.instance?.instanceId;
+    if (!instanceId) return null;
+
+    const order = ['surface', 'wireframe', 'points'];
+    const current = instanceTools.getRepresentation?.(instanceId) || 'surface';
+    const next = order[(order.indexOf(current) + 1) % order.length];
+
+    instanceTools.setRepresentation?.(instanceId, next);
+    this._pushVisualizationPatch({ representation: next });
+    this._emit('representationChanged', { representation: next });
+    return next;
+  }
+
+  /** Current surface representation of the active dataset (for menu highlight). */
+  getRepresentation() {
+    const instanceId = this._activeContext?.instance?.instanceId;
+    if (!instanceId) return null;
+    return instanceTools.getRepresentation?.(instanceId) || 'surface';
+  }
+
+  /**
+   * Toggle vector/scalar glyphs on the active dataset, mirroring the desktop
+   * glyph menu handler (VTKInstanceHandler). Disables if currently enabled;
+   * otherwise enables using the first available vector array for orientation,
+   * guarded by the same availability check the desktop menu uses. Pushes the
+   * same `glyph` sync patch so collaborators + persistence converge.
+   * @returns {boolean} the new enabled state (false if unavailable / no arrays)
+   */
+  toggleGlyphs() {
+    const instanceId = this._activeContext?.instance?.instanceId;
+    if (!instanceId) return false;
+
+    const state = vtkGlyphFeature.getState(instanceId);
+    if (!state) return false;
+
+    if (state.enabled) {
+      vtkGlyphFeature.disableGlyphs(instanceId);
+      this._pushVisualizationPatch({ glyph: vtkGlyphFeature.getConfigForSync(instanceId) });
+      this._emit('glyphsToggled', { enabled: false });
+      return false;
+    }
+
+    const { vectorArrays = [], scalarArrays = [] } = state;
+    if (!isGlyphFeatureAvailable(vectorArrays, scalarArrays)) {
+      log.warn('VR glyph toggle: no usable vector/scalar point-data arrays on this dataset');
+      return false;
+    }
+
+    const polydata = this._activeContext?.instance?.instanceData?.polydata;
+    if (!polydata) {
+      log.warn('VR glyph toggle: dataset polydata unavailable');
+      return false;
+    }
+
+    vtkGlyphFeature.enableGlyphs(instanceId, polydata, {
+      orientationArray: vectorArrays?.[0]?.name,
+    });
+    this._pushVisualizationPatch({ glyph: vtkGlyphFeature.getConfigForSync(instanceId) });
+    this._emit('glyphsToggled', { enabled: true });
+    return true;
+  }
+
+  /** @returns {boolean} whether glyphs are currently enabled on the active dataset */
+  isGlyphsEnabled() {
+    const instanceId = this._activeContext?.instance?.instanceId;
+    if (!instanceId) return false;
+    return !!vtkGlyphFeature.getState(instanceId)?.enabled;
+  }
+
+  // ===========================================================================
   // ISOLATION MODE (room-scale inspection)
   // ===========================================================================
   //
@@ -495,6 +794,104 @@ class VRExplorationManager extends BaseManager {
    * a couple of meters back from its center.
    * @returns {boolean} true if isolation is now active
    */
+  /**
+   * Compute an auto-fit vrScale/vrOrigin so a dataset of arbitrary size and
+   * position ends up ~1m in front of the user at chest height, regardless of
+   * where its bounds sit relative to the data origin. Shared by initial VR
+   * placement (_applyInitialPlacement) and isolation mode (enterIsolation) —
+   * same math, same "diagonal spans ~2.5 physical meters" convention.
+   * @private
+   */
+  _computeAutoPlacement(dataBounds) {
+    const b = dataBounds || [-1, 1, -1, 1, -1, 1];
+    const dx = b[1] - b[0];
+    const dy = b[3] - b[2];
+    const dz = b[5] - b[4];
+    const diagonal = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+    const center = [(b[0] + b[1]) / 2, (b[2] + b[3]) / 2, (b[4] + b[5]) / 2];
+
+    const vrScale = 2.5 / diagonal;
+    const vrOrigin = [
+      center[0],
+      center[1] - 1.4 / vrScale,
+      center[2] + 2.0 / vrScale,
+    ];
+    return { vrScale, vrOrigin, diagonal, center };
+  }
+
+  /**
+   * Apply the starting pose for a freshly-entered VR context. If the caller
+   * didn't request an explicit scale, auto-fit the dataset to room scale
+   * (matches enterIsolation's convention). If an explicit scale WAS
+   * requested, keep it but still compute vrOrigin so the dataset center
+   * sits in front of the user — vrOrigin must never be left at [0,0,0].
+   * @private
+   */
+  _applyInitialPlacement(vrContext, sessionConfig) {
+    const placement = this._computeAutoPlacement(vrContext.dataBounds);
+    const hasExplicitScale =
+      sessionConfig?.vrScale != null && sessionConfig.vrScale !== 1.0;
+    // Remembered for _applyPoseRelativePlacement, which runs once the first
+    // real XR frame arrives and needs to know whether to keep this scale.
+    vrContext._hasExplicitScale = hasExplicitScale;
+
+    if (hasExplicitScale) {
+      vrContext.vrScale = sessionConfig.vrScale;
+      const center = placement.center;
+      vrContext.vrOrigin = [
+        center[0],
+        center[1] - 1.4 / vrContext.vrScale,
+        center[2] + 2.0 / vrContext.vrScale,
+      ];
+    } else {
+      vrContext.vrScale = placement.vrScale;
+      vrContext.vrOrigin = placement.vrOrigin;
+    }
+
+    log.info('Applied initial VR placement', {
+      vrScale: vrContext.vrScale,
+      vrOrigin: vrContext.vrOrigin,
+      diagonal: placement.diagonal,
+    });
+  }
+
+  /**
+   * Re-place the dataset relative to the user's ACTUAL head position and
+   * facing direction, read from the first real XR frame. _applyInitialPlacement
+   * runs before any frame exists, so it has to assume the user faces
+   * reference-space -Z at session start — not guaranteed on every
+   * headset/platform. Getting this wrong leaves the dataset out of the
+   * viewing frustum entirely (reported as a fully black VR view).
+   * @private
+   */
+  _applyPoseRelativePlacement(vrContext, viewerPose) {
+    const { position, orientation } = viewerPose.transform;
+    const forward = controllerForward(orientation);
+    const distance = 2.0;
+    const target = [
+      position.x + forward[0] * distance,
+      position.y + forward[1] * distance - 0.3,
+      position.z + forward[2] * distance,
+    ];
+
+    const placement = this._computeAutoPlacement(vrContext.dataBounds);
+    const vrScale = vrContext._hasExplicitScale ? vrContext.vrScale : placement.vrScale;
+
+    vrContext.vrScale = vrScale;
+    vrContext.vrOrigin = [
+      placement.center[0] - target[0] / vrScale,
+      placement.center[1] - target[1] / vrScale,
+      placement.center[2] - target[2] / vrScale,
+    ];
+
+    log.info('Applied pose-relative VR placement', {
+      vrScale: vrContext.vrScale,
+      vrOrigin: vrContext.vrOrigin,
+      headPosition: [position.x, position.y, position.z],
+      headForward: forward,
+    });
+  }
+
   enterIsolation() {
     const ctx = this._activeContext?.vrContext;
     if (!ctx) {
@@ -503,37 +900,23 @@ class VRExplorationManager extends BaseManager {
     }
     if (this._isolationBackup) return true; // already isolated
 
-    const b = ctx.dataBounds || [-1, 1, -1, 1, -1, 1];
-    const dx = b[1] - b[0];
-    const dy = b[3] - b[2];
-    const dz = b[5] - b[4];
-    const diagonal = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
-    const center = [(b[0] + b[1]) / 2, (b[2] + b[3]) / 2, (b[4] + b[5]) / 2];
-
     this._isolationBackup = {
       vrScale: ctx.vrScale,
       vrOrigin: [...(ctx.vrOrigin || [0, 0, 0])],
     };
 
-    // Model diagonal spans ~2.5 physical meters
-    const scale = 2.5 / diagonal;
+    const placement = this._computeAutoPlacement(ctx.dataBounds);
     if (this._navigationController?.setScale) {
-      this._navigationController.setScale(scale);
+      this._navigationController.setScale(placement.vrScale);
     } else {
-      ctx.vrScale = scale;
+      ctx.vrScale = placement.vrScale;
     }
-
-    // User origin: model center at chest height, standing 2 m back
-    ctx.vrOrigin = [
-      center[0],
-      center[1] - 1.4 / ctx.vrScale,
-      center[2] + 2.0 / ctx.vrScale,
-    ];
+    ctx.vrOrigin = placement.vrOrigin;
 
     const viewId = this._activeContext.instance?.viewConfigId || ctx.instanceId;
     vrManager.enterIsolationMode(viewId);
     this._emit('isolationChanged', { isolated: true, viewId });
-    log.info('Entered isolation mode', { scale: ctx.vrScale, diagonal });
+    log.info('Entered isolation mode', { scale: ctx.vrScale, diagonal: placement.diagonal });
     return true;
   }
 
@@ -675,32 +1058,84 @@ class VRExplorationManager extends BaseManager {
   // ===========================================================================
   // FRAME LOOP
   // ===========================================================================
+  //
+  // Frame work is driven by vrManager's own XR rAF loop via the "frame"
+  // event (see startExploration's vrManager.on('frame', this._onFrame)) —
+  // there is exactly one requestAnimationFrame loop for the whole VR
+  // session, owned by VRManager.
 
-  _startFrameLoop(xrSession) {
-    this._isRunning = true;
-    xrSession.requestAnimationFrame(this._onFrame);
-  }
+  /**
+   * @param {{time:number, deltaTime:number, frame:XRFrame, viewerPose:XRViewerPose}} frameData
+   */
+  _onFrame({ time, deltaTime: deltaTimeMs, frame, viewerPose }) {
+    if (!this._activeContext) return;
 
-  _stopFrameLoop() {
-    this._isRunning = false;
-  }
-
-  _onFrame(time, frame) {
-    if (!this._isRunning || !this._activeContext) return;
-
-    const { handler, vrContext, xrSession } = this._activeContext;
-
-    // Calculate delta time
-    const deltaTime = this._lastFrameTime ? (time - this._lastFrameTime) / 1000 : 0.016;
-    this._lastFrameTime = time;
+    const { handler, vrContext } = this._activeContext;
+    const deltaTime = (deltaTimeMs || 16.67) / 1000;
 
     try {
+      if (this._needsPoseCorrection && viewerPose) {
+        this._needsPoseCorrection = false;
+        this._applyPoseRelativePlacement(vrContext, viewerPose);
+      }
+
       // Get input state
       const inputState = this._gatherInputState(frame);
 
-      // Update navigation (handles movement, teleport, scale)
+      // INPUT ARBITRATION (R2). The floating spatial menu must be interactable
+      // without its pinches also firing tools/teleport. So the menu hit-tests
+      // the RAW input FIRST — before nav/tools — and reports whether the
+      // pointer is over a button. We then hand nav and the tools a shallow-
+      // cloned inputState with the offending trigger stripped, never mutating
+      // the object _gatherInputState returned (other consumers below — pose
+      // sync, avatars, pointer broadcast — still read the raw poses).
+      const menuResult = vrSpatialUI.update(inputState) || null;
+      const menuHovering = !!menuResult?.hovering;
+      const menuHand = menuResult?.hand || 'right';
+      // A pinch used to place/aim an active tool must not ALSO aim teleport.
+      const toolActive = !!this._toolManager?.getActiveTool?.();
+
+      const navStripHands = new Set();
+      const toolStripHands = new Set();
+      if (menuHovering) {
+        navStripHands.add(menuHand);
+        toolStripHands.add(menuHand);
+      }
+      if (toolActive) {
+        // Strip both hands' triggers from nav so a tool pinch never drives
+        // locomotion; thumbstick locomotion is untouched (only triggers gated).
+        navStripHands.add('left');
+        navStripHands.add('right');
+      }
+      const navInput = this._gateInputState(inputState, navStripHands);
+      const toolInput = this._gateInputState(inputState, toolStripHands);
+
+      // One-shot input-profile detection: Vision Pro's transient-pointer
+      // sources are grip-less and usually absent from xrSession.inputSources
+      // until the user pinches, so this can't be decided at session start —
+      // it has to happen lazily, on the first frame that actually reports a
+      // controller. If every controller seen is a transient-pointer and the
+      // session is still on the default fly mode (which reads
+      // thumbstick/triggerValue/squeezeValue/buttons — all inert for
+      // gripless sources), switch the default to teleport so the user isn't
+      // frozen in place. Fires at most once per session; the user can still
+      // switch back to fly via the menu afterward.
+      if (!this._inputProfileDetected) {
+        const seenControllers = [inputState.controllers.left, inputState.controllers.right].filter(Boolean);
+        if (seenControllers.length > 0) {
+          this._inputProfileDetected = true;
+          const allTransientPointer = seenControllers.every((c) => c.isTransientPointer === true);
+          if (allTransientPointer && this.getNavigationMode() === EXPLORATION_MODES.FLY) {
+            log.info('Gripless input detected (Vision Pro) — switching default navigation to teleport');
+            this.setNavigationMode(EXPLORATION_MODES.TELEPORT);
+          }
+        }
+      }
+
+      // Update navigation (handles movement, teleport, scale). Nav consumes the
+      // arbitration-gated clone so a menu pinch / tool pinch can't drive it.
       if (this._navigationController) {
-        const navResult = this._navigationController.update(inputState, frame, deltaTime);
+        const navResult = this._navigationController.update(navInput, frame, deltaTime);
 
         // Apply navigation result to VR context
         if (navResult.vrScale !== null) {
@@ -713,7 +1148,30 @@ class VRExplorationManager extends BaseManager {
             navResult.position.z,
           ];
         }
+
+        // Persist the new placement to the ViewConfiguration on gesture END
+        // only (grab release / teleport commit), never per drag frame.
+        if (navResult.grabEnded || navResult.teleporting) {
+          this._persistVRHints(vrContext);
+        }
       }
+
+      // In-VR follow: soft positional lerp toward the target participant.
+      // Real locomotion input (thumbstick/teleport trigger) always wins and
+      // cancels follow — mirrors followService's desktop
+      // auto-unfollow-on-manual-move semantics. Reads the nav-gated clone so a
+      // menu/tool pinch doesn't read as "the user is moving".
+      if (this._followTargetUserId) {
+        if (this._hasLocomotionInput(navInput)) {
+          this.stopFollowing();
+        } else {
+          this._updateParticipantFollow(vrContext, deltaTime);
+        }
+      }
+
+      // Keep the floor/environment anchored under the user as they
+      // teleport/fly/scale/follow (no-ops internally if nothing changed).
+      vrEnvironment.updateTransform(vrContext.vrScale, vrContext.vrOrigin);
 
       // B button (right controller) toggles isolation mode: pull the model
       // to room scale for walk-around inspection, press again to restore.
@@ -723,18 +1181,25 @@ class VRExplorationManager extends BaseManager {
       }
       this._lastIsolationButtonState = bPressed;
 
-      // Update tools
-      const toolAction = this._toolManager?.update(inputState, frame);
+      // Update tools with the arbitration-gated clone so a pinch aimed at a
+      // menu button never also fires the active tool.
+      const toolAction = this._toolManager?.update(toolInput, frame);
       if (toolAction) {
         this._handleToolAction(toolAction);
       }
 
-      // Update participant sync
+      // Update participant sync. Head/hand poses are in THIS user's own
+      // physical XR space (each participant has an independent WebXR
+      // session/reference space) — vrScale/vrOrigin travel alongside so
+      // remote viewers can convert into the one shared frame, data space,
+      // using the SENDER's transform rather than their own (see
+      // RemoteAvatarController._toScenePose).
       this._participantSync?.updateLocalState({
         headPose: inputState.headPose,
         leftHandPose: inputState.controllers?.left?.pose,
         rightHandPose: inputState.controllers?.right?.pose,
         vrScale: vrContext.vrScale || 1.0,
+        vrOrigin: vrContext.vrOrigin || [0, 0, 0],
       });
 
       // Broadcast the active controller ray so desktop collaborators can see
@@ -744,11 +1209,14 @@ class VRExplorationManager extends BaseManager {
       // Update avatar system
       vrAvatarSystem.update(deltaTime, inputState);
 
-      // Update the in-scene tool menu (hover/tap hit-testing + head anchoring)
-      vrSpatialUI.update(inputState);
+      // NOTE: the in-scene tool menu was already updated at the top of the
+      // frame (before nav/tools) so its hit-test can gate their input — see
+      // the INPUT ARBITRATION block above.
 
-      // Let handler update VR rendering
-      handler.updateVRExploration?.(vrContext, frame, inputState);
+      // Let handler update VR rendering (synchronous stereo render — see
+      // VTKInstanceHandler.updateVRExploration). Gets the tool-gated clone so a
+      // menu pinch doesn't leak into the handler's own interaction handling.
+      handler.updateVRExploration?.(vrContext, frame, toolInput, viewerPose);
 
       // Emit frame event for UI
       this._emit('frame', { time, inputState, deltaTime });
@@ -756,9 +1224,103 @@ class VRExplorationManager extends BaseManager {
     } catch (error) {
       log.error('Error in VR frame loop:', error);
     }
+  }
 
-    // Continue loop
-    xrSession.requestAnimationFrame(this._onFrame);
+  /**
+   * True if the user is actively driving locomotion this frame (thumbstick
+   * past deadzone, or the teleport trigger held) — used to cancel in-VR
+   * follow the moment the user tries to move themselves.
+   * @private
+   */
+  _hasLocomotionInput(inputState) {
+    const mag = (c) =>
+      c?.thumbstick ? Math.hypot(c.thumbstick.x || 0, c.thumbstick.y || 0) : 0;
+    const left = inputState.controllers?.left;
+    const right = inputState.controllers?.right;
+    return mag(left) > 0.15 || mag(right) > 0.15 || !!right?.triggerPressed;
+  }
+
+  /**
+   * Return a SHALLOW clone of the frame's input state with the trigger stripped
+   * (triggerPressed:false, triggerValue:0) from the named hands. Used for input
+   * arbitration (R2): the object _gatherInputState returned is never mutated —
+   * the menu and pose/avatar consumers keep reading the raw triggers/poses —
+   * while nav and tools receive a gated copy so a pinch aimed at a menu button
+   * (or a tool) doesn't also drive locomotion. Only triggers are touched;
+   * thumbstick, poses and buttons pass through unchanged.
+   *
+   * @param {Object} inputState - raw state from _gatherInputState
+   * @param {Set<string>|Array<string>} hands - which hands to strip ('left'/'right')
+   * @returns {Object} the same object if nothing to strip, else a gated clone
+   * @private
+   */
+  _gateInputState(inputState, hands) {
+    const list = hands instanceof Set ? [...hands] : hands || [];
+    if (!list.length) return inputState;
+    const clone = { ...inputState, controllers: { ...inputState.controllers } };
+    for (const hand of list) {
+      const c = clone.controllers?.[hand];
+      if (c) {
+        clone.controllers[hand] = { ...c, triggerPressed: false, triggerValue: 0 };
+      }
+    }
+    return clone;
+  }
+
+  /**
+   * Persist the current VR placement (vrScale / vrOrigin / mode) onto the
+   * active ViewConfiguration so the "where the data sits" survives the session
+   * (R4 — position must not feel fixed, but the last placement should stick).
+   * Fired only on gesture END (grab release / teleport commit). Fire-and-forget
+   * and fully guarded — it must never throw into the XR frame loop.
+   * @param {Object} vrContext
+   * @private
+   */
+  _persistVRHints(vrContext) {
+    try {
+      const viewId = this._activeContext?.instance?.viewConfigId;
+      if (!viewId) return;
+      const view = getViewConfigurationManager()?.getView?.(viewId);
+      if (typeof view?.updateVRHints !== 'function') return;
+      const origin = vrContext?.vrOrigin || [0, 0, 0];
+      view.updateVRHints({
+        vrScale: vrContext?.vrScale,
+        vrOrigin: [origin[0], origin[1], origin[2]],
+        explorationMode: this.getNavigationMode(),
+      });
+    } catch (err) {
+      log.warn(`VR hints persist failed: ${err?.message}`);
+    }
+  }
+
+  /**
+   * Per-frame soft positional follow: lerps vrOrigin toward standing near
+   * the followed participant's current position. Never touches orientation.
+   * Auto-stops if the target's position becomes unknown (e.g. they left).
+   * @private
+   */
+  _updateParticipantFollow(vrContext, deltaTime) {
+    const targetPos = this._getParticipantDataPosition(this._followTargetUserId);
+    if (!targetPos) {
+      this.stopFollowing();
+      return;
+    }
+
+    const vrScale = vrContext.vrScale || 1.0;
+    const desired = [
+      targetPos[0],
+      targetPos[1] - 1.4 / vrScale,
+      targetPos[2] + 1.5 / vrScale,
+    ];
+
+    // ~0.5s settle time regardless of frame rate.
+    const alpha = Math.min(1, deltaTime * 2);
+    const origin = vrContext.vrOrigin || [0, 0, 0];
+    vrContext.vrOrigin = [
+      origin[0] + (desired[0] - origin[0]) * alpha,
+      origin[1] + (desired[1] - origin[1]) * alpha,
+      origin[2] + (desired[2] - origin[2]) * alpha,
+    ];
   }
 
   /**
@@ -802,8 +1364,11 @@ class VRExplorationManager extends BaseManager {
 
   _gatherInputState(frame) {
     const session = frame.session;
-    const referenceSpace = vrManager.getReferenceSpace?.() ||
-      session.requestReferenceSpace?.('local-floor');
+    // vrManager owns the session, so its reference space is always valid by
+    // the time frames are flowing — no per-frame fallback request needed
+    // (requestReferenceSpace() returns a Promise, which was never usable
+    // synchronously by frame.getPose() below anyway).
+    const referenceSpace = vrManager.getReferenceSpace();
 
     const state = {
       headPose: null,
@@ -846,6 +1411,7 @@ class VRExplorationManager extends BaseManager {
             pose: gripPose?.transform,
             targetRay: targetRayPose?.transform,
             gamepad: source.gamepad,
+            isTransientPointer: false,
             triggerPressed:
               source.gamepad?.buttons?.[0]?.pressed ||
               vrManager.isSelectPressed(source),
@@ -885,6 +1451,7 @@ class VRExplorationManager extends BaseManager {
             targetRay: targetRayPose.transform,
             gamepad: source.gamepad || null,
             targetRayMode: source.targetRayMode,
+            isTransientPointer: true,
             triggerPressed:
               source.gamepad?.buttons?.[0]?.pressed ||
               vrManager.isSelectPressed(source),
@@ -922,53 +1489,43 @@ class VRExplorationManager extends BaseManager {
       case 'measurement-removed':
         this._emit('measurementRemoved', action.data);
         break;
-      case 'slice-plane-updated':
-        this._emit('slicePlaneUpdated', action.data);
-        // Sync/persist only on gesture end — not every drag frame.
-        if (action.data?.final) {
-          this._syncVRVisualization('slicePlane');
-        }
-        break;
       case 'probe-created':
         // Probe results are intentionally session-local (transient inspection).
         this._emit('probeCreated', action.data);
         break;
       case 'clip-box-updated':
         this._emit('clipBoxUpdated', action.data);
+        // Sync/persist only on gesture end — not every drag frame.
         if (action.data?.final) {
-          this._syncVRVisualization('clipBox');
+          const instanceId = this._activeContext?.vrContext?.instanceId;
+          const config = instanceId
+            ? vtkClippingFeature.getConfigForSync(instanceId)
+            : null;
+          if (config) this._pushVisualizationPatch({ clipBox: config });
         }
         break;
     }
   }
 
   /**
-   * Push a VR-manipulated visualization property (clipBox / slicePlane) to
-   * collaborators + persistence via the same channel the desktop menus use
-   * (visualizationSyncService → Y.js broadcast + ViewConfiguration).
-   * Fire-and-forget: must never block or break the XR frame loop.
-   * @param {'clipBox'|'slicePlane'} key
+   * Push a VR-manipulated visualization patch (clipBox / representation / glyph)
+   * to collaborators + persistence via the same channel the desktop menus use
+   * (visualizationSyncService → Y.js broadcast + ViewConfiguration), so an
+   * in-VR change is identical to a desktop one. Fire-and-forget: must never
+   * block or break the XR frame loop.
+   * @param {object} patch - e.g. { representation: 'wireframe' } or { clipBox: {...} }
    * @private
    */
-  _syncVRVisualization(key) {
+  _pushVisualizationPatch(patch) {
     try {
       const viewId = this._activeContext?.instance?.viewConfigId;
-      const instanceId = this._activeContext?.vrContext?.instanceId;
-      if (!viewId || !instanceId) return;
-
-      const config =
-        key === 'clipBox'
-          ? vtkClippingFeature.getConfigForSync(instanceId)
-          : vtkSliceFeature.getConfigForSync(instanceId);
-      if (!config) return;
+      if (!viewId || !patch) return;
 
       Promise.resolve(
-        pushSharedVisualizationUpdate(viewId, { [key]: config })
-      ).catch((err) =>
-        log.warn(`VR ${key} sync failed: ${err?.message}`)
-      );
+        pushSharedVisualizationUpdate(viewId, patch)
+      ).catch((err) => log.warn(`VR visualization sync failed: ${err?.message}`));
     } catch (err) {
-      log.warn(`VR ${key} sync failed: ${err?.message}`);
+      log.warn(`VR visualization sync failed: ${err?.message}`);
     }
   }
 

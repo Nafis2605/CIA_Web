@@ -169,6 +169,11 @@ export class AvatarNetworkSync {
       rightHand: toLimb(data.rightHandPose, true),
       pointer: { origin: null, direction: null, visible: false },
       timestamp: data.timestamp || Date.now(),
+      // Sender's own vrScale/vrOrigin — the poses above are in THIS
+      // sender's physical XR space, and must be converted to data space
+      // using their transform, not the local viewer's own.
+      vrScale: typeof data.vrScale === 'number' ? data.vrScale : 1.0,
+      vrOrigin: Array.isArray(data.vrOrigin) ? data.vrOrigin : [0, 0, 0],
     };
   }
 }

@@ -1,0 +1,214 @@
+// src/core/vr/__tests__/VRExplorationManager.arbitration.test.js
+// Input arbitration (R2): the floating spatial menu must be interactable
+// without its pinches also firing tools/teleport. The menu hit-tests the RAW
+// input first; nav and tools then receive a gated clone with the offending
+// trigger stripped. Persistence of the final placement (grab release /
+// teleport commit) writes the ViewConfiguration's VR hints exactly once.
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+
+vi.mock("@Utils/logger.js", () => {
+  const mkLog = () => ({ info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() });
+  return { vr: mkLog(), app: mkLog(), sync: mkLog(), view: mkLog(), createLogger: () => mkLog() };
+});
+
+const mockVrManager = {
+  isVRSupported: vi.fn(() => false),
+  isSelectPressed: vi.fn(() => false),
+  getReferenceSpace: vi.fn(() => ({})),
+  on: vi.fn(),
+  off: vi.fn(),
+};
+vi.mock("@Core/vr/VRManager.js", () => ({
+  get vrManager() {
+    return mockVrManager;
+  },
+}));
+
+vi.mock("@Core/data/models/VRExplorationSession.js", () => ({
+  VRExplorationSession: class {},
+  PARTICIPATION_MODE: { VR_EXPLORER: "vr-explorer", DESKTOP_OBSERVER: "desktop-observer" },
+  SESSION_STATUS: { ACTIVE: "active" },
+  EXPLORATION_MODES: { FLY: "fly", TELEPORT: "teleport", WALK: "walk", SCALE: "scale", GRAB: "grab" },
+}));
+vi.mock("@Core/vr/VRParticipantSync.js", () => ({ VRParticipantSync: class {} }));
+vi.mock("@Core/vr/tools/VRToolManager.js", () => ({ VRToolManager: class {} }));
+vi.mock("@Core/vr/VRSnapshotManager.js", () => ({ VRSnapshotManager: class {} }));
+vi.mock("@Core/vr/VRControlManager.js", () => ({ VRControlManager: class {} }));
+vi.mock("@Core/vr/navigation/VRNavigationController.js", () => ({
+  VRNavigationController: class {},
+}));
+vi.mock("@Core/instances/workspaceManager.js", () => ({
+  workspaceManager: { getInstance: vi.fn() },
+}));
+
+const mockUpdateVRHints = vi.fn();
+const mockGetView = vi.fn(() => ({ updateVRHints: mockUpdateVRHints }));
+vi.mock("@Init/appInitializer.js", () => ({
+  getViewConfigurationManager: vi.fn(() => ({ getView: mockGetView })),
+}));
+vi.mock("@Collaboration/presence/userManagement.js", () => ({
+  getUserId: vi.fn(() => "user-1"),
+  getUserName: vi.fn(() => "Tester"),
+  getUserColor: vi.fn(() => "#ff0000"),
+}));
+vi.mock("@Core/instances/types/vtk/vr/VTKVRAvatars.js", () => ({
+  vrAvatarSystem: { initialize: vi.fn(), dispose: vi.fn(), update: vi.fn() },
+}));
+
+// Spatial UI: control what update() reports (hover / hand) per test.
+const mockSpatialUpdate = vi.fn(() => ({ hovering: false, hand: "right", buttonId: null }));
+vi.mock("@Core/instances/types/vtk/vr/VTKVRSpatialUI.js", () => ({
+  vrSpatialUI: { update: (...a) => mockSpatialUpdate(...a), dispose: vi.fn() },
+}));
+vi.mock("@Core/vr/environment/VREnvironment.js", () => ({
+  vrEnvironment: { updateTransform: vi.fn() },
+}));
+
+import { vrExplorationManager } from "../VRExplorationManager.js";
+
+const TRANSFORM = { position: { x: 0, y: 1.5, z: 0 }, matrix: new Array(16).fill(0) };
+
+function makeFrame(inputSources) {
+  return {
+    session: { inputSources },
+    getViewerPose: vi.fn(() => null),
+    getPose: vi.fn(() => ({ transform: TRANSFORM })),
+  };
+}
+
+// A gripless Vision Pro source with the pinch held.
+const PINCH_SOURCE = {
+  handedness: "none",
+  targetRayMode: "transient-pointer",
+  targetRaySpace: {},
+  gripSpace: null,
+  gamepad: null,
+  hand: null,
+};
+
+describe("VRExplorationManager._onFrame — input arbitration (R2)", () => {
+  let navUpdate;
+  let toolUpdate;
+  let activeTool;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockVrManager.isSelectPressed.mockReturnValue(true); // pinch held
+
+    navUpdate = vi.fn(() => ({ vrScale: null, position: null }));
+    toolUpdate = vi.fn(() => null);
+    activeTool = null;
+
+    vrExplorationManager._inputProfileDetected = true; // skip one-shot switch
+    vrExplorationManager._followTargetUserId = null;
+    vrExplorationManager._activeContext = {
+      handler: { updateVRExploration: vi.fn() },
+      vrContext: { vrScale: 1, vrOrigin: [1, 2, 3] },
+      instance: { viewConfigId: "view-1" },
+    };
+    vrExplorationManager._navigationController = {
+      getMode: vi.fn(() => "teleport"),
+      setMode: vi.fn(),
+      update: navUpdate,
+    };
+    vrExplorationManager._toolManager = {
+      getActiveTool: vi.fn(() => activeTool),
+      update: toolUpdate,
+    };
+  });
+
+  afterEach(() => {
+    vrExplorationManager._activeContext = null;
+    vrExplorationManager._navigationController = null;
+    vrExplorationManager._toolManager = null;
+    vrExplorationManager._inputProfileDetected = false;
+  });
+
+  function runFrame() {
+    vrExplorationManager._onFrame({
+      time: 0,
+      deltaTime: 16,
+      frame: makeFrame([PINCH_SOURCE]),
+      viewerPose: null,
+    });
+  }
+
+  it("passes the RAW input state to the spatial menu (before nav/tools)", () => {
+    runFrame();
+    expect(mockSpatialUpdate).toHaveBeenCalledTimes(1);
+    const raw = mockSpatialUpdate.mock.calls[0][0];
+    // Raw: the pinch trigger is still present for the menu to consume.
+    expect(raw.controllers.right.triggerPressed).toBe(true);
+  });
+
+  it("menu hover strips the trigger from BOTH nav and tool updates", () => {
+    mockSpatialUpdate.mockReturnValueOnce({ hovering: true, hand: "right", buttonId: "move" });
+    runFrame();
+
+    const navInput = navUpdate.mock.calls[0][0];
+    const toolInput = toolUpdate.mock.calls[0][0];
+    expect(navInput.controllers.right.triggerPressed).toBe(false);
+    expect(navInput.controllers.right.triggerValue).toBe(0);
+    expect(toolInput.controllers.right.triggerPressed).toBe(false);
+    expect(toolInput.controllers.right.triggerValue).toBe(0);
+  });
+
+  it("does NOT strip the trigger when the pointer is not over the menu", () => {
+    mockSpatialUpdate.mockReturnValueOnce({ hovering: false, hand: "right", buttonId: null });
+    runFrame();
+    expect(navUpdate.mock.calls[0][0].controllers.right.triggerPressed).toBe(true);
+    expect(toolUpdate.mock.calls[0][0].controllers.right.triggerPressed).toBe(true);
+  });
+
+  it("an active tool strips the trigger from nav (annotation pinch must not aim teleport) but tools keep it", () => {
+    activeTool = { id: "annotate" };
+    mockSpatialUpdate.mockReturnValueOnce({ hovering: false, hand: "right", buttonId: null });
+    runFrame();
+
+    // Nav must not see the pinch...
+    expect(navUpdate.mock.calls[0][0].controllers.right.triggerPressed).toBe(false);
+    // ...but the tool still gets it (it's placing the annotation).
+    expect(toolUpdate.mock.calls[0][0].controllers.right.triggerPressed).toBe(true);
+  });
+
+  it("does not mutate the object _gatherInputState returned (menu sees raw even after gating)", () => {
+    activeTool = { id: "annotate" };
+    mockSpatialUpdate.mockReturnValueOnce({ hovering: true, hand: "right", buttonId: "move" });
+    runFrame();
+    // The exact object handed to the menu still reports the pinch as pressed,
+    // even though nav/tools received a stripped clone this same frame.
+    const raw = mockSpatialUpdate.mock.calls[0][0];
+    expect(raw.controllers.right.triggerPressed).toBe(true);
+    // And the gated clone the nav saw is a DIFFERENT object with it stripped.
+    expect(navUpdate.mock.calls[0][0]).not.toBe(raw);
+    expect(navUpdate.mock.calls[0][0].controllers.right.triggerPressed).toBe(false);
+  });
+
+  it("persists VR hints exactly once when a grab ends", () => {
+    navUpdate.mockReturnValue({ vrScale: null, position: { x: 4, y: 5, z: 6 }, grabEnded: true });
+    vrExplorationManager._navigationController.getMode = vi.fn(() => "grab");
+    runFrame();
+
+    expect(mockUpdateVRHints).toHaveBeenCalledTimes(1);
+    expect(mockUpdateVRHints).toHaveBeenCalledWith({
+      vrScale: 1,
+      vrOrigin: [4, 5, 6],
+      explorationMode: "grab",
+    });
+  });
+
+  it("persists VR hints when a teleport commits", () => {
+    navUpdate.mockReturnValue({ vrScale: null, position: { x: 7, y: 8, z: 9 }, teleporting: true });
+    runFrame();
+    expect(mockUpdateVRHints).toHaveBeenCalledTimes(1);
+    expect(mockUpdateVRHints).toHaveBeenCalledWith(
+      expect.objectContaining({ vrOrigin: [7, 8, 9], explorationMode: "teleport" })
+    );
+  });
+
+  it("does NOT persist during an ongoing gesture (no grabEnded / teleporting)", () => {
+    navUpdate.mockReturnValue({ vrScale: null, position: { x: 4, y: 5, z: 6 } });
+    runFrame();
+    expect(mockUpdateVRHints).not.toHaveBeenCalled();
+  });
+});

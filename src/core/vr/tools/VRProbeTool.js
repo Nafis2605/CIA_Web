@@ -3,10 +3,19 @@
 //
 // SCOPE: intentionally session-local. Probing is transient inspection — probe
 // results are neither persisted nor broadcast to collaborators (unlike
-// annotations/measurements, which persist, or clip/slice planes, which sync).
+// annotations/measurements, which persist, or clip boxes, which sync).
 
 import { VRToolInterface } from './VRToolInterface.js';
 import { vr as log } from '@Utils/logger.js';
+import vtkActor from '@kitware/vtk.js/Rendering/Core/Actor';
+import vtkMapper from '@kitware/vtk.js/Rendering/Core/Mapper';
+import vtkSphereSource from '@kitware/vtk.js/Filters/Sources/SphereSource';
+import vtkVectorText from '@kitware/vtk.js/Rendering/Core/VectorText';
+
+const MARKER_APPARENT_RADIUS_M = 0.012;
+const LABEL_APPARENT_HEIGHT_M = 0.02;
+const MARKER_COLOR = [0.2, 0.9, 0.4];
+const LABEL_COLOR = [0.1, 0.1, 0.1];
 
 export class VRProbeTool extends VRToolInterface {
   constructor() {
@@ -21,6 +30,14 @@ export class VRProbeTool extends VRToolInterface {
     this._currentProbe = null;
     this._continuousMode = false;
     this._maxHistorySize = 50;
+
+    // In-headset visuals (created lazily in render()).
+    this._renderer = null;
+    this._markerActor = null;
+    this._markerSource = null;
+    this._labelActor = null;
+    this._labelSource = null;
+    this._labelText = null; // dirty-check for vtkVectorText.setText
   }
 
   async activate(context) {
@@ -31,6 +48,137 @@ export class VRProbeTool extends VRToolInterface {
   async deactivate() {
     await super.deactivate();
     this._currentProbe = null;
+    this._clearVisuals();
+  }
+
+  /**
+   * Draw a marker sphere at the current probe point plus a vtkVectorText label
+   * showing the probed value(s). Hidden when there is no current probe.
+   * @param {Object} renderer - VTK VR scene renderer
+   */
+  render(renderer) {
+    if (!renderer) return;
+    this._renderer = renderer;
+
+    const probe = this._currentProbe;
+    const pos = probe?.position;
+    if (!probe || !pos) {
+      this._setVisible(false);
+      return;
+    }
+
+    this._ensureActors(renderer);
+
+    const ms = this._apparentScale(MARKER_APPARENT_RADIUS_M);
+    if (this._markerActor) {
+      this._markerActor.setPosition(pos.x, pos.y, pos.z);
+      this._markerActor.setScale(ms, ms, ms);
+      this._markerActor.setVisibility(true);
+    }
+
+    if (this._labelActor) {
+      const text = this._formatProbeText(probe.data);
+      if (text !== this._labelText && this._labelSource) {
+        this._labelSource.setText(text);
+        this._labelText = text;
+      }
+      // Float the label slightly above the marker.
+      const lift = MARKER_APPARENT_RADIUS_M / this._getVrScale();
+      this._labelActor.setPosition(pos.x, pos.y + lift, pos.z);
+      const ls = this._apparentScale(LABEL_APPARENT_HEIGHT_M);
+      this._labelActor.setScale(ls, ls, ls);
+      this._labelActor.setVisibility(true);
+    }
+  }
+
+  /**
+   * Build a short one-line summary of the probe data for the 3D label.
+   * @private
+   */
+  _formatProbeText(data) {
+    if (!data) return 'no data';
+    if (data.values && typeof data.values === 'object') {
+      const parts = Object.entries(data.values).map(([name, v]) => {
+        const val = Array.isArray(v)
+          ? v.map((n) => (typeof n === 'number' ? n.toFixed(2) : n)).join(', ')
+          : typeof v === 'number'
+          ? v.toFixed(3)
+          : v;
+        return `${name}: ${val}`;
+      });
+      if (parts.length) return parts.join('  ');
+    }
+    if (data.value !== null && data.value !== undefined) {
+      const name = data.arrayName || 'value';
+      const val =
+        typeof data.value === 'number' ? data.value.toFixed(3) : data.value;
+      return `${name}: ${val}`;
+    }
+    return 'no data';
+  }
+
+  /** @private Lazily build the marker + label actors once. */
+  _ensureActors(renderer) {
+    if (!this._markerSource) {
+      this._markerSource = vtkSphereSource.newInstance({
+        radius: 1.0,
+        phiResolution: 12,
+        thetaResolution: 12,
+      });
+      const mapper = vtkMapper.newInstance();
+      mapper.setInputConnection(this._markerSource.getOutputPort());
+      const actor = vtkActor.newInstance();
+      actor.setMapper(mapper);
+      actor.getProperty().setColor(...MARKER_COLOR);
+      actor.getProperty().setLighting(false);
+      actor.setPickable(false);
+      actor.setVisibility(false);
+      this._markerActor = actor;
+      renderer.addActor(actor);
+    }
+    if (!this._labelActor) {
+      try {
+        this._labelSource = vtkVectorText.newInstance();
+        this._labelSource.setText('');
+        const mapper = vtkMapper.newInstance();
+        mapper.setInputConnection(this._labelSource.getOutputPort());
+        const actor = vtkActor.newInstance();
+        actor.setMapper(mapper);
+        actor.getProperty().setColor(...LABEL_COLOR);
+        actor.getProperty().setLighting(false);
+        actor.setPickable(false);
+        actor.setVisibility(false);
+        this._labelActor = actor;
+        renderer.addActor(actor);
+      } catch (err) {
+        log.warn(`VR probe label unavailable: ${err?.message}`);
+        this._labelSource = null;
+        this._labelActor = null;
+      }
+    }
+  }
+
+  /** @private */
+  _setVisible(visible) {
+    this._markerActor?.setVisibility(visible);
+    this._labelActor?.setVisibility(visible);
+  }
+
+  /** @private Remove all visual actors from the renderer they were added to. */
+  _clearVisuals() {
+    const r = this._renderer;
+    if (r) {
+      for (const actor of [this._markerActor, this._labelActor]) {
+        if (actor) {
+          r.removeActor(actor);
+          actor.delete?.();
+        }
+      }
+    }
+    this._markerActor = this._markerSource = null;
+    this._labelActor = this._labelSource = null;
+    this._labelText = null;
+    this._renderer = null;
   }
 
   handleInput(inputState, frame) {
@@ -57,8 +205,16 @@ export class VRProbeTool extends VRToolInterface {
       }
     }
 
-    // Single probe on trigger press
-    if (rightCtrl.triggerPressed && !this._lastTriggerState) {
+    // Single probe on trigger press. Rising-edge detection: update
+    // _lastTriggerState unconditionally BEFORE acting on it — the old
+    // placement below returns early on success, so updating this after the
+    // if-block never ran and re-armed itself every frame the trigger
+    // stayed down (same bug fixed in VRAnnotationTool/VRMeasureTool).
+    const triggerPressed = !!rightCtrl.triggerPressed;
+    const triggerRisingEdge = triggerPressed && !this._lastTriggerState;
+    this._lastTriggerState = triggerPressed;
+
+    if (triggerRisingEdge) {
       const hit = this._performRaycast(rightCtrl, frame);
 
       if (hit) {
@@ -81,7 +237,6 @@ export class VRProbeTool extends VRToolInterface {
         };
       }
     }
-    this._lastTriggerState = rightCtrl.triggerPressed;
 
     // A button to toggle continuous mode
     if (rightCtrl.buttons?.a && !this._lastAButtonState) {

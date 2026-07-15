@@ -80,6 +80,10 @@ export class VRParticipantSync {
       userColor: participant.userColor,
       mode: participant.mode,
       vrScale: state.vrScale || participant.vrScale,
+      // Data-space offset alongside vrScale so remote viewers can convert
+      // this user's own-XR-space poses into the shared data-space frame
+      // (each participant's WebXR reference space is physically distinct).
+      vrOrigin: state.vrOrigin || participant.vrOrigin || [0, 0, 0],
       scaleVisibility: participant.scaleVisibility,
       timestamp: now,
 

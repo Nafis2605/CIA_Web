@@ -21,13 +21,10 @@ export class VRControlManager {
         const data = this._yControlRequests.get(key);
 
         if (data?.type === 'request' && data.toUserId === getUserId()) {
-          // Someone is requesting to control us
-          window.dispatchEvent(new CustomEvent('cia:vr-control-request', {
-            detail: {
-              fromUserId: data.fromUserId,
-              fromUserName: data.fromUserName,
-            }
-          }));
+          // Someone is requesting to control us. No approval UI exists yet —
+          // requests surface only through respondToControl() being called
+          // programmatically (e.g. auto-approval when the session allows it).
+          log.info(`VR control requested by ${data.fromUserName} (${data.fromUserId})`);
         }
 
         if (data?.type === 'response' && data.toUserId === getUserId()) {
@@ -35,14 +32,7 @@ export class VRControlManager {
           if (data.approved) {
             this._session.establishControl(getUserId(), data.fromUserId);
           }
-
-          window.dispatchEvent(new CustomEvent('cia:vr-control-response', {
-            detail: {
-              approved: data.approved,
-              targetUserId: data.fromUserId,
-            }
-          }));
-
+          log.info(`VR control request ${data.approved ? 'approved' : 'denied'} by ${data.fromUserId}`);
           this._pendingRequest = null;
         }
       });

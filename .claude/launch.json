@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "frontend",
+      "runtimeExecutable": "C:\\Users\\fanaf\\OneDrive\\Desktop\\CIA_Web\\.claude\\start-frontend.bat",
+      "runtimeArgs": [],
+      "port": 8081
+    }
+  ]
+}

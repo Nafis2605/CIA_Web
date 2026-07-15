@@ -176,7 +176,7 @@ UI Components → Services → Managers → Core (EventBus, models) → Utils
 | `@Config` | `src/config` |
 | `@VR` | `src/vr` |
 
-**Vitest alias gap:** only `@UI` and `@Utils` are defined in `vitest.config.js`. Tests that import `@Core`, `@Services`, `@VR`, etc. will fail to resolve — add the alias manually to `vitest.config.js` `resolve.alias` before writing such tests.
+All path aliases above are mirrored in `vitest.config.js` `resolve.alias`, so tests can import through any of them.
 
 ## Key Import Patterns
 

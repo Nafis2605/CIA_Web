@@ -22,14 +22,6 @@ export class VRScaleController {
     this._isScaling = false;
     this._initialGripDistance = null;
     this._initialScale = null;
-
-    // Scale presets
-    this._presets = [
-      { name: "Overview", scale: 10.0, icon: "overview" },
-      { name: "Normal", scale: 1.0, icon: "normal" },
-      { name: "Detail", scale: 0.1, icon: "detail" },
-      { name: "Micro", scale: 0.01, icon: "micro" },
-    ];
   }
 
   /**
@@ -101,20 +93,6 @@ export class VRScaleController {
     // Update VR context
     this._vrContext.vrScale = this._scale;
 
-    // Trigger haptic feedback proportional to scale change rate
-    const scaleChangeRate = Math.abs(targetScale - this._scale);
-    if (scaleChangeRate > 0.01) {
-      window.dispatchEvent(
-        new CustomEvent("cia:vr-haptic", {
-          detail: {
-            type: "scale",
-            intensity: Math.min(0.3, scaleChangeRate * 0.5),
-            duration: 10,
-          },
-        })
-      );
-    }
-
     return { scaling: true, newScale: this._scale };
   }
 
@@ -138,13 +116,6 @@ export class VRScaleController {
     this._initialGripDistance = null;
     this._initialScale = null;
     log.debug("Scale gesture ended", { finalScale: this._scale });
-
-    // Trigger completion haptic
-    window.dispatchEvent(
-      new CustomEvent("cia:vr-haptic", {
-        detail: { type: "scale-complete", intensity: 0.5, duration: 30 },
-      })
-    );
   }
 
   /**
@@ -188,55 +159,6 @@ export class VRScaleController {
    */
   getMaxScale() {
     return this._options.maxScale;
-  }
-
-  /**
-   * Get scale presets
-   */
-  getPresets() {
-    return this._presets;
-  }
-
-  /**
-   * Apply a scale preset
-   */
-  applyPreset(presetName) {
-    const preset = this._presets.find((p) => p.name === presetName);
-    if (preset) {
-      this.setScale(preset.scale);
-      log.debug(`Applied scale preset: ${presetName}`);
-      return true;
-    }
-    return false;
-  }
-
-  /**
-   * Get nearest preset to current scale
-   */
-  getNearestPreset() {
-    let nearest = this._presets[0];
-    let minDiff = Math.abs(Math.log10(this._scale) - Math.log10(nearest.scale));
-
-    for (const preset of this._presets) {
-      const diff = Math.abs(Math.log10(this._scale) - Math.log10(preset.scale));
-      if (diff < minDiff) {
-        minDiff = diff;
-        nearest = preset;
-      }
-    }
-
-    return nearest;
-  }
-
-  /**
-   * Get scale as human-readable string
-   */
-  getScaleLabel() {
-    if (this._scale >= 1) {
-      return `${this._scale.toFixed(1)}x`;
-    } else {
-      return `1:${(1 / this._scale).toFixed(1)}`;
-    }
   }
 
   /**

@@ -104,6 +104,17 @@ module.exports = {
         changeOrigin: true,
         pathRewrite: { "^/render-api": "" },
       },
+      // Y.js collaboration WebSocket — same-origin so HTTPS pages (and LAN/tunnel
+      // clients like Apple Vision Pro) can connect without a mixed-content block.
+      // The room name is the first path segment on the Y.js server, so the mount
+      // prefix must be stripped: /yjs-ws/<roomId> -> /<roomId>.
+      {
+        context: ["/yjs-ws"],
+        target: "ws://localhost:9001",
+        ws: true,
+        changeOrigin: true,
+        pathRewrite: { "^/yjs-ws": "" },
+      },
       // Node.js API server
       {
         context: ["/api"],
@@ -182,7 +193,7 @@ module.exports = {
     }),
     new webpack.DefinePlugin({
       "process.env.YJS_WEBSOCKET_URL": JSON.stringify(
-        process.env.YJS_WEBSOCKET_URL || "ws://localhost:9001"
+        process.env.YJS_WEBSOCKET_URL || "/yjs-ws"
       ),
       "process.env.NODE_ENV": JSON.stringify(
         process.env.NODE_ENV || "development"
@@ -191,7 +202,7 @@ module.exports = {
         process.env.API_BASE_URL || "http://localhost:3001/api"
       ),
       __YJS_WS_URL__: JSON.stringify(
-        process.env.YJS_WEBSOCKET_URL || "ws://localhost:9001"
+        process.env.YJS_WEBSOCKET_URL || "/yjs-ws"
       ),
       __KEYCLOAK_URL__: JSON.stringify(
         process.env.KEYCLOAK_URL || "http://localhost:8080"

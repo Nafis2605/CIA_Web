@@ -4,7 +4,7 @@
 // Layout: minimal header + full-screen VTK canvas.
 // VR wrist menu handles in-headset controls.
 
-import React, { useEffect, useState, useCallback, useMemo } from "react";
+import React, { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { ui as log } from "@Utils/logger.js";
 import { sessionManager } from "@Core/session/sessionManager.js";
 import { authService } from "@Services/authService.js";
@@ -64,7 +64,8 @@ import { useCanvas } from "@UI/react/hooks/useCanvas.js";
 import { useWebXRAvailability } from "@UI/react/components/organisms";
 import { useVoiceControls } from "@UI/react/hooks/useVoiceBar.js";
 import { useRoomIndicator } from "@UI/react/hooks/useRoomIndicator.js";
-import { vrManager } from "@Core/vr/VRManager.js";
+import { vrExplorationManager } from "@Core/vr/VRExplorationManager.js";
+import { workspaceManager } from "@Core/instances/workspaceManager.js";
 
 import "./CIAWebApp.scss";
 
@@ -102,6 +103,7 @@ export function CIAWebApp({ username, userId, projectId }) {
     selectWorkspace,
     updateWorkspace,
     isLoading: isWorkspacesLoading,
+    error: workspacesError,
     createPersonalWorkspace,
   // Note: do NOT pass roomId here. The Y.js session UUID (roomId from sessionManager)
   // is the collaboration channel key and is NOT a server-side rooms table record.
@@ -109,14 +111,24 @@ export function CIAWebApp({ username, userId, projectId }) {
   // Y.js already uses sessionManager.getRoomId() independently via yjsSetup.js.
   } = useWorkspaces({ userId, projectId });
 
-  // Auto-create a personal workspace on first run (no workspace in this project/room yet)
+  // Auto-create a personal workspace on first run (no workspace in this
+  // project/room yet). This is only a guarded fallback: useWorkspaces already
+  // get-or-creates a personal workspace during loadWorkspaces. We guard it hard
+  // to avoid the creation loop that produced hundreds of thousands of rows:
+  //   - fire at most once per session (autoCreateAttemptedRef), and
+  //   - skip when the workspace list failed to load — a failed list is not an
+  //     empty list, and creating on error would spam the server.
+  const autoCreateAttemptedRef = useRef(false);
   useEffect(() => {
     if (isWorkspacesLoading || !userId || !projectId) return;
+    if (workspacesError) return;
     if ((workspaces || []).length > 0) return;
+    if (autoCreateAttemptedRef.current) return;
+    autoCreateAttemptedRef.current = true;
     createPersonalWorkspace?.('My Workspace').catch((err) => {
       log.warn('Auto-create workspace failed:', err.message);
     });
-  }, [isWorkspacesLoading, workspaces, userId, projectId, createPersonalWorkspace]);
+  }, [isWorkspacesLoading, workspaces, userId, projectId, workspacesError, createPersonalWorkspace]);
 
   // Ensure the active workspace has a canvas
   const ensureCanvas = useCallback(
@@ -212,12 +224,17 @@ export function CIAWebApp({ username, userId, projectId }) {
 
   const handleEnterVR = useCallback(async () => {
     try {
-      await vrManager.enterVR();
+      const instance = canvasId ? workspaceManager.getActiveInstanceForCanvas(canvasId) : null;
+      if (!instance?.instanceData?.hasData) {
+        toast.error("Open a dataset first");
+        return;
+      }
+      await vrExplorationManager.startExploration(instance.instanceId, {});
     } catch (err) {
       log.error("Enter VR failed:", err);
       toast.error(`VR unavailable: ${err.message}`);
     }
-  }, []);
+  }, [canvasId]);
 
   // ── Voice ─────────────────────────────────────────────────────────────────
   const voice = useVoiceControls();

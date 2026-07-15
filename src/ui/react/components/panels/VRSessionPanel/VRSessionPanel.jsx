@@ -67,7 +67,7 @@ function VRSessionPanel({
   // Local state
   const [navigationMode, setNavigationMode] = useState(session?.defaultExplorationMode || "fly");
   const [scaleVisibility, setScaleVisibility] = useState("my-scale");
-  const [vrScale, setVrScale] = useState(session?.defaultVrScale || 1.0);
+  const [vrScale, setVrScale] = useState(session?.defaultVRScale || 1.0);
   const [isExpanded, setIsExpanded] = useState(true);
   const [showEndConfirm, setShowEndConfirm] = useState(false);
 
@@ -75,7 +75,7 @@ function VRSessionPanel({
   useEffect(() => {
     if (session) {
       setNavigationMode(session.defaultExplorationMode || "fly");
-      setVrScale(session.defaultVrScale || 1.0);
+      setVrScale(session.defaultVRScale || 1.0);
     }
   }, [session]);
 
