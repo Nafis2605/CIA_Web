@@ -26,7 +26,7 @@ vi.mock("@Core/data/models/VRExplorationSession.js", () => ({
   VRExplorationSession: class {},
   PARTICIPATION_MODE: { VR_EXPLORER: "vr-explorer", DESKTOP_OBSERVER: "desktop-observer" },
   SESSION_STATUS: { ACTIVE: "active" },
-  EXPLORATION_MODES: { FLY: "fly", TELEPORT: "teleport", WALK: "walk", SCALE: "scale" },
+  EXPLORATION_MODES: { FLY: "fly", TELEPORT: "teleport", WALK: "walk", SCALE: "scale", GRAB: "grab" },
 }));
 vi.mock("@Core/vr/VRParticipantSync.js", () => ({ VRParticipantSync: class {} }));
 vi.mock("@Core/vr/tools/VRToolManager.js", () => ({ VRToolManager: class {} }));
@@ -181,13 +181,13 @@ describe("VRExplorationManager._onFrame — one-shot gripless navigation-mode sw
     vrExplorationManager._inputProfileDetected = false;
   });
 
-  it("switches the default fly mode to teleport on the first frame that is gripless-only", () => {
+  it("switches the default fly mode to grab on the first frame that is gripless-only", () => {
     const frame = makeFrame([GRIPLESS_SOURCE]);
 
     vrExplorationManager._onFrame({ time: 0, deltaTime: 16, frame, viewerPose: null });
 
     expect(vrExplorationManager._navigationController.setMode).toHaveBeenCalledTimes(1);
-    expect(vrExplorationManager._navigationController.setMode).toHaveBeenCalledWith("teleport");
+    expect(vrExplorationManager._navigationController.setMode).toHaveBeenCalledWith("grab");
     expect(vrExplorationManager._inputProfileDetected).toBe(true);
   });
 

@@ -86,6 +86,13 @@ export class VREnvironment {
    */
   initialize(renderer, vrContext) {
     if (!renderer) return;
+    // Idempotency guard: if a previous VR session's teardown ever failed to
+    // call dispose() (e.g. an earlier sub-manager's dispose() threw before
+    // leaveSession() reached this one), stale actors would still be sitting
+    // in this same long-lived renderer. Disposing first guarantees at most
+    // one set of environment actors ever exists, self-healing any leak
+    // instead of stacking duplicates on top of it.
+    if (this._renderer) this.dispose();
     this._renderer = renderer;
 
     this._floorSolidActor = this._createFloorSolid();

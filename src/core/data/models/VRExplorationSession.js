@@ -192,7 +192,12 @@ export class VRExplorationSession {
     // =========================================================================
     // EXPLORATION SETTINGS
     // =========================================================================
-    this.defaultExplorationMode = config.defaultExplorationMode || EXPLORATION_MODES.FLY;
+    // Default to GRAB (direct manipulation): the first pinch-drag moves the
+    // dataset, which is what users expect on Apple Vision Pro (gaze + pinch).
+    // FLY reads thumbstick/buttons that gripless transient-pointer input never
+    // emits, so it leaves Vision Pro users unable to move. Teleport/fly remain
+    // selectable from the in-world spatial menu.
+    this.defaultExplorationMode = config.defaultExplorationMode || EXPLORATION_MODES.GRAB;
     this.defaultVRScale = config.defaultVRScale || 1.0;
 
     // =========================================================================

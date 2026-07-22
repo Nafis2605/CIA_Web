@@ -57,6 +57,66 @@ export function rotateVectorByQuaternion(vec, q) {
 }
 
 /**
+ * Rotate a 3-vector by `theta` radians about the world-up (+Y) axis.
+ *
+ * Used for the two-hand "handlebar" twist that spins the dataset on a
+ * turntable: the data actor is yawed about its own centre (see
+ * VTKInstanceHandler._applyVRDataRotation), and probe lookups undo that yaw to
+ * query the un-rotated polydata (VTKInstanceHandler.probeDataVR). Right-handed:
+ * a positive theta rotates +X toward +Z.
+ *
+ * @param {number[]} vec - [x, y, z]
+ * @param {number} theta - radians
+ * @returns {number[]} rotated [x, y, z]
+ */
+export function yawRotateVector(vec, theta) {
+  const [x, y, z] = vec;
+  if (!theta) return [x, y, z];
+  const c = Math.cos(theta);
+  const s = Math.sin(theta);
+  return [x * c + z * s, y, -x * s + z * c];
+}
+
+/**
+ * Build a flat 16-element column-major 4x4 matrix (gl-matrix / vtk.js
+ * `mat4` layout — the same layout `actor.setUserMatrix()` expects) for
+ * "translate to pivot, yaw by theta, translate back": `T(pivot) · Ry(theta) ·
+ * T(-pivot)`. Applying this to a point gives exactly `pivot +
+ * yawRotateVector(point - pivot, theta)` — i.e. it rotates a point about
+ * `pivot` the same way `yawRotateVector` rotates a vector about the origin.
+ *
+ * Used as an actor's `UserMatrix` (see
+ * VTKInstanceHandler._applyVRDataRotation) to spin the data actor about a
+ * WORLD-space pivot as an OUTER wrapper around its existing Position/Origin/
+ * Orientation/Scale — vtk.js's `computeMatrix()` applies UserMatrix outermost
+ * (`world = UserMatrix · innerWorld`), so this is identity at theta=0
+ * regardless of the actor's own transform, and never needs to know or touch
+ * it. This is what makes it safe where directly mutating Origin/Orientation
+ * was not: Origin is defined in the actor's LOCAL frame, so writing a
+ * WORLD-space pivot into it corrupts the transform whenever the actor
+ * already has any non-identity Orientation/Scale (e.g. from the desktop
+ * Pan/Rotate/Scale tool or a collaborator's shared state).
+ *
+ * @param {number} theta - radians
+ * @param {number[]} [pivot] - [x, y, z] world-space pivot point
+ * @returns {number[]} flat 16-element column-major matrix
+ */
+export function buildYawPivotMatrix(theta, pivot = [0, 0, 0]) {
+  const [cx, , cz] = pivot;
+  const t = theta || 0;
+  const c = Math.cos(t);
+  const s = Math.sin(t);
+  const tx = cx * (1 - c) - cz * s;
+  const tz = cz * (1 - c) + cx * s;
+  return [
+    c, 0, -s, 0,
+    0, 1, 0, 0,
+    s, 0, c, 0,
+    tx, 0, tz, 1,
+  ];
+}
+
+/**
  * The controller "forward" axis in data space: the WebXR local -Z axis
  * ([0, 0, -1]) rotated by the controller's orientation quaternion. Used as the
  * clip/slice plane normal so the plane faces the way the user points.

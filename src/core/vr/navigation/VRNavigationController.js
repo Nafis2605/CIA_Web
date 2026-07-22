@@ -101,13 +101,17 @@ export class VRNavigationController {
       position: null,
       orientation: null,
       vrScale: null,
+      vrRotation: null,
       teleporting: false,
     };
 
-    // Check for scale gesture (two-hand pinch)
+    // Check for scale + twist gesture (two-hand pinch)
     const scaleResult = this._scaleController.update(inputState, deltaTime);
     if (scaleResult.scaling) {
       result.vrScale = scaleResult.newScale;
+      if (scaleResult.newRotation != null) {
+        result.vrRotation = scaleResult.newRotation;
+      }
     }
 
     // Update active navigation mode

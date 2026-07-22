@@ -90,6 +90,7 @@ import { vrManager } from "@Core/vr/VRManager.js";
 import { vrExplorationManager } from "@Core/vr/VRExplorationManager.js";
 import { VRControllerRenderer } from "@Core/vr/VRControllerRenderer.js";
 import { VR_CLEAR_COLOR } from "@Core/vr/environment/VREnvironment.js";
+import { buildYawPivotMatrix } from "@Core/vr/tools/vrPlaneMath.js";
 import {
   updateCursorWorldPosition,
   clearCursorWorldPosition,
@@ -4685,9 +4686,38 @@ console.log('Tools:', tools);
         ? openGLRenderWindow.getSize()
         : null;
 
-    // Get dataset bounds
-    const bounds = renderer.computeVisiblePropBounds();
-    const dataBounds = bounds || [-1, 1, -1, 1, -1, 1];
+    // Get dataset bounds, scoped to the DATA ACTOR ONLY — not
+    // renderer.computeVisiblePropBounds(), which aggregates every visible
+    // actor in the renderer (confirmed against vtk.js's Renderer.js: it has
+    // no pickability filter, so even setPickable(false) floor/wall/menu
+    // actors still count). Environment/menu actors are added to this SAME
+    // long-lived renderer on every VR entry; if a prior session's teardown
+    // ever failed to remove them (see VRExplorationManager.leaveSession
+    // hardening), computeVisiblePropBounds() would include their ~20-24m
+    // geometry and inflate the diagonal, collapsing the auto-fit vrScale
+    // toward zero — the "tiny object, giant menu panels" bug. Scoping to
+    // just the data actor makes sizing structurally immune to that
+    // regardless of teardown correctness. computeVisiblePropBounds() is only
+    // a last-resort fallback if the actor itself has no valid bounds yet
+    // (e.g. actors not fully registered on the Vision Pro entry timing).
+    const isValidBounds = (b) =>
+      Array.isArray(b) &&
+      b.length === 6 &&
+      b.every((v) => Number.isFinite(v)) &&
+      b[1] >= b[0] &&
+      b[3] >= b[2] &&
+      b[5] >= b[4] &&
+      (b[1] - b[0] > 1e-6 || b[3] - b[2] > 1e-6 || b[5] - b[4] > 1e-6);
+
+    let bounds =
+      typeof sceneObjects.actor?.getBounds === "function"
+        ? sceneObjects.actor.getBounds()
+        : null;
+    if (!isValidBounds(bounds)) {
+      const rendererBounds = renderer.computeVisiblePropBounds();
+      if (isValidBounds(rendererBounds)) bounds = rendererBounds;
+    }
+    const dataBounds = isValidBounds(bounds) ? bounds : [-1, 1, -1, 1, -1, 1];
 
     // Store original camera state
     const originalCameraState = {
@@ -4698,6 +4728,32 @@ console.log('Tools:', tools);
       clippingRange: camera.getClippingRange(),
       viewAngle: camera.getViewAngle(),
     };
+
+    // World-space center of the dataset — the pivot the two-hand twist yaws
+    // the actor about (turntable spin), and the reference probeDataVR undoes
+    // that yaw around. Captured once at entry from the (validated) bounds.
+    // computeVisiblePropBounds()/actor.getBounds() are WORLD-space (post any
+    // existing actor transform), which is exactly what actor.setUserMatrix's
+    // pivot needs — see _applyVRDataRotation.
+    const dataCenter = [
+      (dataBounds[0] + dataBounds[1]) / 2,
+      (dataBounds[2] + dataBounds[3]) / 2,
+      (dataBounds[4] + dataBounds[5]) / 2,
+    ];
+
+    // Preserve the data actor's UserMatrix so _applyVRDataRotation can spin it
+    // in VR (as an outer world-space rotation, independent of the actor's own
+    // Position/Origin/Orientation/Scale — see _applyVRDataRotation for why)
+    // and exitVRExploration can restore it exactly. getUserMatrix() returns a
+    // LIVE mutable reference into the actor's internal state — setUserMatrix
+    // mutates that same array in place, so this must be a defensive copy, not
+    // the reference itself, or the "original" snapshot would be corrupted the
+    // moment VR sets a new matrix.
+    const dataActor = sceneObjects.actor;
+    const originalActorUserMatrix =
+      typeof dataActor?.getUserMatrix === "function"
+        ? Array.from(dataActor.getUserMatrix())
+        : null;
 
     // Create VR exploration context
     const vrContext = {
@@ -4710,14 +4766,19 @@ console.log('Tools:', tools);
       handler: this,
       sceneObjects,
       dataBounds,
+      dataCenter,
       originalCameraState,
       originalGLSize,
+      originalActorUserMatrix,
 
       // VR state — placement is finalized by
       // VRExplorationManager._applyInitialPlacement right after this call
       // returns; these are just safe pre-placement defaults.
       vrScale: session.defaultVRScale || 1.0,
       vrOrigin: [0, 0, 0],
+      // Two-hand twist yaw (radians) applied to the data actor each frame.
+      vrRotation: 0,
+      _appliedVRRotation: null,
 
       // Measurements
       measurements: [],
@@ -4751,6 +4812,11 @@ console.log('Tools:', tools);
 
     const pose = viewerPose || frame.getViewerPose(referenceSpace);
     if (!pose) return;
+
+    // Apply the two-hand twist as a yaw on the data actor (turntable spin)
+    // before rendering this frame. Cheap dirty-check inside — no-ops when the
+    // rotation hasn't changed.
+    this._applyVRDataRotation(vrContext);
 
     // Bind the XR framebuffer and clear it once for both eyes. The clear
     // color matches VREnvironment's bright BG_BOTTOM so the surround reads as
@@ -4838,6 +4904,19 @@ console.log('Tools:', tools);
       camera.setClippingRange(...originalCameraState.clippingRange);
       camera.setViewAngle(originalCameraState.viewAngle);
       camera.setProjectionMatrix(null);
+    }
+
+    // Restore the data actor's UserMatrix, undoing any two-hand twist yaw
+    // applied to it during VR (_applyVRDataRotation). The actor's own
+    // Position/Origin/Orientation/Scale were never touched, so nothing else
+    // needs restoring here.
+    const dataActor = sceneObjects.actor;
+    if (
+      dataActor &&
+      vrContext.originalActorUserMatrix &&
+      typeof dataActor.setUserMatrix === "function"
+    ) {
+      dataActor.setUserMatrix(vrContext.originalActorUserMatrix);
     }
 
     // Clean up controller visuals
@@ -4956,9 +5035,24 @@ console.log('Tools:', tools);
     const coords = pointsObj.getData();
     if (!coords || coords.length < nPoints * 3) return null;
 
-    const px = Array.isArray(position) ? position[0] : position.x;
-    const py = Array.isArray(position) ? position[1] : position.y;
-    const pz = Array.isArray(position) ? position[2] : position.z;
+    let px = Array.isArray(position) ? position[0] : position.x;
+    let py = Array.isArray(position) ? position[1] : position.y;
+    let pz = Array.isArray(position) ? position[2] : position.z;
+
+    // The polydata coords are the actor's LOCAL (un-rotated) points, but the
+    // probe position comes from raycastVR in WORLD space on the possibly-yawed
+    // actor. Undo the two-hand twist about the dataset center so the nearest-
+    // point scan compares like with like.
+    const yaw = vrContext.vrRotation || 0;
+    if (yaw) {
+      const center = vrContext.dataCenter || [0, 0, 0];
+      const c = Math.cos(-yaw);
+      const s = Math.sin(-yaw);
+      const rx = px - center[0];
+      const rz = pz - center[2];
+      px = center[0] + (rx * c + rz * s);
+      pz = center[2] + (-rx * s + rz * c);
+    }
 
     // Linear nearest-point scan (squared distance — no sqrt in the loop).
     let bestId = -1;
@@ -5098,6 +5192,44 @@ console.log('Tools:', tools);
 
     // Set projection matrix from XR
     camera.setProjectionMatrix(xrView.projectionMatrix);
+  }
+
+  /**
+   * Apply the current two-hand twist as a yaw on the data actor, pivoting about
+   * the dataset's WORLD-space center so it spins in place like a turntable.
+   * Leaves the world/camera frame (vrScale, vrOrigin) untouched, so grab,
+   * teleport, scale, the spatial menu, environment and tool raycasts all keep
+   * working unchanged — vtkCellPicker honours the actor's matrix, so
+   * raycastVR stays correct on the rotated surface (probeDataVR undoes the
+   * yaw for its raw-polydata scan).
+   *
+   * Implemented via `actor.setUserMatrix()`, NOT `setOrigin`/`setOrientation`.
+   * vtk.js applies UserMatrix as the OUTERMOST wrap around the actor's
+   * existing Position/Origin/Orientation/Scale (`world = UserMatrix ·
+   * innerWorld` — see Prop3D.js computeMatrix), so this rotates the object
+   * exactly as currently rendered, in world space, regardless of what those
+   * other properties are — and is the identity transform at yaw=0 no matter
+   * what they are. Mutating Origin/Orientation directly was tried first and
+   * caused a regression: Origin is defined in the actor's LOCAL frame, but
+   * the dataset center (from computeVisiblePropBounds) is WORLD-space, and
+   * the desktop Pan/Rotate/Scale tool (and collaborative shared-state sync)
+   * routinely leave the actor's own transform non-identity — writing a
+   * world-space point into a local-space property then introduced a spurious
+   * jump on VR entry (object invisible / sunk below the floor) even at yaw=0.
+   * Restored exactly on exit by exitVRExploration.
+   * @private
+   */
+  _applyVRDataRotation(vrContext) {
+    const actor = vrContext?.sceneObjects?.actor;
+    if (!actor || typeof actor.setUserMatrix !== "function") return;
+
+    const yaw = vrContext.vrRotation || 0;
+    // Dirty-check — actor transform is unchanged most frames.
+    if (vrContext._appliedVRRotation === yaw) return;
+    vrContext._appliedVRRotation = yaw;
+
+    const center = vrContext.dataCenter || [0, 0, 0];
+    actor.setUserMatrix(buildYawPivotMatrix(yaw, center));
   }
 
   // ===========================================================================

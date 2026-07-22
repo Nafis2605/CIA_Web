@@ -386,6 +386,25 @@ class VRExplorationManager extends BaseManager {
   /**
    * Leave the current session
    */
+  /**
+   * Run one teardown step, logging and swallowing any failure instead of
+   * letting it abort the rest of leaveSession()'s cleanup sequence. Without
+   * this, a single sub-manager throwing (e.g. vrSpatialUI.dispose()) would
+   * skip every step after it — critically vrEnvironment.dispose() — leaving
+   * floor/wall/marker/menu actors permanently stuck in the instance's
+   * long-lived renderer (VR "exits" with no visible error, but the next
+   * "Enter VR" then sizes the dataset off contaminated bounds). Each step is
+   * independently guarded so one failure can never take out the others.
+   * @private
+   */
+  async _safeCleanupStep(label, fn) {
+    try {
+      await fn();
+    } catch (e) {
+      log.error(`VR leaveSession: ${label} failed`, e);
+    }
+  }
+
   async leaveSession() {
     // Guard against re-entrancy: leaveSession() -> vrManager.exitVR() ->
     // XRSession "end" event -> our sessionEnded handler -> leaveSession()
@@ -399,70 +418,80 @@ class VRExplorationManager extends BaseManager {
 
     log.info('Leaving VR session...', { sessionId: session.id });
 
-    // Unsubscribe from VRManager events first so no further frame/end
-    // callbacks touch a partially torn-down context.
-    this._offFrame?.();
-    this._offFrame = null;
-    this._offSessionEnded?.();
-    this._offSessionEnded = null;
-
-    // Clean up sub-managers
-    this._participantSync?.stop();
-    vrCursorSync.clearCursor(); // remove this user's ray from collaborators' views
-    vrMultiViewGrid.disable();
-    vrSpatialUI.dispose();
-    vrAvatarSystem.dispose();
-    vrEnvironment.dispose(); // must run before the handler's final desktop render
-    await this._toolManager?.cleanup();
-    this._snapshotManager?.cleanup();
-    this._controlManager?.cleanup();
-    this._navigationController?.cleanup();
-
-    // Exit VR exploration on handler
-    if (this._activeContext?.handler && this._activeContext?.vrContext) {
-      await this._activeContext.handler.exitVRExploration(this._activeContext.vrContext);
-    }
-
-    // End the XR session via VRManager (the sole session owner). Safe to
-    // call even if the session already ended (e.g. we got here via the
-    // sessionEnded event) — exitVR() no-ops when there's no active session.
     try {
-      await vrManager.exitVR();
-    } catch (e) {
-      // Session may already be ended
+      // Unsubscribe from VRManager events first so no further frame/end
+      // callbacks touch a partially torn-down context.
+      this._offFrame?.();
+      this._offFrame = null;
+      this._offSessionEnded?.();
+      this._offSessionEnded = null;
+
+      // Clean up sub-managers — each step independently guarded (see
+      // _safeCleanupStep) so a failure in one can never skip the rest,
+      // especially vrEnvironment.dispose() (must run before the handler's
+      // final desktop render, and before the next VR entry computes bounds).
+      await this._safeCleanupStep('participantSync.stop', () => this._participantSync?.stop());
+      await this._safeCleanupStep('vrCursorSync.clearCursor', () => vrCursorSync.clearCursor());
+      await this._safeCleanupStep('vrMultiViewGrid.disable', () => vrMultiViewGrid.disable());
+      await this._safeCleanupStep('vrSpatialUI.dispose', () => vrSpatialUI.dispose());
+      await this._safeCleanupStep('vrAvatarSystem.dispose', () => vrAvatarSystem.dispose());
+      await this._safeCleanupStep('vrEnvironment.dispose', () => vrEnvironment.dispose());
+      await this._safeCleanupStep('toolManager.cleanup', () => this._toolManager?.cleanup());
+      await this._safeCleanupStep('snapshotManager.cleanup', () => this._snapshotManager?.cleanup());
+      await this._safeCleanupStep('controlManager.cleanup', () => this._controlManager?.cleanup());
+      await this._safeCleanupStep('navigationController.cleanup', () => this._navigationController?.cleanup());
+
+      // Exit VR exploration on handler
+      await this._safeCleanupStep('handler.exitVRExploration', () => {
+        if (this._activeContext?.handler && this._activeContext?.vrContext) {
+          return this._activeContext.handler.exitVRExploration(this._activeContext.vrContext);
+        }
+        return undefined;
+      });
+
+      // End the XR session via VRManager (the sole session owner). Safe to
+      // call even if the session already ended (e.g. we got here via the
+      // sessionEnded event) — exitVR() no-ops when there's no active session.
+      try {
+        await vrManager.exitVR();
+      } catch (e) {
+        // Session may already be ended
+      }
+
+      // End session
+      session.end();
+
+      // Notify the server (non-fatal; only meaningful for server-registered ids)
+      if (session.id && !String(session.id).startsWith('vrsession_')) {
+        apiClient
+          .post(`/vr/sessions/${session.id}/leave`, {})
+          .catch((err) => log.warn('VR session leave notification failed:', err.message));
+      }
+    } finally {
+      // Guaranteed to run even if something above threw unexpectedly outside
+      // the individually-guarded steps — otherwise _leaving would stay true
+      // forever and every future "Enter VR" attempt would silently no-op.
+      this._activeSession = null;
+      this._activeContext = null;
+      this._isolationBackup = null;
+      this._lastIsolationButtonState = false;
+      this._followTargetUserId = null;
+      this._inputProfileDetected = false;
+      this._participantSync = null;
+      this._toolManager = null;
+      this._snapshotManager = null;
+      this._controlManager = null;
+      this._navigationController = null;
+
+      // Emit events
+      this._emit('sessionLeft', { sessionId: session.id });
+
+      window.dispatchEvent(new CustomEvent('cia:vr-session-ended', {
+        detail: { sessionId: session.id }
+      }));
+
+      this._leaving = false;
     }
-
-    // End session
-    session.end();
-
-    // Notify the server (non-fatal; only meaningful for server-registered ids)
-    if (session.id && !String(session.id).startsWith('vrsession_')) {
-      apiClient
-        .post(`/vr/sessions/${session.id}/leave`, {})
-        .catch((err) => log.warn('VR session leave notification failed:', err.message));
-    }
-
-    // Clean up
-    this._activeSession = null;
-    this._activeContext = null;
-    this._isolationBackup = null;
-    this._lastIsolationButtonState = false;
-    this._followTargetUserId = null;
-    this._inputProfileDetected = false;
-    this._participantSync = null;
-    this._toolManager = null;
-    this._snapshotManager = null;
-    this._controlManager = null;
-    this._navigationController = null;
-
-    // Emit events
-    this._emit('sessionLeft', { sessionId: session.id });
-
-    window.dispatchEvent(new CustomEvent('cia:vr-session-ended', {
-      detail: { sessionId: session.id }
-    }));
-
-    this._leaving = false;
   }
 
   // ===========================================================================
@@ -803,13 +832,26 @@ class VRExplorationManager extends BaseManager {
    * @private
    */
   _computeAutoPlacement(dataBounds) {
-    const b = dataBounds || [-1, 1, -1, 1, -1, 1];
+    // Guard degenerate/invalid bounds: a null box, or one whose extent is
+    // (near) zero on every axis — which happens when actors aren't fully
+    // added yet on the Vision Pro entry timing — would yield a nonsense
+    // diagonal and mis-size the object. Fall back to a unit box in that case.
+    let b = dataBounds;
+    const valid =
+      Array.isArray(b) &&
+      b.length === 6 &&
+      b.every((v) => Number.isFinite(v)) &&
+      (b[1] - b[0] > 1e-6 || b[3] - b[2] > 1e-6 || b[5] - b[4] > 1e-6);
+    if (!valid) b = [-1, 1, -1, 1, -1, 1];
+
     const dx = b[1] - b[0];
     const dy = b[3] - b[2];
     const dz = b[5] - b[4];
     const diagonal = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
     const center = [(b[0] + b[1]) / 2, (b[2] + b[3]) / 2, (b[4] + b[5]) / 2];
 
+    // Auto-fit: the dataset's bounding diagonal should appear ~2.5 physical
+    // metres across, placed 2.0 m in front and dropped 1.4 m to eye level.
     const vrScale = 2.5 / diagonal;
     const vrOrigin = [
       center[0],
@@ -829,29 +871,26 @@ class VRExplorationManager extends BaseManager {
    */
   _applyInitialPlacement(vrContext, sessionConfig) {
     const placement = this._computeAutoPlacement(vrContext.dataBounds);
-    const hasExplicitScale =
-      sessionConfig?.vrScale != null && sessionConfig.vrScale !== 1.0;
-    // Remembered for _applyPoseRelativePlacement, which runs once the first
-    // real XR frame arrives and needs to know whether to keep this scale.
-    vrContext._hasExplicitScale = hasExplicitScale;
 
-    if (hasExplicitScale) {
-      vrContext.vrScale = sessionConfig.vrScale;
-      const center = placement.center;
-      vrContext.vrOrigin = [
-        center[0],
-        center[1] - 1.4 / vrContext.vrScale,
-        center[2] + 2.0 / vrContext.vrScale,
-      ];
-    } else {
-      vrContext.vrScale = placement.vrScale;
-      vrContext.vrOrigin = placement.vrOrigin;
-    }
+    // ALWAYS auto-fit on fresh entry. A persisted/default `vrScale` (from a
+    // prior session's default_vr_scale, threaded in via sessionConfig) is a
+    // stale hint, not a live user gesture — honoring it was the root cause of
+    // the "object appears tiny and far away" report on Apple Vision Pro, where
+    // a small saved scale locked the dataset far below its fit-to-view size.
+    // Live scale/rotation gestures during the session write vrContext directly;
+    // they don't come back through sessionConfig, so ignoring it here is safe.
+    vrContext._hasExplicitScale = false;
+    vrContext.vrScale = placement.vrScale;
+    vrContext.vrOrigin = placement.vrOrigin;
+    // Rotation is part of the same affine XR→data map as scale/origin; start
+    // unrotated (yaw radians about world-up through the data center).
+    vrContext.vrRotation = 0;
 
     log.info('Applied initial VR placement', {
       vrScale: vrContext.vrScale,
       vrOrigin: vrContext.vrOrigin,
       diagonal: placement.diagonal,
+      ignoredSessionScale: sessionConfig?.vrScale ?? null,
     });
   }
 
@@ -875,9 +914,13 @@ class VRExplorationManager extends BaseManager {
     ];
 
     const placement = this._computeAutoPlacement(vrContext.dataBounds);
-    const vrScale = vrContext._hasExplicitScale ? vrContext.vrScale : placement.vrScale;
+    // Always auto-fit (see _applyInitialPlacement) — the pose-relative pass
+    // only re-derives vrOrigin so the auto-fit dataset centers on where the
+    // user is actually looking on the first real frame.
+    const vrScale = placement.vrScale;
 
     vrContext.vrScale = vrScale;
+    vrContext.vrRotation = 0;
     vrContext.vrOrigin = [
       placement.center[0] - target[0] / vrScale,
       placement.center[1] - target[1] / vrScale,
@@ -1089,7 +1132,11 @@ class VRExplorationManager extends BaseManager {
       // cloned inputState with the offending trigger stripped, never mutating
       // the object _gatherInputState returned (other consumers below — pose
       // sync, avatars, pointer broadcast — still read the raw poses).
-      const menuResult = vrSpatialUI.update(inputState) || null;
+      const menuResult =
+        vrSpatialUI.update(inputState, {
+          vrScale: vrContext.vrScale,
+          vrOrigin: vrContext.vrOrigin,
+        }) || null;
       const menuHovering = !!menuResult?.hovering;
       const menuHand = menuResult?.hand || 'right';
       // A pinch used to place/aim an active tool must not ALSO aim teleport.
@@ -1126,8 +1173,11 @@ class VRExplorationManager extends BaseManager {
           this._inputProfileDetected = true;
           const allTransientPointer = seenControllers.every((c) => c.isTransientPointer === true);
           if (allTransientPointer && this.getNavigationMode() === EXPLORATION_MODES.FLY) {
-            log.info('Gripless input detected (Vision Pro) — switching default navigation to teleport');
-            this.setNavigationMode(EXPLORATION_MODES.TELEPORT);
+            // Safety net for any session still defaulting to FLY (inert for
+            // gripless input): fall back to GRAB — direct pinch-drag
+            // manipulation — not teleport, so the first pinch moves the data.
+            log.info('Gripless input detected (Vision Pro) — switching default navigation to grab');
+            this.setNavigationMode(EXPLORATION_MODES.GRAB);
           }
         }
       }
@@ -1140,6 +1190,12 @@ class VRExplorationManager extends BaseManager {
         // Apply navigation result to VR context
         if (navResult.vrScale !== null) {
           vrContext.vrScale = navResult.vrScale;
+        }
+        if (navResult.vrRotation != null) {
+          // Two-hand twist yaw. Applied to the data actor (turntable spin) by
+          // the handler each frame from vrContext.vrRotation — see
+          // VTKInstanceHandler._applyVRDataRotation.
+          vrContext.vrRotation = navResult.vrRotation;
         }
         if (navResult.position) {
           vrContext.vrOrigin = [
@@ -1438,10 +1494,23 @@ class VRExplorationManager extends BaseManager {
           const targetRayPose = frame.getPose(source.targetRaySpace, referenceSpace);
           if (!targetRayPose) continue;
 
-          const handedness =
+          // Resolve which hand slot this gripless source fills. visionOS often
+          // reports handedness "none" for pinch sources; assign it to whichever
+          // slot is still free so TWO simultaneous pinches populate both hands
+          // (required for the two-hand scale + twist gesture) rather than
+          // collapsing onto "right".
+          let handedness =
             source.handedness && source.handedness !== 'none'
               ? source.handedness
-              : 'right';
+              : null;
+          if (!handedness) {
+            handedness = !state.controllers.right
+              ? 'right'
+              : !state.controllers.left
+                ? 'left'
+                : null;
+            if (!handedness) continue; // both hands already filled
+          }
 
           // Don't overwrite a real tracked controller for the same hand
           if (state.controllers[handedness]) continue;

@@ -22,100 +22,150 @@ export class VRScaleController {
     this._isScaling = false;
     this._initialGripDistance = null;
     this._initialScale = null;
+    this._initialAngle = null;
+    this._initialRotation = null;
   }
 
   /**
-   * Update scale controller based on input
+   * True when a hand is "engaged" for the two-hand gesture: a pinch
+   * (triggerPressed) on Apple Vision Pro's gripless transient-pointer — whose
+   * squeezeValue is always 0 — or a grip squeeze on tracked controllers.
+   * @private
+   */
+  _isEngaged(controller) {
+    if (!controller) return false;
+    return (
+      controller.triggerPressed === true ||
+      (controller.squeezeValue || 0) > this._options.gripThreshold
+    );
+  }
+
+  /**
+   * Update scale + twist controller based on input.
+   *
+   * Two hands engaged simultaneously drives the "handlebar" gesture: the
+   * distance between the hands controls scale (spread apart = zoom out) and
+   * their relative heading controls yaw rotation (twist = spin the dataset on
+   * a turntable). Triggering on pinch (not squeeze) is what makes this work on
+   * Vision Pro, where squeezeValue is always 0.
    *
    * @param {Object} inputState - Controller input state
    * @param {number} deltaTime - Time since last frame
-   * @returns {Object} { scaling, newScale }
+   * @returns {Object} { scaling, newScale, rotating, newRotation }
    */
   update(inputState, deltaTime) {
     const leftController = inputState.controllers?.left;
     const rightController = inputState.controllers?.right;
 
-    // Check for two-hand grip
-    const leftGripping =
-      leftController?.squeezeValue > this._options.gripThreshold;
-    const rightGripping =
-      rightController?.squeezeValue > this._options.gripThreshold;
-
-    if (leftGripping && rightGripping) {
-      // Both hands gripping - scaling gesture
-      return this._handleScaleGesture(leftController, rightController);
+    if (this._isEngaged(leftController) && this._isEngaged(rightController)) {
+      return this._handleTwoHandGesture(leftController, rightController);
     } else if (this._isScaling) {
-      // Release scaling gesture
-      this._endScaleGesture();
+      this._endGesture();
     }
 
-    return { scaling: false, newScale: this._scale };
+    return { scaling: false, newScale: this._scale, rotating: false };
   }
 
   /**
-   * Handle active scale gesture
+   * Handle active two-hand scale + twist gesture.
    * @private
    */
-  _handleScaleGesture(leftController, rightController) {
+  _handleTwoHandGesture(leftController, rightController) {
     const leftPos = leftController.pose?.position;
     const rightPos = rightController.pose?.position;
 
     if (!leftPos || !rightPos) {
-      return { scaling: false, newScale: this._scale };
+      return { scaling: false, newScale: this._scale, rotating: false };
     }
 
-    // Calculate current distance between hands
     const currentDistance = this._calculateDistance(leftPos, rightPos);
+    // Heading of the hand-to-hand vector in the horizontal (XZ) plane — the
+    // "handlebar" angle. Twisting the wrists changes it and rotates the model.
+    const currentAngle = Math.atan2(
+      rightPos.x - leftPos.x,
+      rightPos.z - leftPos.z
+    );
 
     if (!this._isScaling) {
-      // Start scaling
-      this._startScaleGesture(currentDistance);
-      return { scaling: true, newScale: this._scale };
+      this._startGesture(currentDistance, currentAngle);
+      return {
+        scaling: true,
+        newScale: this._scale,
+        rotating: true,
+        newRotation: this._vrContext.vrRotation || 0,
+      };
     }
 
-    // Calculate scale change
+    // --- Scale from distance ratio (pulling apart zooms out) ---
     const distanceRatio = currentDistance / this._initialGripDistance;
-    const targetScale = this._initialScale / distanceRatio; // Inverse - pulling apart zooms out
-
-    // Apply sensitivity and smoothing
+    const targetScale = this._initialScale / distanceRatio;
     const scaledTarget =
       this._scale +
       (targetScale - this._scale) *
         this._options.scaleSensitivity *
         (1 - this._options.smoothing);
-
-    // Clamp to limits
     this._scale = Math.max(
       this._options.minScale,
       Math.min(this._options.maxScale, scaledTarget)
     );
-
-    // Update VR context
     this._vrContext.vrScale = this._scale;
 
-    return { scaling: true, newScale: this._scale };
+    // --- Yaw from the change in handlebar angle ---
+    // Flip the sign here if the twist feels reversed on-device.
+    const deltaAngle = this._normalizeAngle(currentAngle - this._initialAngle);
+    const newRotation = this._initialRotation + deltaAngle;
+    this._vrContext.vrRotation = newRotation;
+
+    return {
+      scaling: true,
+      newScale: this._scale,
+      rotating: true,
+      newRotation,
+    };
   }
 
   /**
-   * Start scale gesture
+   * Wrap an angle delta into (-π, π] so a twist never jumps a full turn.
    * @private
    */
-  _startScaleGesture(initialDistance) {
+  _normalizeAngle(a) {
+    let x = a;
+    while (x > Math.PI) x -= 2 * Math.PI;
+    while (x <= -Math.PI) x += 2 * Math.PI;
+    return x;
+  }
+
+  /**
+   * Start the two-hand gesture — anchor both the scale and rotation baselines.
+   * @private
+   */
+  _startGesture(initialDistance, initialAngle) {
     this._isScaling = true;
     this._initialGripDistance = initialDistance;
     this._initialScale = this._scale;
-    log.debug("Scale gesture started", { initialDistance, initialScale: this._scale });
+    this._initialAngle = initialAngle;
+    this._initialRotation = this._vrContext.vrRotation || 0;
+    log.debug("Two-hand gesture started", {
+      initialDistance,
+      initialScale: this._scale,
+      initialRotation: this._initialRotation,
+    });
   }
 
   /**
-   * End scale gesture
+   * End the two-hand gesture.
    * @private
    */
-  _endScaleGesture() {
+  _endGesture() {
     this._isScaling = false;
     this._initialGripDistance = null;
     this._initialScale = null;
-    log.debug("Scale gesture ended", { finalScale: this._scale });
+    this._initialAngle = null;
+    this._initialRotation = null;
+    log.debug("Two-hand gesture ended", {
+      finalScale: this._scale,
+      finalRotation: this._vrContext.vrRotation,
+    });
   }
 
   /**

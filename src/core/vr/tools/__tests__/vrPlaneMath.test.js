@@ -6,7 +6,19 @@ import {
   controllerForward,
   mapXRPointToData,
   quantizeNormalToAxis,
+  yawRotateVector,
+  buildYawPivotMatrix,
 } from "../vrPlaneMath.js";
+
+/** Apply a flat column-major 4x4 matrix (gl-matrix layout) to a point. */
+function applyMat4(m, p) {
+  const [x, y, z] = p;
+  return [
+    m[0] * x + m[4] * y + m[8] * z + m[12],
+    m[1] * x + m[5] * y + m[9] * z + m[13],
+    m[2] * x + m[6] * y + m[10] * z + m[14],
+  ];
+}
 
 const IDENTITY_Q = { x: 0, y: 0, z: 0, w: 1 };
 const Y90_Q = { x: 0, y: Math.SQRT1_2, z: 0, w: Math.SQRT1_2 };
@@ -52,6 +64,82 @@ describe("controllerForward", () => {
     expect(x).toBeCloseTo(0);
     expect(y).toBeCloseTo(0);
     expect(z).toBeCloseTo(-1);
+  });
+});
+
+describe("yawRotateVector", () => {
+  it("theta 0 returns the input", () => {
+    expect(yawRotateVector([1, 2, 3], 0)).toEqual([1, 2, 3]);
+  });
+
+  it("leaves the Y component untouched", () => {
+    const [, y] = yawRotateVector([1, 7, 0], Math.PI / 3);
+    expect(y).toBe(7);
+  });
+
+  it("+90° about Y sends +X toward +Z", () => {
+    const [x, , z] = yawRotateVector([1, 0, 0], Math.PI / 2);
+    expect(x).toBeCloseTo(0);
+    expect(z).toBeCloseTo(-1);
+  });
+
+  it("is invertible with the negated angle", () => {
+    const v = [0.3, -1.2, 0.7];
+    const round = yawRotateVector(yawRotateVector(v, 1.1), -1.1);
+    expect(round[0]).toBeCloseTo(v[0]);
+    expect(round[1]).toBeCloseTo(v[1]);
+    expect(round[2]).toBeCloseTo(v[2]);
+  });
+});
+
+describe("buildYawPivotMatrix", () => {
+  it("theta 0 is the identity matrix regardless of pivot", () => {
+    const m = buildYawPivotMatrix(0, [5, -3, 9]);
+    const identity = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+    for (let i = 0; i < 16; i++) {
+      expect(m[i]).toBeCloseTo(identity[i]);
+    }
+  });
+
+  it("defaults to a zero pivot", () => {
+    const m = buildYawPivotMatrix(Math.PI / 2);
+    const p = applyMat4(m, [1, 2, 3]);
+    const expected = yawRotateVector([1, 2, 3], Math.PI / 2);
+    expect(p[0]).toBeCloseTo(expected[0]);
+    expect(p[1]).toBeCloseTo(expected[1]);
+    expect(p[2]).toBeCloseTo(expected[2]);
+  });
+
+  it("transforming a point matches pivot + yawRotateVector(point - pivot, theta)", () => {
+    const pivot = [10, 4, -6];
+    const theta = 1.234;
+    const point = [12, 7, -2];
+    const m = buildYawPivotMatrix(theta, pivot);
+    const actual = applyMat4(m, point);
+
+    const relative = [point[0] - pivot[0], point[1] - pivot[1], point[2] - pivot[2]];
+    const rotated = yawRotateVector(relative, theta);
+    const expected = [rotated[0] + pivot[0], rotated[1] + pivot[1], rotated[2] + pivot[2]];
+
+    expect(actual[0]).toBeCloseTo(expected[0]);
+    expect(actual[1]).toBeCloseTo(expected[1]);
+    expect(actual[2]).toBeCloseTo(expected[2]);
+  });
+
+  it("leaves the pivot point itself fixed", () => {
+    const pivot = [3, -8, 2];
+    const m = buildYawPivotMatrix(0.7, pivot);
+    const p = applyMat4(m, pivot);
+    expect(p[0]).toBeCloseTo(pivot[0]);
+    expect(p[1]).toBeCloseTo(pivot[1]);
+    expect(p[2]).toBeCloseTo(pivot[2]);
+  });
+
+  it("does not move points along the Y axis relative to the pivot", () => {
+    const pivot = [1, 5, 1];
+    const m = buildYawPivotMatrix(0.9, pivot);
+    const p = applyMat4(m, [1, 50, 1]);
+    expect(p[1]).toBeCloseTo(50);
   });
 });
 

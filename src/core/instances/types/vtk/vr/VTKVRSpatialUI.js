@@ -88,6 +88,24 @@ export class VRSpatialUI {
     this._statusSource = null;
     this._statusActor = null;
     this._lastStatusText = null;
+    // XR→data affine (dataPos = xrPos/vrScale + vrOrigin). All panel geometry
+    // and hit-testing is computed in physical (XR) metres; these convert the
+    // final actor placements into the data-space renderer the VR camera draws,
+    // so the panel appears at a fixed physical size/distance regardless of how
+    // the dataset is zoomed. Mirrors VREnvironment's per-actor transform.
+    this._vrScale = 1.0;
+    this._vrOrigin = [0, 0, 0];
+  }
+
+  /**
+   * Map a physical (XR) point to the data-space coordinate the VR camera
+   * renders: dataPos = xrPos/vrScale + vrOrigin.
+   * @private
+   */
+  _toData(p) {
+    const s = this._vrScale || 1.0;
+    const o = this._vrOrigin || [0, 0, 0];
+    return [p[0] / s + o[0], p[1] / s + o[1], p[2] / s + o[2]];
   }
 
   /**
@@ -95,6 +113,13 @@ export class VRSpatialUI {
    * @param {object} manager  - VRExplorationManager (source of truth)
    */
   initialize(renderer, manager) {
+    // Idempotency guard: if a previous VR session's teardown ever failed to
+    // call dispose() (e.g. an earlier sub-manager's dispose() threw before
+    // leaveSession() reached this one), stale button/label actors would
+    // still be sitting in this same long-lived renderer. Disposing first
+    // guarantees at most one menu panel ever exists, self-healing any leak
+    // instead of stacking a duplicate set of "blue rectangles" on top.
+    if (this._renderer) this.dispose();
     this._renderer = renderer;
     this._model = new VRSpatialMenuModel(manager);
     this._model.onSessionStart();
@@ -200,8 +225,15 @@ export class VRSpatialUI {
    *   not visible / has no input — the frame loop treats that as "no menu
    *   interaction this frame".
    */
-  update(inputState) {
+  update(inputState, transform) {
     if (!this._model?.isVisible() || !inputState) return null;
+
+    // Latch the current XR→data transform so _layoutButtons/_layoutStatus can
+    // place the panel in the data-space renderer at a fixed physical size.
+    if (transform) {
+      this._vrScale = transform.vrScale || 1.0;
+      this._vrOrigin = transform.vrOrigin || [0, 0, 0];
+    }
 
     // Keep highlights aligned with the manager (tool may have changed via the
     // DOM menu, isolation via the B-button).
@@ -282,8 +314,11 @@ export class VRSpatialUI {
     const { center, right, up } = a;
 
     // Yaw the quads/labels so they face the same way the panel normal points
-    // (plane/text geometry natively faces +Z).
+    // (plane/text geometry natively faces +Z). The data-space renderer only
+    // scales + translates relative to physical space (no world rotation), so
+    // this yaw is unchanged; positions/sizes are converted below.
     const yawDeg = (Math.atan2(a.normal[0], a.normal[2]) * 180) / Math.PI;
+    const inv = 1 / (this._vrScale || 1.0);
 
     for (const { actor, region, labelActor } of this._buttonActors.values()) {
       // UV center → offset from panel center, in meters
@@ -292,13 +327,14 @@ export class VRSpatialUI {
       const cx = center[0] + right[0] * ou + up[0] * ov;
       const cy = center[1] + right[1] * ou + up[1] * ov;
       const cz = center[2] + right[2] * ou + up[2] * ov;
-      actor.setPosition(cx, cy, cz);
+      actor.setPosition(...this._toData([cx, cy, cz]));
       actor.setOrientation(0, yawDeg, 0);
 
-      // Scale unit plane to cell size (plane source spans [-0.5,0.5]).
+      // Scale unit plane to cell size (plane source spans [-0.5,0.5]), then by
+      // 1/vrScale so it renders at its authored physical size in data space.
       const w = (region.u1 - region.u0) * PANEL_WIDTH;
       const h = (region.v1 - region.v0) * PANEL_HEIGHT;
-      actor.setScale(w, h, 1);
+      actor.setScale(w * inv, h * inv, inv);
       actor.setVisibility(true);
 
       if (labelActor) {
@@ -308,12 +344,14 @@ export class VRSpatialUI {
         const s = LABEL_CHAR_HEIGHT;
         const halfTextW = 0.5 * region.label.length * s * LABEL_CHAR_ASPECT;
         labelActor.setPosition(
-          cx - right[0] * halfTextW + a.normal[0] * LABEL_LIFT,
-          cy - s * 0.5 + a.normal[1] * LABEL_LIFT,
-          cz - right[2] * halfTextW + a.normal[2] * LABEL_LIFT
+          ...this._toData([
+            cx - right[0] * halfTextW + a.normal[0] * LABEL_LIFT,
+            cy - s * 0.5 + a.normal[1] * LABEL_LIFT,
+            cz - right[2] * halfTextW + a.normal[2] * LABEL_LIFT,
+          ])
         );
         labelActor.setOrientation(0, yawDeg, 0);
-        labelActor.setScale(s, s, s);
+        labelActor.setScale(s * inv, s * inv, s * inv);
         labelActor.setVisibility(true);
       }
     }
@@ -352,13 +390,16 @@ export class VRSpatialUI {
     const cy = center[1] + up[1] * ov;
     const cz = center[2] + up[2] * ov;
 
+    const inv = 1 / (this._vrScale || 1.0);
     this._statusActor.setPosition(
-      cx - right[0] * halfTextW + a.normal[0] * LABEL_LIFT,
-      cy - s * 0.5 + a.normal[1] * LABEL_LIFT,
-      cz - right[2] * halfTextW + a.normal[2] * LABEL_LIFT
+      ...this._toData([
+        cx - right[0] * halfTextW + a.normal[0] * LABEL_LIFT,
+        cy - s * 0.5 + a.normal[1] * LABEL_LIFT,
+        cz - right[2] * halfTextW + a.normal[2] * LABEL_LIFT,
+      ])
     );
     this._statusActor.setOrientation(0, yawDeg, 0);
-    this._statusActor.setScale(s, s, s);
+    this._statusActor.setScale(s * inv, s * inv, s * inv);
     this._statusActor.setVisibility(true);
   }
 
