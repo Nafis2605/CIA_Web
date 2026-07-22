@@ -26,11 +26,13 @@ export const config = Object.freeze({
   // API & Server URLs
   // ---------------------------------------------------------------------------
 
-  /** Base URL for the API server */
+  /** Base URL for the API server. A relative path like "/api" is resolved
+   *  against the page origin at request/connect time (see resolveWsUrl.js for
+   *  the WebSocket case) — see the webpack devServer /api and /ws proxies. */
   apiBaseUrl: resolveValue(
     "apiBaseUrl",
     typeof __API_BASE_URL__ !== "undefined" ? __API_BASE_URL__ : undefined,
-    "http://localhost:3001/api"
+    "/api"
   ),
 
   /** WebSocket URL for Y.js collaboration server. A path like "/yjs-ws" is

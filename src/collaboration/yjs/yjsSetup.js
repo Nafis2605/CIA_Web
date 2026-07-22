@@ -33,6 +33,7 @@ import cameraSharePolicy from "@Core/session/cameraSharePolicy.js";
 import { authService } from "@Services/authService.js";
 import { getUserId } from "@Collaboration/presence/userManagement.js";
 import { sync as log } from "@Utils/logger.js";
+import { resolveWsUrl } from "@Utils/resolveWsUrl.js";
 
 // ============================================================================
 // Core Y.js Document and Awareness
@@ -100,24 +101,6 @@ async function waitForAccessToken() {
 }
 
 /**
- * Resolve a Y.js WebSocket URL. A path like "/yjs-ws" is turned into an
- * absolute same-origin URL (wss on HTTPS pages, ws on HTTP), so the socket
- * rides the same host/proxy/tunnel that served the page. Older visionOS
- * Safari does not resolve relative URLs in the WebSocket constructor, so
- * this must happen here rather than in y-websocket. Absolute ws:// / wss://
- * URLs pass through unchanged.
- * @param {string} url
- * @returns {string}
- */
-export function resolveYjsWsUrl(url) {
-  if (typeof url === "string" && url.startsWith("/")) {
-    const scheme = window.location.protocol === "https:" ? "wss://" : "ws://";
-    return `${scheme}${window.location.host}${url}`;
-  }
-  return url;
-}
-
-/**
  * Initialize the Y.js WebSocket provider
  * This must be called after sessionManager.initializeFromURL()
  */
@@ -128,7 +111,7 @@ export async function initializeYjsProvider() {
   }
 
   const roomId = sessionManager.getRoomId();
-  const wsUrl = resolveYjsWsUrl(clientConfig.yjsWebSocketUrl);
+  const wsUrl = resolveWsUrl(clientConfig.yjsWebSocketUrl);
   let token = null;
 
   try {

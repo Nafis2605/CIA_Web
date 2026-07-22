@@ -122,6 +122,21 @@ module.exports = {
         changeOrigin: true,
         secure: false,
       },
+      // Node.js API server's live broadcast WebSocket (annotations, view/camera
+      // state) — same-origin for the same reason as /yjs-ws above, so LAN/tunnel
+      // clients like Apple Vision Pro can reach it without a mixed-content block.
+      // Mounted at /app-ws (not /ws) because webpack-dev-server's own HMR socket
+      // already defaults to /ws — reusing that path would swallow this proxy.
+      // The backend's actual WebSocketServer still listens at /ws (unchanged);
+      // only the public dev-server mount point differs.
+      {
+        context: ["/app-ws"],
+        target: "http://localhost:3001",
+        ws: true,
+        changeOrigin: true,
+        secure: false,
+        pathRewrite: { "^/app-ws": "/ws" },
+      },
     ],
   },
   module: {
@@ -198,9 +213,7 @@ module.exports = {
       "process.env.NODE_ENV": JSON.stringify(
         process.env.NODE_ENV || "development"
       ),
-      __API_BASE_URL__: JSON.stringify(
-        process.env.API_BASE_URL || "http://localhost:3001/api"
-      ),
+      __API_BASE_URL__: JSON.stringify(process.env.API_BASE_URL || "/api"),
       __YJS_WS_URL__: JSON.stringify(
         process.env.YJS_WEBSOCKET_URL || "/yjs-ws"
       ),

@@ -4761,6 +4761,16 @@ console.log('Tools:', tools);
     gl.enable(gl.DEPTH_TEST);
     gl.depthFunc(gl.LEQUAL);
 
+    // vtk.js derives gl.viewport internally from the renderer's fractional
+    // viewport × the OpenGL render window size, so a manual gl.viewport()
+    // would just be overwritten. The render window must be sized to the FULL
+    // stereo framebuffer (not a per-eye sub-rectangle) — each eye's rectangle
+    // is expressed below as fractional (xmin, ymin, xmax, ymax) against that
+    // same full size. Sizing to the per-eye viewport instead corrupts vtk.js's
+    // fractional-to-pixel math for both eyes (they end up drawn into the wrong,
+    // overlapping region of the real XR framebuffer).
+    openGLRenderWindow.setSize(xrLayer.framebufferWidth, xrLayer.framebufferHeight);
+
     // Render for each eye (typically left and right).
     for (const view of pose.views) {
       const viewport = xrLayer.getViewport(view);
@@ -4768,11 +4778,6 @@ console.log('Tools:', tools);
       // Update camera from this eye's XR view (position + projection matrix).
       this._updateCameraFromVRPose(camera, view, vrScale, vrOrigin);
 
-      // vtk.js derives gl.viewport internally from the renderer's fractional
-      // viewport × the OpenGL render window size, so a manual gl.viewport()
-      // would just be overwritten. Size the render window to the eye viewport
-      // and express the eye rectangle as fractional (xmin, ymin, xmax, ymax).
-      openGLRenderWindow.setSize(viewport.width, viewport.height);
       renderer.setViewport(
         viewport.x / xrLayer.framebufferWidth,
         viewport.y / xrLayer.framebufferHeight,
