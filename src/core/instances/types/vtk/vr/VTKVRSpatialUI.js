@@ -14,10 +14,12 @@
 // never disagree.
 //
 // ANCHORING
-// The panel floats ~1.2 m in front of the head at a slight downward tilt so it
-// doesn't block the data. It re-anchors lazily: it only follows the head once
-// the head has drifted past a comfort threshold, so it feels world-stable while
-// you inspect but comes back when you turn to look for it.
+// The panel floats ~1.2 m in front of the head, dropped well below eye-line
+// and offset to one side so it reads as a chest-level/peripheral HUD instead
+// of sitting on the same forward ray as an auto-fit dataset (which would
+// otherwise visually block it). It re-anchors lazily: it only follows the
+// head once the head has drifted past a comfort threshold, so it feels
+// world-stable while you inspect but comes back when you turn to look for it.
 //
 // SELECTION
 //  - Controller ray: the target ray is intersected with the panel plane; a
@@ -36,35 +38,45 @@ import { VRSpatialMenuModel } from "@Core/vr/VRSpatialMenuModel.js";
 import vtkActor from "@kitware/vtk.js/Rendering/Core/Actor";
 import vtkMapper from "@kitware/vtk.js/Rendering/Core/Mapper";
 import vtkPlaneSource from "@kitware/vtk.js/Filters/Sources/PlaneSource";
-import vtkVectorText from "@kitware/vtk.js/Rendering/Core/VectorText";
+import vtkTexture from "@kitware/vtk.js/Rendering/Core/Texture";
+import vtkImageData from "@kitware/vtk.js/Common/DataModel/ImageData";
+import vtkDataArray from "@kitware/vtk.js/Common/Core/DataArray";
 
 // Physical panel size in meters (WebXR world units before vrScale). Height
 // covers three button rows (0.14m each, matching the original single-row
 // size) — bump by 0.14 if VR_MENU_BUTTONS ever grows another row.
 const PANEL_WIDTH = 0.6;
 const PANEL_HEIGHT = 0.42;
-// Distance in front of head, and downward tilt so it clears the dataset.
+// Distance in front of head. PANEL_DROP is deliberately generous (well below
+// PANEL_DISTANCE would put a straight-ahead dataset) and PANEL_SIDE_OFFSET
+// nudges the panel off the dead-center forward ray — together they keep the
+// panel from angularly overlapping an auto-fit dataset placed straight ahead
+// (that dataset centers ~2.0m out / ~1.4m below eye-line, per
+// VRExplorationManager._computeAutoPlacement — both panel and dataset used to
+// sit on the same ray, with the closer, less-dropped panel visually blocking
+// the object). Reads as a chest-level/peripheral HUD instead.
 const PANEL_DISTANCE = 1.2;
-const PANEL_DROP = 0.35; // how far below eye-line the panel center sits
+const PANEL_DROP = 0.55; // how far below eye-line the panel center sits
+const PANEL_SIDE_OFFSET = 0.28; // lateral offset (toward +right), meters
 // Lazy re-anchor: only chase the head after it drifts this far (meters).
 const REANCHOR_DISTANCE = 0.5;
 
 const COLOR_IDLE = [0.14, 0.16, 0.22];
 const COLOR_HOVER = [0.24, 0.42, 0.62];
 const COLOR_ACTIVE = [0.16, 0.52, 0.5];
-const COLOR_LABEL = [0.95, 0.96, 1.0];
-const COLOR_STATUS = [0.7, 0.76, 0.85];
+const COLOR_LABEL = "#f3f5ff"; // matches old COLOR_LABEL = [0.95, 0.96, 1.0]
+const COLOR_STATUS = "#b3c2d9"; // matches old COLOR_STATUS = [0.7, 0.76, 0.85]
 
-// Text labels (vtkVectorText): character height in meters, and how far the
-// text floats in front of its button quad so it never z-fights.
-const LABEL_CHAR_HEIGHT = 0.018;
-const LABEL_LIFT = 0.003;
-// vtkVectorText's glyphs are ~0.7 units wide per character at unit height;
-// used to approximate the text width for centering.
-const LABEL_CHAR_ASPECT = 0.7;
+// Text labels: rendered as canvas-texture billboards (see _createTextLabelActor),
+// not vtkVectorText — vtkVectorText requires an opentype.js-parsed font via
+// setFont(), which nothing in this codebase (or its dependencies; opentype.js
+// isn't even installed) ever supplies, so every vtkVectorText label silently
+// rendered as empty, invisible geometry. Canvas text has no such dependency.
+const BUTTON_LABEL_WORLD_HEIGHT = 0.03; // label height in meters, before vrScale
+const LABEL_LIFT = 0.003; // float above the button quad so it never z-fights
 
 // Status line: sits just above the panel's top edge.
-const STATUS_CHAR_HEIGHT = 0.02;
+const STATUS_WORLD_HEIGHT = 0.032;
 const STATUS_MARGIN = 0.03;
 
 /**
@@ -84,9 +96,15 @@ export class VRSpatialUI {
     this._lastSelectPressed = false;
     this._hoverButtonId = null;
     // Status line (dataset / scale / nav mode) — a single dynamic label kept
-    // separate from the static button labels since its text changes.
-    this._statusSource = null;
+    // separate from the static button labels since its text changes. Canvas/
+    // context/texture/plane are kept around so _redrawStatusLabel can update
+    // them in place instead of recreating the actor every text change.
+    this._statusCanvas = null;
+    this._statusCtx = null;
+    this._statusTexture = null;
+    this._statusPlaneSource = null;
     this._statusActor = null;
+    this._statusWorldWidth = 0;
     this._lastStatusText = null;
     // XR→data affine (dataPos = xrPos/vrScale + vrOrigin). All panel geometry
     // and hit-testing is computed in physical (XR) metres; these convert the
@@ -140,29 +158,56 @@ export class VRSpatialUI {
     if (!this._renderer || !this._model) return;
     for (const region of this._model.getButtonLayout()) {
       const actor = this._createButtonActor();
-      const label = this._createLabelActor(region.label);
-      this._buttonActors.set(region.id, { actor, region, labelActor: label });
+      const label = this._createTextLabelActor(
+        region.label,
+        BUTTON_LABEL_WORLD_HEIGHT,
+        COLOR_LABEL
+      );
+      this._buttonActors.set(region.id, { actor, region, labelActor: label?.actor ?? null });
       this._renderer.addActor(actor);
-      if (label) this._renderer.addActor(label);
+      if (label) this._renderer.addActor(label.actor);
     }
     this._buildStatusLabel();
   }
 
-  /** @private */
+  /**
+   * Status line actor: same canvas-texture technique as button labels, but
+   * its text changes at runtime, so the canvas/context/texture/plane are kept
+   * around (as instance fields) for _redrawStatusLabel to update in place.
+   * @private
+   */
   _buildStatusLabel() {
     try {
-      const source = vtkVectorText.newInstance();
-      source.setText("");
+      const canvas = document.createElement("canvas");
+      canvas.width = 1;
+      canvas.height = 1;
+      const ctx = canvas.getContext("2d");
+
+      const texture = vtkTexture.newInstance();
+      texture.setInterpolate(true);
+
+      const planeSource = vtkPlaneSource.newInstance({
+        origin: [0, 0, 0],
+        point1: [0, 0, 0],
+        point2: [0, 0, 0],
+      });
       const mapper = vtkMapper.newInstance();
-      mapper.setInputConnection(source.getOutputPort());
+      mapper.setInputConnection(planeSource.getOutputPort());
+
       const actor = vtkActor.newInstance();
       actor.setMapper(mapper);
-      actor.getProperty().setColor(...COLOR_STATUS);
+      actor.addTexture(texture);
+      actor.getProperty().setOpacity(1.0);
       actor.getProperty().setLighting(false);
       actor.setVisibility(false);
       actor.setPickable(false);
-      this._statusSource = source;
+
+      this._statusCanvas = canvas;
+      this._statusCtx = ctx;
+      this._statusTexture = texture;
+      this._statusPlaneSource = planeSource;
       this._statusActor = actor;
+      this._statusWorldWidth = 0;
       this._renderer.addActor(actor);
     } catch (err) {
       log.warn(`VR menu status label failed: ${err?.message}`);
@@ -187,27 +232,134 @@ export class VRSpatialUI {
   }
 
   /**
-   * 3D text label for a button (vtkVectorText polydata → actor). Returns null
-   * on failure — the button stays usable as an unlabeled quad.
+   * Canvas-texture text label — same technique as
+   * src/core/vr/avatars/AvatarLabel.js: draws crisp text via the Canvas 2D
+   * API into an offscreen canvas, uploads it as a vtkTexture on a plane
+   * authored directly at its final physical (metre) footprint, sized to the
+   * text's own measured aspect ratio (no stretching, no per-character-count
+   * estimate). The plane is centered on its own local origin, so callers just
+   * position it at the desired center point — see _layoutButtons/_layoutStatus.
+   *
+   * Returns null on failure or empty text — the button stays usable as an
+   * unlabeled quad.
+   *
+   * @param {string} text
+   * @param {number} worldHeight - label height in physical metres (before vrScale)
+   * @param {string} cssColor - text fill color
+   * @returns {{actor:object, worldWidth:number, worldHeight:number}|null}
    * @private
    */
-  _createLabelActor(text) {
+  _createTextLabelActor(text, worldHeight, cssColor) {
+    const str = text || "";
+    if (!str) return null;
     try {
-      const source = vtkVectorText.newInstance();
-      source.setText(text || "");
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d");
+      const pxHeight = 48;
+      const font = `600 ${Math.round(pxHeight * 0.6)}px Arial, sans-serif`;
+      ctx.font = font;
+      const measured = ctx.measureText(str).width;
+      const padding = pxHeight * 0.4;
+      canvas.width = Math.max(1, Math.ceil(measured + padding * 2));
+      canvas.height = pxHeight;
+      // Resizing the canvas resets its 2D context state — re-apply the font.
+      ctx.font = font;
+      ctx.fillStyle = cssColor;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillText(str, canvas.width / 2, canvas.height / 2 + 1);
+
+      const texture = vtkTexture.newInstance();
+      texture.setInterpolate(true);
+      this._uploadCanvasTexture(canvas, ctx, texture);
+
+      const worldWidth = worldHeight * (canvas.width / canvas.height);
+      const hw = worldWidth / 2;
+      const hh = worldHeight / 2;
+      const planeSource = vtkPlaneSource.newInstance({
+        origin: [-hw, -hh, 0],
+        point1: [hw, -hh, 0],
+        point2: [-hw, hh, 0],
+      });
       const mapper = vtkMapper.newInstance();
-      mapper.setInputConnection(source.getOutputPort());
+      mapper.setInputConnection(planeSource.getOutputPort());
+
       const actor = vtkActor.newInstance();
       actor.setMapper(mapper);
-      actor.getProperty().setColor(...COLOR_LABEL);
+      actor.addTexture(texture);
+      actor.getProperty().setOpacity(1.0);
       actor.getProperty().setLighting(false);
       actor.setVisibility(false);
       actor.setPickable(false);
-      return actor;
+      return { actor, worldWidth, worldHeight };
     } catch (err) {
-      log.warn(`VR menu label failed for "${text}": ${err?.message}`);
+      log.warn(`VR menu label failed for "${str}": ${err?.message}`);
       return null;
     }
+  }
+
+  /**
+   * Redraw the (dynamic) status canvas for new text, re-upload its texture,
+   * and resize its plane to match the new text's aspect ratio.
+   * @private
+   */
+  _redrawStatusLabel(text) {
+    const canvas = this._statusCanvas;
+    const ctx = this._statusCtx;
+    const pxHeight = 48;
+    const font = `500 ${Math.round(pxHeight * 0.56)}px Arial, sans-serif`;
+    ctx.font = font;
+    const measured = ctx.measureText(text).width;
+    const padding = pxHeight * 0.4;
+    canvas.width = Math.max(1, Math.ceil(measured + padding * 2));
+    canvas.height = pxHeight;
+    ctx.font = font; // re-apply after resize
+    ctx.fillStyle = COLOR_STATUS;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillText(text, canvas.width / 2, canvas.height / 2 + 1);
+    this._uploadCanvasTexture(canvas, ctx, this._statusTexture);
+
+    const worldHeight = STATUS_WORLD_HEIGHT;
+    const worldWidth = worldHeight * (canvas.width / canvas.height);
+    const hw = worldWidth / 2;
+    const hh = worldHeight / 2;
+    this._statusPlaneSource.setOrigin(-hw, -hh, 0);
+    this._statusPlaneSource.setPoint1(hw, -hh, 0);
+    this._statusPlaneSource.setPoint2(-hw, hh, 0);
+    this._statusWorldWidth = worldWidth;
+  }
+
+  /**
+   * Upload a 2D canvas's current pixels into a vtkTexture, flipped vertically
+   * (WebGL texture origin is bottom-left; canvas is top-left).
+   * @private
+   */
+  _uploadCanvasTexture(canvas, ctx, texture) {
+    const w = canvas.width;
+    const h = canvas.height;
+    const imgData = ctx.getImageData(0, 0, w, h);
+    const flipped = new Uint8Array(w * h * 4);
+    for (let row = 0; row < h; row++) {
+      const src = (h - 1 - row) * w * 4;
+      const dst = row * w * 4;
+      flipped.set(imgData.data.subarray(src, src + w * 4), dst);
+    }
+    const image = vtkImageData.newInstance();
+    image.setDimensions(w, h, 1);
+    image.setSpacing(1, 1, 1);
+    image.setOrigin(0, 0, 0);
+    const scalars = vtkDataArray.newInstance({
+      numberOfComponents: 4,
+      values: flipped,
+      dataType: "Uint8Array",
+    });
+    scalars.setName("scalars");
+    image.getPointData().setScalars(scalars);
+    texture.setInputData(image);
+    texture.modified();
   }
 
   // ===========================================================================
@@ -290,15 +442,19 @@ export class VRSpatialUI {
     fx /= flen;
     fz /= flen;
 
-    const center = [
-      headPos[0] + fx * PANEL_DISTANCE,
-      headPos[1] - PANEL_DROP,
-      headPos[2] + fz * PANEL_DISTANCE,
-    ];
     // Panel basis: right = fwd × worldUp, up = worldUp (kept upright for reading)
     const right = [fz, 0, -fx]; // horizontal, perpendicular to forward
     const up = [0, 1, 0];
     const normal = [-fx, 0, -fz]; // faces back toward the head
+
+    // Offset laterally (along `right`) in addition to the downward drop, so
+    // the panel sits off the dead-center forward ray instead of directly on
+    // top of it — see the PANEL_DROP/PANEL_SIDE_OFFSET comment above.
+    const center = [
+      headPos[0] + fx * PANEL_DISTANCE + right[0] * PANEL_SIDE_OFFSET,
+      headPos[1] - PANEL_DROP,
+      headPos[2] + fz * PANEL_DISTANCE + right[2] * PANEL_SIDE_OFFSET,
+    ];
 
     this._panelAnchor = { center, right, up, normal };
     this._lastHeadPos = headPos;
@@ -338,20 +494,19 @@ export class VRSpatialUI {
       actor.setVisibility(true);
 
       if (labelActor) {
-        // Center the text on the cell: vtkVectorText anchors at its left
-        // baseline, so back up by half the approximate text width and half a
-        // character height, then lift slightly off the quad along the normal.
-        const s = LABEL_CHAR_HEIGHT;
-        const halfTextW = 0.5 * region.label.length * s * LABEL_CHAR_ASPECT;
+        // The label plane is already centered on its own local origin and
+        // sized to the text's measured aspect ratio (see
+        // _createTextLabelActor), so it just needs to sit at the cell center,
+        // lifted slightly off the quad along the normal so it never z-fights.
         labelActor.setPosition(
           ...this._toData([
-            cx - right[0] * halfTextW + a.normal[0] * LABEL_LIFT,
-            cy - s * 0.5 + a.normal[1] * LABEL_LIFT,
-            cz - right[2] * halfTextW + a.normal[2] * LABEL_LIFT,
+            cx + a.normal[0] * LABEL_LIFT,
+            cy + a.normal[1] * LABEL_LIFT,
+            cz + a.normal[2] * LABEL_LIFT,
           ])
         );
         labelActor.setOrientation(0, yawDeg, 0);
-        labelActor.setScale(s * inv, s * inv, s * inv);
+        labelActor.setScale(inv, inv, inv);
         labelActor.setVisibility(true);
       }
     }
@@ -359,32 +514,30 @@ export class VRSpatialUI {
 
   /**
    * Position the dataset/scale/nav-mode status line just above the panel's
-   * top edge. Text is only re-set on vtkVectorText when it actually changes
-   * (dirty-checked) — rebuilding the glyph polydata every frame would be
+   * top edge. Text is only redrawn (canvas repaint + texture re-upload) when
+   * it actually changes (dirty-checked) — doing that every frame would be
    * wasteful for a value that's usually static between input events.
    * @private
    */
   _layoutStatus() {
     const a = this._panelAnchor;
-    if (!a || !this._statusActor || !this._statusSource) return;
+    if (!a || !this._statusActor) return;
 
     const text = this._model.getStatusLine();
     if (text !== this._lastStatusText) {
-      this._statusSource.setText(text);
       this._lastStatusText = text;
+      if (text) this._redrawStatusLabel(text);
     }
     if (!text) {
       this._statusActor.setVisibility(false);
       return;
     }
 
-    const { center, right, up } = a;
+    const { center, up } = a;
     const yawDeg = (Math.atan2(a.normal[0], a.normal[2]) * 180) / Math.PI;
 
-    const s = STATUS_CHAR_HEIGHT;
     const topEdgeOv = 0.5 * PANEL_HEIGHT;
-    const ov = topEdgeOv + STATUS_MARGIN + s * 0.5;
-    const halfTextW = 0.5 * text.length * s * LABEL_CHAR_ASPECT;
+    const ov = topEdgeOv + STATUS_MARGIN + STATUS_WORLD_HEIGHT * 0.5;
 
     const cx = center[0] + up[0] * ov;
     const cy = center[1] + up[1] * ov;
@@ -393,13 +546,13 @@ export class VRSpatialUI {
     const inv = 1 / (this._vrScale || 1.0);
     this._statusActor.setPosition(
       ...this._toData([
-        cx - right[0] * halfTextW + a.normal[0] * LABEL_LIFT,
-        cy - s * 0.5 + a.normal[1] * LABEL_LIFT,
-        cz - right[2] * halfTextW + a.normal[2] * LABEL_LIFT,
+        cx + a.normal[0] * LABEL_LIFT,
+        cy + a.normal[1] * LABEL_LIFT,
+        cz + a.normal[2] * LABEL_LIFT,
       ])
     );
     this._statusActor.setOrientation(0, yawDeg, 0);
-    this._statusActor.setScale(s * inv, s * inv, s * inv);
+    this._statusActor.setScale(inv, inv, inv);
     this._statusActor.setVisibility(true);
   }
 
@@ -516,8 +669,12 @@ export class VRSpatialUI {
     this._lastHeadPos = null;
     this._hoverButtonId = null;
     this._lastSelectPressed = false;
-    this._statusSource = null;
+    this._statusCanvas = null;
+    this._statusCtx = null;
+    this._statusTexture = null;
+    this._statusPlaneSource = null;
     this._statusActor = null;
+    this._statusWorldWidth = 0;
     this._lastStatusText = null;
     this._renderer = null;
     this._model = null;

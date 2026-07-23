@@ -168,7 +168,14 @@ class VRExplorationManager extends BaseManager {
       navigationMode: sessionConfig.explorationMode,
       scale: sessionConfig.vrScale,
       requiredFeatures: ['local-floor'],
-      optionalFeatures: ['bounded-floor', 'hand-tracking', 'layers'],
+      // NOTE: do NOT request 'layers'. The renderer draws exclusively through
+      // the legacy XRWebGLLayer set as baseLayer (VRManager._setupWebGLLayer).
+      // Browsers that support the WebXR Layers API (e.g. Oculus/Meta Quest)
+      // would grant 'layers', and the spec then forbids setting baseLayer in
+      // updateRenderState() — throwing "Can't use baseLayer with layers feature
+      // requested" and blocking VR entry. We never use the Layers API, so
+      // requesting it gains nothing and only breaks capable headsets.
+      optionalFeatures: ['bounded-floor', 'hand-tracking'],
     });
     const xrSession = vrManager.getSession();
 

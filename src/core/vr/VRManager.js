@@ -116,11 +116,12 @@ class VRManager extends BaseManager {
       const features = ["immersive-vr"];
 
       // These checks would need actual session to verify, so we just list potential
+      // (omits 'layers' — the renderer uses XRWebGLLayer baseLayer only, and
+      // requesting the Layers API breaks VR entry on headsets that support it)
       const potentialFeatures = [
         "local-floor",
         "bounded-floor",
         "hand-tracking",
-        "layers",
       ];
 
       return {
@@ -176,7 +177,11 @@ class VRManager extends BaseManager {
           : ["local-floor"],
         optionalFeatures: Array.isArray(options.optionalFeatures)
           ? options.optionalFeatures
-          : ["bounded-floor", "hand-tracking", "layers"],
+          // NOTE: never default to 'layers' — the renderer uses XRWebGLLayer
+          // baseLayer only (see _setupWebGLLayer). Headsets that support the
+          // WebXR Layers API (Meta Quest) would grant it, and the spec then
+          // rejects baseLayer in updateRenderState(), breaking VR entry.
+          : ["bounded-floor", "hand-tracking"],
       };
 
       this._sessionConfig = {
