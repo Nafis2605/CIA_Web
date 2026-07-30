@@ -776,6 +776,21 @@ class VRExplorationManager extends BaseManager {
   }
 
   /**
+   * Cycle the clip plane's axis constraint (free -> X -> Y -> Z). Backs the
+   * contextual "Axis" button, which is the only way to get an exactly
+   * axis-aligned cut on Vision Pro — free-aiming a plane by hand with no grip
+   * to brace against is not precise.
+   * @returns {string|null} the new axis lock, or null when free
+   */
+  cycleClipAxis() {
+    const tool = this._toolManager?.getActiveTool?.();
+    if (tool?.id !== 'clip' || typeof tool.cycleAxisLock !== 'function') return null;
+    const action = tool.cycleAxisLock();
+    if (action) this._handleToolAction(action);
+    return tool.getAxisLock?.() ?? null;
+  }
+
+  /**
    * Reset the active Clip tool's plane. Same routing as invertClipPlane().
    * Invoked by the spatial menu's contextual "Reset" button.
    */

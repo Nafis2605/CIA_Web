@@ -621,7 +621,11 @@ describe("VRSpatialMenuModel — contextual row", () => {
     // renders directly above TOOLS — next to the tool whose options it holds.
     const minStaticRow = Math.min(...VR_MENU_BUTTONS.map((b) => b.row));
     const contextualRow = layout.filter((r) => r.row === minStaticRow - 1);
-    expect(contextualRow.map((b) => b.id).sort()).toEqual(["clip-invert", "clip-reset"]);
+    // Derived, not hardcoded — the point is that the row matches the declared
+    // set for this tool, whatever that set grows into.
+    expect(contextualRow.map((b) => b.id).sort()).toEqual(
+      clipContextual.map((b) => b.id).sort()
+    );
   });
 
   it("annotate's contextual row is Mode + Label; probe's is Continuous + Clear", () => {
@@ -636,8 +640,9 @@ describe("VRSpatialMenuModel — contextual row", () => {
   });
 
   it("contextual row disappears when the tool deactivates, and its buttons become unhittable", () => {
+    const clipCount = VR_MENU_CONTEXTUAL_BUTTONS.filter((b) => b.contextTool === "clip").length;
     model.activate("clip");
-    expect(model.getButtonLayout()).toHaveLength(VR_MENU_BUTTONS.length + 2);
+    expect(model.getButtonLayout()).toHaveLength(VR_MENU_BUTTONS.length + clipCount);
 
     model.activate("clip"); // toggle off
     expect(model.getButtonLayout()).toHaveLength(VR_MENU_BUTTONS.length);

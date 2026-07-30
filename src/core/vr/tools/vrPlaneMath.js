@@ -180,3 +180,59 @@ export function quantizeNormalToAxis(normal) {
   vector[axis] = sign;
   return { axis, sign, vector };
 }
+
+/**
+ * Build a column-major (gl-matrix layout) 4x4 that maps the local +Z axis onto
+ * `normal` and translates to `origin`.
+ *
+ * Used to orient the clip tool's visible plane quad, which is authored in the
+ * local XY plane (so its own normal is +Z). Applied via actor.setUserMatrix for
+ * the same reason _applyVRDataRotation uses UserMatrix: it wraps outermost, is
+ * identity-safe, and requires no knowledge of the actor's own transform.
+ *
+ * The tangent basis is arbitrary about the normal — only the plane's
+ * orientation is meaningful, not its in-plane rotation — so the reference axis
+ * is picked as whichever of +X/+Y is least parallel to the normal, avoiding a
+ * degenerate cross product.
+ *
+ * @param {number[]} origin - [x,y,z] in data space
+ * @param {number[]} normal - [x,y,z]; need not be unit length
+ * @returns {number[]|null} 16-element column-major matrix, or null if `normal`
+ *   is degenerate (zero-length or non-finite)
+ */
+export function buildPlaneFrameMatrix(origin, normal) {
+  const o = Array.isArray(origin) ? origin : [0, 0, 0];
+  if (!Array.isArray(normal) || normal.length < 3) return null;
+
+  const len = Math.hypot(normal[0], normal[1], normal[2]);
+  if (!Number.isFinite(len) || len < 1e-9) return null;
+  const n = [normal[0] / len, normal[1] / len, normal[2] / len];
+
+  // Least-parallel reference axis keeps the cross product well-conditioned.
+  const ref = Math.abs(n[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+
+  // tangent = normalize(ref x n)
+  let t = [
+    ref[1] * n[2] - ref[2] * n[1],
+    ref[2] * n[0] - ref[0] * n[2],
+    ref[0] * n[1] - ref[1] * n[0],
+  ];
+  const tLen = Math.hypot(t[0], t[1], t[2]);
+  if (!Number.isFinite(tLen) || tLen < 1e-9) return null;
+  t = [t[0] / tLen, t[1] / tLen, t[2] / tLen];
+
+  // bitangent = n x tangent (already unit: both operands are unit and normal)
+  const b = [
+    n[1] * t[2] - n[2] * t[1],
+    n[2] * t[0] - n[0] * t[2],
+    n[0] * t[1] - n[1] * t[0],
+  ];
+
+  // Columns are the images of local X, Y, Z; translation lives at 12..14.
+  return [
+    t[0], t[1], t[2], 0,
+    b[0], b[1], b[2], 0,
+    n[0], n[1], n[2], 0,
+    o[0] || 0, o[1] || 0, o[2] || 0, 1,
+  ];
+}

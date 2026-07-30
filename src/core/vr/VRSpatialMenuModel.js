@@ -196,6 +196,9 @@ export const VR_MENU_CONTEXTUAL_BUTTONS = Object.freeze([
   // undoing everything. Undo still pops one point at a time.
   { id: "measure-new-path", label: "New Path", icon: "plus", kind: "measure-new-path", contextTool: "measure", group: "TOOLS" },
   { id: "clip-invert", label: "Invert", icon: "flipHorizontal", kind: "clip-invert", contextTool: "clip", group: "TOOLS" },
+  // Snap the cut to a principal axis. Matters most on Vision Pro, where there
+  // is no grip to brace against while free-aiming a plane by hand.
+  { id: "clip-axis", label: "Axis", icon: "axis3d", kind: "clip-axis", contextTool: "clip", group: "TOOLS" },
   { id: "clip-reset", label: "Reset", icon: "restore", kind: "clip-reset", contextTool: "clip", group: "TOOLS" },
   { id: "annotation-mode", label: "Mode", icon: "penTool", kind: "annotation-mode", contextTool: "annotate", group: "TOOLS" },
   // Cycles the annotate tool's pending preset label — the only VR text-entry
@@ -458,6 +461,8 @@ export class VRSpatialMenuModel {
         return this._resetValue();
       case "measure-new-path":
         return this._measureNewPath();
+      case "clip-axis":
+        return this._cycleClipAxis();
       case "clip-invert":
         return this._invertClipPlane();
       case "clip-reset":
@@ -672,6 +677,12 @@ export class VRSpatialMenuModel {
   _resetValue() {
     const value = this._call("resetValue");
     return { handled: true, action: "value-reset", value: value ?? null };
+  }
+
+  /** Cycle the clip plane's axis constraint (free -> X -> Y -> Z). @private */
+  _cycleClipAxis() {
+    const axis = this._call("cycleClipAxis");
+    return { handled: true, action: "clip-axis-changed", axis: axis ?? null };
   }
 
   /** Archive the active measurement path and start a fresh one. @private */

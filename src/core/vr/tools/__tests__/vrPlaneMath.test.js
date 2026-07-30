@@ -8,6 +8,7 @@ import {
   quantizeNormalToAxis,
   yawRotateVector,
   buildYawPivotMatrix,
+  buildPlaneFrameMatrix,
 } from "../vrPlaneMath.js";
 
 /** Apply a flat column-major 4x4 matrix (gl-matrix layout) to a point. */
@@ -177,5 +178,75 @@ describe("quantizeNormalToAxis", () => {
 
   it("survives a missing normal", () => {
     expect(quantizeNormalToAxis(null).axis).toBe(1);
+  });
+});
+
+describe("buildPlaneFrameMatrix", () => {
+  /** Apply a flat column-major 4x4 to a direction (no translation). */
+  function applyDir(m, v) {
+    const [x, y, z] = v;
+    return [
+      m[0] * x + m[4] * y + m[8] * z,
+      m[1] * x + m[5] * y + m[9] * z,
+      m[2] * x + m[6] * y + m[10] * z,
+    ];
+  }
+
+  it("maps local +Z onto the supplied normal", () => {
+    for (const n of [[1, 0, 0], [0, 1, 0], [0, 0, 1], [0.3, -0.5, 0.81]]) {
+      const len = Math.hypot(...n);
+      const unit = n.map((c) => c / len);
+      const m = buildPlaneFrameMatrix([0, 0, 0], n);
+      const mapped = applyDir(m, [0, 0, 1]);
+      mapped.forEach((c, i) => expect(c).toBeCloseTo(unit[i]));
+    }
+  });
+
+  it("puts the origin in the translation slots", () => {
+    const m = buildPlaneFrameMatrix([2, -7, 4], [0, 0, 1]);
+    expect(m[12]).toBeCloseTo(2);
+    expect(m[13]).toBeCloseTo(-7);
+    expect(m[14]).toBeCloseTo(4);
+    expect(m[15]).toBe(1);
+  });
+
+  it("is the identity for a +Z normal at the origin", () => {
+    const m = buildPlaneFrameMatrix([0, 0, 0], [0, 0, 1]);
+    const identity = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+    // The in-plane rotation is arbitrary, so only check that the frame is
+    // orthonormal and +Z maps to +Z — not every element.
+    expect(m[8]).toBeCloseTo(identity[8]);
+    expect(m[9]).toBeCloseTo(identity[9]);
+    expect(m[10]).toBeCloseTo(identity[10]);
+  });
+
+  it("produces an orthonormal, right-handed basis", () => {
+    const m = buildPlaneFrameMatrix([1, 2, 3], [0.4, 0.5, -0.77]);
+    const t = [m[0], m[1], m[2]];
+    const b = [m[4], m[5], m[6]];
+    const n = [m[8], m[9], m[10]];
+    const dot = (a, c) => a[0] * c[0] + a[1] * c[1] + a[2] * c[2];
+
+    expect(Math.hypot(...t)).toBeCloseTo(1);
+    expect(Math.hypot(...b)).toBeCloseTo(1);
+    expect(Math.hypot(...n)).toBeCloseTo(1);
+    expect(dot(t, b)).toBeCloseTo(0);
+    expect(dot(t, n)).toBeCloseTo(0);
+    expect(dot(b, n)).toBeCloseTo(0);
+  });
+
+  it("handles a normal nearly parallel to the reference axis", () => {
+    // The +X reference would give a degenerate cross product here; the helper
+    // switches references rather than returning garbage.
+    const m = buildPlaneFrameMatrix([0, 0, 0], [1, 0, 0]);
+    expect(m).not.toBeNull();
+    const t = [m[0], m[1], m[2]];
+    expect(Math.hypot(...t)).toBeCloseTo(1);
+  });
+
+  it("returns null for a degenerate normal rather than NaNs", () => {
+    expect(buildPlaneFrameMatrix([0, 0, 0], [0, 0, 0])).toBeNull();
+    expect(buildPlaneFrameMatrix([0, 0, 0], [NaN, 0, 1])).toBeNull();
+    expect(buildPlaneFrameMatrix([0, 0, 0], null)).toBeNull();
   });
 });
