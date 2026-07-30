@@ -65,7 +65,7 @@ describe("VRMeasureTool — measurement rendering", () => {
     return tool.handleInput(makeInputState({ triggerPressed: true }), {});
   }
 
-  it("adds line + endpoint + label actors once two points are placed", () => {
+  it("builds a point marker, a segment line and a distance label for a pair", () => {
     const startAction = placeStart();
     expect(startAction).toMatchObject({ type: "measurement-start-placed" });
 
@@ -75,39 +75,185 @@ describe("VRMeasureTool — measurement rendering", () => {
 
     tool.render(renderer);
 
-    // start sphere, end sphere, line, label = 4 actors added
-    expect(renderer.addActor).toHaveBeenCalledTimes(4);
-    expect(renderer.actors.length).toBe(4);
-    // The line actor is visible once both points exist.
-    expect(tool._lineActor.getVisibility()).toBe(true);
+    expect(tool.getPoints().length).toBe(2);
+    expect(tool.getMeasurements().length).toBe(1);
+    expect(tool._segmentActors[0].actor.getVisibility()).toBe(true);
+    expect(tool._segmentActors[0].label.getText()).toContain("5.000");
   });
 
-  it("only shows the start sphere while the end point is still pending", () => {
+  it("shows only the point marker while the segment is still open", () => {
     placeStart();
     tool.render(renderer);
 
-    expect(tool._startActor.getVisibility()).toBe(true);
-    expect(tool._lineActor.getVisibility()).toBe(false);
-    expect(tool._endActor.getVisibility()).toBe(false);
+    expect(tool._pointActors.length).toBe(1);
+    expect(tool._pointActors[0].getVisibility()).toBe(true);
+    expect(tool._segmentActors.length).toBe(0);
   });
 
-  it("removes all measurement actors on deactivate (reset)", async () => {
+  it("removes every actor on deactivate (shared renderer — a leak breaks desktop)", async () => {
     placeStart();
     placeEnd();
     tool.render(renderer);
-    expect(renderer.actors.length).toBe(4);
+    expect(renderer.actors.length).toBeGreaterThan(0);
 
     await tool.deactivate();
-    expect(renderer.removeActor).toHaveBeenCalledTimes(4);
+
     expect(renderer.actors.length).toBe(0);
-    expect(tool._lineActor).toBeNull();
+    expect(tool._pointActors.length).toBe(0);
+    expect(tool._segmentActors.length).toBe(0);
+    expect(tool._totalLabel).toBeNull();
   });
 
-  it("scales endpoint spheres for constant apparent size (base / vrScale)", () => {
+  it("scales point markers for constant apparent size (base / vrScale)", () => {
     placeStart();
     placeEnd();
     tool.render(renderer);
     // ENDPOINT_APPARENT_RADIUS_M (0.012) / vrScale (2) = 0.006
-    expect(tool._startActor.getScale()[0]).toBeCloseTo(0.006);
+    expect(tool._pointActors[0].getScale()[0]).toBeCloseTo(0.006);
+  });
+});
+
+describe("VRMeasureTool — chained polyline", () => {
+  let tool;
+  let renderer;
+
+  /** Raycast that walks a fixed list of points, one per trigger pull. */
+  function makeToolAt(points) {
+    const t = new VRMeasureTool();
+    let i = 0;
+    const raycastVR = vi.fn(() => ({ position: points[Math.min(i, points.length - 1)] }));
+    t.activate({ handler: { raycastVR }, vrContext: { vrScale: 1 } });
+    t._advance = () => { i += 1; };
+    return t;
+  }
+
+  function tap(t) {
+    t._lastTriggerState = false;
+    const r = t.handleInput(makeInputState({ triggerPressed: true }), {});
+    t._advance();
+    return r;
+  }
+
+  beforeEach(() => {
+    renderer = makeSpyRenderer();
+    // A path along +X: 0 -> 1 -> 3 -> 6, i.e. segments of 1, 2 and 3.
+    tool = makeToolAt([
+      { x: 0, y: 0, z: 0 },
+      { x: 1, y: 0, z: 0 },
+      { x: 3, y: 0, z: 0 },
+      { x: 6, y: 0, z: 0 },
+    ]);
+  });
+
+  it("continues from the previous point instead of starting a fresh pair", () => {
+    tap(tool); // 0
+    tap(tool); // 1  -> segment 0->1
+    tap(tool); // 3  -> segment 1->3
+
+    const segs = tool.getMeasurements();
+    expect(segs.length).toBe(2);
+    // The crux of chaining: segment 2 STARTS where segment 1 ended.
+    expect(segs[1].startPoint).toMatchObject(segs[0].endPoint);
+    expect(segs[0].distance).toBeCloseTo(1);
+    expect(segs[1].distance).toBeCloseTo(2);
+  });
+
+  it("reports a running total across every segment", () => {
+    tap(tool); tap(tool); tap(tool); tap(tool);
+
+    expect(tool.getMeasurements().length).toBe(3);
+    expect(tool.getTotal()).toBeCloseTo(6); // 1 + 2 + 3
+  });
+
+  it("shows the total only once there is more than one segment", () => {
+    tap(tool); tap(tool);
+    tool.render(renderer);
+    expect(tool._totalLabel.getActor().getVisibility()).toBe(false);
+
+    tap(tool);
+    tool.render(renderer);
+    expect(tool._totalLabel.getActor().getVisibility()).toBe(true);
+    expect(tool._totalLabel.getText()).toContain("3.000");
+  });
+
+  it("undo pops ONE point and returns the segment it removed", () => {
+    tap(tool); tap(tool); tap(tool);
+    expect(tool.getPoints().length).toBe(3);
+
+    const undone = tool.undoLast();
+    expect(undone).toMatchObject({ type: "measurement-removed" });
+    expect(undone.data.distance).toBeCloseTo(2);
+    expect(tool.getPoints().length).toBe(2);
+    expect(tool.getMeasurements().length).toBe(1);
+  });
+
+  it("undo of a lone start point cancels rather than removing a segment", () => {
+    tap(tool);
+    expect(tool.undoLast()).toMatchObject({ type: "measurement-cancelled" });
+    expect(tool.getPoints().length).toBe(0);
+  });
+
+  it("undo on an empty path is a no-op", () => {
+    expect(tool.undoLast()).toBeNull();
+  });
+
+  it("releases actors as the path shrinks", () => {
+    tap(tool); tap(tool); tap(tool);
+    tool.render(renderer);
+    const peak = renderer.actors.length;
+
+    tool.undoLast();
+    tool.render(renderer);
+
+    expect(renderer.actors.length).toBeLessThan(peak);
+    expect(tool._pointActors.length).toBe(2);
+    expect(tool._segmentActors.length).toBe(1);
+  });
+
+  it("newPath archives the current path and starts clean", () => {
+    tap(tool); tap(tool); tap(tool);
+
+    const done = tool.newPath();
+    expect(done).toMatchObject({ type: "measurement-path-completed" });
+    expect(done.data.segments.length).toBe(2);
+    expect(done.data.total).toBeCloseTo(3);
+
+    expect(tool.getPoints().length).toBe(0);
+    expect(tool.getMeasurements().length).toBe(0);
+    expect(tool.getPaths().length).toBe(1);
+  });
+
+  it("newPath on an empty path is a no-op", () => {
+    expect(tool.newPath()).toBeNull();
+  });
+
+  it("emits a payload shaped for _persistVRMeasurement, unchanged by chaining", () => {
+    tap(tool);
+    const action = tap(tool);
+
+    // VRExplorationManager._persistVRMeasurement reads exactly these fields,
+    // which is why chaining needed no persistence changes.
+    expect(action.data).toMatchObject({
+      id: expect.any(String),
+      startPoint: { x: 0, y: 0, z: 0 },
+      endPoint: { x: 1, y: 0, z: 0 },
+      unit: "units",
+    });
+    expect(action.data.distance).toBeCloseTo(1);
+  });
+
+  it("does NOT emit a preview action every frame", () => {
+    // The old tool returned a `measurement-preview` action per frame — a
+    // dispatch and a log line at 90 Hz that no handler consumed.
+    tap(tool);
+    for (let i = 0; i < 6; i++) {
+      const r = tool.handleInput(makeInputState({ triggerPressed: false }), {});
+      expect(r).toBeNull();
+    }
+  });
+
+  it("caps the path length rather than growing actors without bound", () => {
+    for (let i = 0; i < 70; i++) tap(tool);
+    expect(tool.getPoints().length).toBeLessThanOrEqual(64);
   });
 });

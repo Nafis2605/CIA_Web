@@ -599,11 +599,16 @@ describe("VRSpatialMenuModel — contextual row", () => {
     model = new VRSpatialMenuModel(manager);
   });
 
-  it("adds no extra buttons when no tool, or a tool without contextual buttons (measure), is active", () => {
+  it("adds no extra buttons when no tool is active", () => {
     expect(model.getButtonLayout()).toHaveLength(VR_MENU_BUTTONS.length);
+  });
 
+  it("gives measure a New Path button, since measuring is now a chained path", () => {
+    // Undo pops one point at a time, so without this the only way to start a
+    // disconnected measurement would be to undo every point first.
     model.activate("measure");
-    expect(model.getButtonLayout()).toHaveLength(VR_MENU_BUTTONS.length);
+    const ids = model.getButtonLayout().map((b) => b.id);
+    expect(ids).toContain("measure-new-path");
   });
 
   it("appends exactly the matching tool's contextual buttons as one extra row above TOOLS", () => {

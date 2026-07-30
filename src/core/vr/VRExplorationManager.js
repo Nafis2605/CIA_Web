@@ -721,6 +721,21 @@ class VRExplorationManager extends BaseManager {
     return true;
   }
 
+  /**
+   * Archive the active measurement path and begin a disconnected one. Backs the
+   * measure tool's contextual "New Path" button — without it, the only way to
+   * start measuring elsewhere would be to undo every point first.
+   * @returns {object|null} the archived path, or null if nothing was drawn
+   */
+  startNewMeasurementPath() {
+    const tool = this._toolManager?.getActiveTool?.();
+    if (tool?.id !== 'measure' || typeof tool.newPath !== 'function') return null;
+    const action = tool.newPath();
+    if (!action) return null;
+    this._handleToolAction(action);
+    return action.data ?? null;
+  }
+
   getAvailableTools() {
     return this._toolManager?.getAvailableTools() || [];
   }
@@ -2171,12 +2186,28 @@ class VRExplorationManager extends BaseManager {
         this._emit('annotationRemoved', action.data);
         this._deletePersistedVRAnnotation(action.data);
         break;
+      case 'measurement-start-placed':
+        // First point of a chained path — nothing to persist until it closes
+        // a segment, but observers want to know a measurement has begun.
+        this._emit('measurementStartPlaced', action.data);
+        break;
       case 'measurement-created':
         this._emit('measurementCreated', action.data);
         this._persistVRMeasurement(action.data);
         break;
       case 'measurement-removed':
         this._emit('measurementRemoved', action.data);
+        // Undo must also remove the SERVER-side annotation, or an undone
+        // segment reappears for everyone else (and on reload). Works unchanged
+        // for measurements: same annotation store, keyed on the serverId that
+        // _persistVRMeasurement back-fills onto this same object.
+        this._deletePersistedVRAnnotation(action.data);
+        break;
+      case 'measurement-cancelled':
+        this._emit('measurementCancelled', action.data ?? null);
+        break;
+      case 'measurement-path-completed':
+        this._emit('measurementPathCompleted', action.data);
         break;
       case 'probe-created':
         // Probe results are intentionally session-local (transient inspection).
@@ -2192,6 +2223,13 @@ class VRExplorationManager extends BaseManager {
             : null;
           if (config) this._pushVisualizationPatch({ clipBox: config });
         }
+        break;
+      default:
+        // Session-local tool feedback (probe-*, clip-grab-start, ...). Emitted
+        // for observers; nothing persisted. A default arm exists so a newly
+        // added action type can never again be silently swallowed — several
+        // were, which is how tools appeared to half-work.
+        this._emit('toolAction', action);
         break;
     }
   }

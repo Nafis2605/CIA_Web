@@ -191,6 +191,10 @@ export const VR_MENU_GROUPS = Object.freeze([
  * @type {ReadonlyArray<{id:string,label:string,icon:string,kind:string,contextTool:string}>}
  */
 export const VR_MENU_CONTEXTUAL_BUTTONS = Object.freeze([
+  // Measure builds a CHAINED path: each pick continues from the last. "New
+  // Path" is how you start a disconnected measurement somewhere else without
+  // undoing everything. Undo still pops one point at a time.
+  { id: "measure-new-path", label: "New Path", icon: "plus", kind: "measure-new-path", contextTool: "measure", group: "TOOLS" },
   { id: "clip-invert", label: "Invert", icon: "flipHorizontal", kind: "clip-invert", contextTool: "clip", group: "TOOLS" },
   { id: "clip-reset", label: "Reset", icon: "restore", kind: "clip-reset", contextTool: "clip", group: "TOOLS" },
   { id: "annotation-mode", label: "Mode", icon: "penTool", kind: "annotation-mode", contextTool: "annotate", group: "TOOLS" },
@@ -452,6 +456,8 @@ export class VRSpatialMenuModel {
         return this._nudgeValue(btn.steps);
       case "value-reset":
         return this._resetValue();
+      case "measure-new-path":
+        return this._measureNewPath();
       case "clip-invert":
         return this._invertClipPlane();
       case "clip-reset":
@@ -666,6 +672,12 @@ export class VRSpatialMenuModel {
   _resetValue() {
     const value = this._call("resetValue");
     return { handled: true, action: "value-reset", value: value ?? null };
+  }
+
+  /** Archive the active measurement path and start a fresh one. @private */
+  _measureNewPath() {
+    const path = this._call("startNewMeasurementPath");
+    return { handled: true, action: "measure-new-path", path: path ?? null };
   }
 
   /** Toggles glyphs via the same desktop VTKGlyphFeature (VRExplorationManager.toggleGlyphs). */
@@ -1113,7 +1125,10 @@ export class VRSpatialMenuModel {
       const toolHints = {
         clip: "Grip+drag to aim, A to invert, B to reset",
         annotate: "Trigger to place, thumbstick to change type, A to undo",
-        measure: "Trigger to place start/end, B or Undo to cancel",
+        // Chained: each pick continues the path from the last point. No
+        // B-button reference — Vision Pro has no A/B, so Undo/New Path on the
+        // menu are the only controls guaranteed on both headsets.
+        measure: "Trigger to add points · Undo removes the last one",
         probe: "Trigger to probe, A for continuous, B to clear, thumbstick to browse history",
       };
       return toolHints[this._activeToolId] || "";
