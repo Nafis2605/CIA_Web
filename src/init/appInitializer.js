@@ -646,6 +646,13 @@ export async function initializePhase2() {
             "@Services/voice/voiceCommandHandlers.js"
           );
           initializeVoiceCommandHandlers();
+
+          // Bridge voice speaking-state -> avatar pulse / presence, and keep
+          // voice audio alive across VR enter/exit.
+          const { initializeVoiceAvatarBridge } = await import(
+            "@Services/voice/voiceAvatarBridge.js"
+          );
+          initializeVoiceAvatarBridge();
         },
         "warn"
       );

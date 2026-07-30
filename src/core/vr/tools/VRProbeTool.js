@@ -377,6 +377,38 @@ export class VRProbeTool extends VRToolInterface {
   }
 
   /**
+   * Drop the most recent probe sample. Implements the optional `undoLast` hook
+   * that VRExplorationManager.undoLastToolAction() calls, so the menu's global
+   * Undo button does something real while the probe tool is active (it used to
+   * be a silent no-op here — only the annotate and measure tools implemented
+   * it). The readout falls back to the previous sample, or clears if none.
+   *
+   * Returns an ACTION object (not a boolean) because
+   * VRExplorationManager.undoLastToolAction() treats the return value as a tool
+   * action and routes it through _handleToolAction. Probe results are
+   * intentionally session-local, so the action carries no persistence payload.
+   *
+   * @returns {{type:string,data:object}|null} probe-updated action, or null if
+   *   there was nothing left to undo.
+   */
+  undoLast() {
+    if (!this._probeHistory.length) {
+      // Nothing recorded, but a live single-shot readout may still be showing.
+      if (this._currentProbe) {
+        this._currentProbe = null;
+        this._clearVisuals();
+        return { type: 'probe-updated', data: { remaining: 0 } };
+      }
+      return null;
+    }
+
+    this._probeHistory.pop();
+    this._currentProbe = this._probeHistory[this._probeHistory.length - 1] || null;
+    if (!this._currentProbe) this._clearVisuals();
+    return { type: 'probe-updated', data: { remaining: this._probeHistory.length } };
+  }
+
+  /**
    * Export probe history for analysis
    */
   exportHistory() {

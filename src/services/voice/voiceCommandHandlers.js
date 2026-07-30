@@ -7,7 +7,7 @@
 import { app as log } from "@Utils/logger.js";
 import { workspaceManager } from "@Core/instances/workspaceManager.js";
 import { vrExplorationManager } from "@Core/vr/VRExplorationManager.js";
-import { voiceRoomService } from "@Services/voice/voiceRoomService.js";
+import { voiceRoomService, getVoiceRoomName } from "@Services/voice/voiceRoomService.js";
 import { annotationManager } from "@Core/data/managers/AnnotationManager.js";
 import { instanceTools } from "@Core/instances/types/vtk/vtkInstanceTools.js";
 
@@ -434,8 +434,9 @@ async function handleVoiceRoomCommand(name, params) {
     }
 
     case "join": {
-      // Get current room from session or use default
-      const roomName = params.roomName || "main";
+      // Derive from the collaboration session so voice commands join the same
+      // room as the voice bar / Voice tab (params.roomName is an optional channel).
+      const roomName = getVoiceRoomName(params.roomName);
       await voiceRoomService.joinRoom(roomName);
       showFeedback("Joined voice channel");
       break;

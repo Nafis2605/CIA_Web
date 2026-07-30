@@ -33,53 +33,116 @@ import { vr as log } from "@Utils/logger.js";
 /**
  * Button descriptors, left→right within each row, rows bottom→top. `kind`
  * drives dispatch:
- *   - "tool":           toggles a VR tool (annotate/measure/clip) via the manager
- *   - "action":         a one-shot command (undo)
- *   - "toggle":         a stateful toggle (isolation/grid) reflected from manager
- *   - "nav-mode":       cycles the locomotion mode (fly/teleport/walk)
- *   - "nav-mode-set":   toggles a specific locomotion mode on/off (grab)
- *   - "scale":          jumps to a fixed vrScale preset
- *   - "representation": cycles surface→wireframe→points (same as desktop menu)
- *   - "glyph-toggle":   toggles vector/scalar glyphs (same as desktop menu)
- *   - "exit":           leave the VR session
- * @type {ReadonlyArray<{id:string,label:string,icon:string,kind:string,toolId?:string,scaleValue?:number,row:number}>}
+ *   - "tool":              toggles a VR tool (annotate/measure/clip/probe) via the manager
+ *   - "action":            a one-shot command (undo)
+ *   - "toggle":            a stateful toggle (isolation/grid) reflected from manager
+ *   - "nav-mode":          cycles the locomotion mode (fly/teleport/walk)
+ *   - "nav-mode-set":      toggles a specific locomotion mode on/off (grab/walk)
+ *   - "scale":             jumps to a fixed vrScale preset
+ *   - "representation":    cycles surface→wireframe→points (same as desktop menu)
+ *   - "glyph-toggle":      toggles vector/scalar glyphs (same as desktop menu)
+ *   - "snapshot-save":     quick-saves a session snapshot
+ *   - "snapshot-load":     cycles to the next saved snapshot and loads it
+ *   - "voice-mute":        toggles the local participant's voice mute state
+ *   - "voice-join":        joins/leaves the session's voice room
+ *   - "toggle-visibility": hides the panel (local UI chrome, no manager call)
+ *   - "exit":              leave the VR session
+ * @type {ReadonlyArray<{id:string,label:string,icon:string,kind:string,toolId?:string,scaleValue?:number,mode?:string,row:number}>}
  */
 export const VR_MENU_BUTTONS = Object.freeze([
-  // Row 0 (bottom): tools, undo, isolation, grid, exit. annotate stays first
-  // and exit stays last (VTKVRSpatialUI and tests rely on that ordering).
-  { id: "annotate", label: "Annotate", icon: "edit", kind: "tool", toolId: "annotate", row: 0 },
-  { id: "measure", label: "Measure", icon: "ruler", kind: "tool", toolId: "measure", row: 0 },
-  { id: "clip", label: "Clip", icon: "crop", kind: "tool", toolId: "clip", row: 0 },
-  { id: "undo", label: "Undo", icon: "rotateCcw", kind: "action", row: 0 },
-  { id: "isolation", label: "Isolate", icon: "expand", kind: "toggle", row: 0 },
-  { id: "grid", label: "Grid", icon: "layoutGrid", kind: "toggle", row: 0 },
-  { id: "exit", label: "Exit VR", icon: "doorOpen", kind: "exit", row: 0 },
-  // Row 1 (above row 0): locomotion mode, scale presets, and appearance
-  // controls (representation cycle + glyph toggle — the same desktop
-  // implementations, so VR and desktop stay consistent). scaleValue matches
-  // VRScaleController's corrected preset numbers (small=overview, large=detail).
-  { id: "nav-mode", label: "Nav", icon: "compass", kind: "nav-mode", row: 1 },
-  // Toggles "grab" locomotion (pinch-and-drag to pull the data closer / push it
-  // away). Tapping again while active drops back to teleport.
-  { id: "move", label: "Move", icon: "move", kind: "nav-mode-set", mode: "grab", row: 1 },
-  { id: "scale-overview", label: "Overview", icon: "minimize", kind: "scale", scaleValue: 0.1, row: 1 },
-  { id: "scale-normal", label: "Normal", icon: "square", kind: "scale", scaleValue: 1.0, row: 1 },
-  { id: "scale-detail", label: "Detail", icon: "maximize", kind: "scale", scaleValue: 10.0, row: 1 },
-  { id: "representation", label: "Style", icon: "cube", kind: "representation", row: 1 },
-  { id: "glyphs", label: "Glyphs", icon: "arrowUpRight", kind: "glyph-toggle", row: 1 },
-  // Row 2 (top): collaborators + annotation label. Collaborators cycle
-  // through other session participants rather than a full per-user list
-  // (keeps the fixed-cell UV grid simple) — every tap still does something
-  // real, just "next collaborator" instead of "this specific collaborator".
-  { id: "goto-participant", label: "Go To", icon: "target", kind: "goto-participant", row: 2 },
-  { id: "follow-participant", label: "Follow", icon: "user", kind: "follow-participant", row: 2 },
-  // Cycles the annotate tool's pending preset label — the only VR
-  // text-entry mechanism (see ANNOTATION_LABEL_PRESETS in VRAnnotationTool.js).
-  { id: "annotation-label", label: "Label", icon: "tag", kind: "annotation-label", row: 2 },
+  // ---- Row 0 — TOOLS: create / measure / inspect on the data ---------------
+  // annotate stays first (VTKVRSpatialUI/tests rely on row 0 starting with it).
+  { id: "annotate", label: "Annotate", icon: "edit", kind: "tool", toolId: "annotate", row: 0, group: "TOOLS" },
+  { id: "measure", label: "Measure", icon: "ruler", kind: "tool", toolId: "measure", row: 0, group: "TOOLS" },
+  { id: "clip", label: "Clip", icon: "crop", kind: "tool", toolId: "clip", row: 0, group: "TOOLS" },
+  { id: "probe", label: "Probe", icon: "crosshair", kind: "tool", toolId: "probe", row: 0, group: "TOOLS" },
+  { id: "undo", label: "Undo", icon: "rotateCcw", kind: "action", row: 0, group: "TOOLS" },
+
+  // ---- Row 1 — MOVE: locomotion + object manipulation ----------------------
+  // These are mutually exclusive modes. The selected mode decides what the
+  // TRIGGER does; grip always pulls the world and the left stick always moves
+  // (see VRNavigationController.update's layered model).
+  { id: "nav-mode", label: "Nav", icon: "compass", kind: "nav-mode", row: 1, group: "MOVE" },
+  // "grab": trigger stays free (tools/menu); grip pulls the world.
+  { id: "move", label: "Move", icon: "move", kind: "nav-mode-set", mode: "grab", row: 1, group: "MOVE" },
+  // "move-object": trigger drags the ACTIVE dataset's transform for every
+  // collaborator (shared), not just the local view.
+  { id: "move-object", label: "Move Obj", icon: "transform", kind: "nav-mode-set", mode: "move-object", row: 1, group: "MOVE" },
+  { id: "walk", label: "Walk", icon: "footprints", kind: "nav-mode-set", mode: "walk", row: 1, group: "MOVE" },
+  // "teleport": trigger aims the arc and commits on release.
+  { id: "teleport", label: "Teleport", icon: "zap", kind: "nav-mode-set", mode: "teleport", row: 1, group: "MOVE" },
+
+  // ---- Row 2 — VIEW: scale + appearance ------------------------------------
+  // scaleValue matches VRScaleController's preset numbers (small=overview,
+  // large=detail); representation/glyphs reuse the desktop implementations so
+  // VR and desktop stay consistent.
+  { id: "scale-overview", label: "Overview", icon: "minimize", kind: "scale", scaleValue: 0.1, row: 2, group: "VIEW" },
+  { id: "scale-normal", label: "Normal", icon: "square", kind: "scale", scaleValue: 1.0, row: 2, group: "VIEW" },
+  { id: "scale-detail", label: "Detail", icon: "maximize", kind: "scale", scaleValue: 10.0, row: 2, group: "VIEW" },
+  { id: "representation", label: "Style", icon: "cube", kind: "representation", row: 2, group: "VIEW" },
+  { id: "glyphs", label: "Glyphs", icon: "arrowUpRight", kind: "glyph-toggle", row: 2, group: "VIEW" },
+
+  // ---- Row 3 — SCENE: what is shown, and saving/restoring it ---------------
+  { id: "isolation", label: "Isolate", icon: "fullscreen", kind: "toggle", row: 3, group: "SCENE" },
+  { id: "grid", label: "Grid", icon: "layoutGrid", kind: "toggle", row: 3, group: "SCENE" },
+  { id: "snapshot-save", label: "Save", icon: "save", kind: "snapshot-save", row: 3, group: "SCENE" },
+  { id: "snapshot-load", label: "Load", icon: "folderOpen", kind: "snapshot-load", row: 3, group: "SCENE" },
+  { id: "hide-menu", label: "Hide", icon: "eyeOff", kind: "toggle-visibility", row: 3, group: "SCENE" },
+
+  // ---- Row 4 — SESSION: other people, voice, and leaving -------------------
+  // Go To/Follow cycle through other session participants rather than a full
+  // per-user list (keeps the fixed-cell UV grid simple) — every tap still does
+  // something real, just "next collaborator" instead of "this specific one".
+  // exit stays last (VTKVRSpatialUI/tests rely on the last row ending with it).
+  { id: "goto-participant", label: "Go To", icon: "target", kind: "goto-participant", row: 4, group: "SESSION" },
+  { id: "follow-participant", label: "Follow", icon: "user", kind: "follow-participant", row: 4, group: "SESSION" },
+  { id: "voice-join", label: "Voice", icon: "headsetMic", kind: "voice-join", row: 4, group: "SESSION" },
+  { id: "voice-mute", label: "Mute", icon: "mic", kind: "voice-mute", row: 4, group: "SESSION" },
+  { id: "exit", label: "Exit VR", icon: "doorOpen", kind: "exit", row: 4, group: "SESSION" },
+]);
+
+/**
+ * Ordered activity groups, one per static row (top → bottom). Drives the
+ * per-group card border accent and the row labels drawn on the backing panel
+ * (see VTKVRSpatialUI), so the grouping is visible in-headset rather than only
+ * implied by position.
+ * @type {ReadonlyArray<string>}
+ */
+export const VR_MENU_GROUPS = Object.freeze([
+  "TOOLS",
+  "MOVE",
+  "VIEW",
+  "SCENE",
+  "SESSION",
+]);
+
+/**
+ * Contextual buttons: only appear (as an extra row above the static rows)
+ * while the matching tool (`contextTool`) is active. Measure gets no entry —
+ * the global "Undo" button already cancels an in-progress measurement or
+ * removes the last completed one (see VRMeasureTool.undoLast), so a redundant
+ * Cancel button would just duplicate it.
+ * @type {ReadonlyArray<{id:string,label:string,icon:string,kind:string,contextTool:string}>}
+ */
+export const VR_MENU_CONTEXTUAL_BUTTONS = Object.freeze([
+  { id: "clip-invert", label: "Invert", icon: "flipHorizontal", kind: "clip-invert", contextTool: "clip", group: "TOOLS" },
+  { id: "clip-reset", label: "Reset", icon: "restore", kind: "clip-reset", contextTool: "clip", group: "TOOLS" },
+  { id: "annotation-mode", label: "Mode", icon: "penTool", kind: "annotation-mode", contextTool: "annotate", group: "TOOLS" },
+  // Cycles the annotate tool's pending preset label — the only VR text-entry
+  // mechanism (see ANNOTATION_LABEL_PRESETS in VRAnnotationTool.js). Contextual
+  // rather than static: it is meaningless unless the annotate tool is active,
+  // and moving it here freed its grid slot for the Teleport mode button.
+  { id: "annotation-label", label: "Label", icon: "tag", kind: "annotation-label", contextTool: "annotate", group: "TOOLS" },
+  { id: "probe-continuous", label: "Continuous", icon: "sync", kind: "probe-continuous", contextTool: "probe", group: "TOOLS" },
+  { id: "probe-clear", label: "Clear", icon: "trash", kind: "probe-clear", contextTool: "probe", group: "TOOLS" },
 ]);
 
 // Fraction of each cell's width/height left as inner padding (per side).
 const CELL_PADDING = 0.06;
+
+// How long a local tool tap is trusted over the manager's reported active tool.
+// Covers the async activate/deactivate round-trip (see syncFromManager).
+const TOOL_SYNC_HOLD_MS = 250;
 
 /**
  * VRSpatialMenuModel
@@ -100,6 +163,13 @@ export class VRSpatialMenuModel {
     // Cycle position through getOtherParticipants() for the Go To/Follow
     // buttons — see _pickNextParticipant.
     this._participantCycleIndex = -1;
+    // Cycle position through getSessionSnapshots() for the Load button — see
+    // _loadNextSnapshot. Same "cycle to next X" pattern as participants.
+    this._snapshotCycleIndex = -1;
+    // Timestamp of the last local tool tap, so syncFromManager() can briefly
+    // trust the optimistic _activeToolId over the manager's lagging async
+    // getActiveTool(). Null when there is no tap to honour.
+    this._toolTapAtMs = null;
   }
 
   // ===========================================================================
@@ -114,13 +184,34 @@ export class VRSpatialMenuModel {
    * (avoids ambiguous hits). With a single row this reduces to exactly the
    * original one-row layout.
    *
+   * When a tool with contextual buttons (VR_MENU_CONTEXTUAL_BUTTONS) is
+   * active, its buttons are appended as one extra row above the static rows
+   * — so the panel grows by exactly one row while a contextual tool is
+   * active, and shrinks back the moment it deactivates.
+   *
    * @returns {Array<{id:string,label:string,icon:string,kind:string,
    *   toolId?:string, row:number, u0:number,u1:number,v0:number,v1:number,
    *   cu:number,cv:number}>} cu/cv = cell center (for placing labels/icons)
    */
   getButtonLayout() {
+    const contextual = VR_MENU_CONTEXTUAL_BUTTONS.filter(
+      (b) => b.contextTool === this._activeToolId
+    );
+    let allButtons = VR_MENU_BUTTONS;
+    if (contextual.length) {
+      // Row -1 sorts before every static row, and with the top-down v mapping
+      // below that renders it as a strip ABOVE the TOOLS row — right next to
+      // the tool whose options it holds, rather than stranded at the far
+      // bottom of the panel.
+      const minStaticRow = Math.min(...VR_MENU_BUTTONS.map((b) => b.row ?? 0));
+      allButtons = [
+        ...VR_MENU_BUTTONS,
+        ...contextual.map((b) => ({ ...b, row: minStaticRow - 1 })),
+      ];
+    }
+
     const rows = new Map();
-    for (const btn of VR_MENU_BUTTONS) {
+    for (const btn of allButtons) {
       const rowId = btn.row ?? 0;
       if (!rows.has(rowId)) rows.set(rowId, []);
       rows.get(rowId).push(btn);
@@ -135,7 +226,11 @@ export class VRSpatialMenuModel {
       const cellW = 1 / n;
       const padU = cellW * CELL_PADDING;
       const padV = rowH * CELL_PADDING;
-      const vBase = rowIndex * rowH;
+      // v runs along +up, so the LAST row index must sit at v=0 for the FIRST
+      // declared row to render at the TOP. Without this inversion the panel
+      // read bottom-up (tools at the floor, session controls at eye level),
+      // the opposite of the declaration order and of how the groups read.
+      const vBase = (rowIds.length - 1 - rowIndex) * rowH;
 
       buttons.forEach((btn, i) => {
         const u0 = i * cellW + padU;
@@ -200,7 +295,11 @@ export class VRSpatialMenuModel {
    *   isolated?:boolean}}
    */
   activate(buttonId) {
-    const btn = VR_MENU_BUTTONS.find((b) => b.id === buttonId);
+    // Look up against the CURRENT layout (static + active-contextual), not the
+    // frozen static constant, so contextual buttons are dispatchable while
+    // their tool is active, and a stale id from a since-deactivated tool
+    // safely falls through to the "unknown button" no-op below.
+    const btn = this.getButtonLayout().find((b) => b.id === buttonId);
     if (!btn) {
       log.warn(`VRSpatialMenu: unknown button "${buttonId}"`);
       return { handled: false };
@@ -230,6 +329,26 @@ export class VRSpatialMenuModel {
         return this._cycleRepresentation();
       case "glyph-toggle":
         return this._toggleGlyphs();
+      case "clip-invert":
+        return this._invertClipPlane();
+      case "clip-reset":
+        return this._resetClipPlane();
+      case "annotation-mode":
+        return this._cycleAnnotationMode();
+      case "probe-continuous":
+        return this._toggleProbeContinuous();
+      case "probe-clear":
+        return this._clearProbeHistory();
+      case "snapshot-save":
+        return this._saveSnapshot();
+      case "snapshot-load":
+        return this._loadNextSnapshot();
+      case "voice-mute":
+        return this._toggleVoiceMute();
+      case "voice-join":
+        return this._toggleVoiceConnection();
+      case "toggle-visibility":
+        return this._hideMenu();
       case "exit":
         return this._exit();
       default:
@@ -247,15 +366,19 @@ export class VRSpatialMenuModel {
   }
 
   /**
-   * Toggles a specific locomotion mode (grab). Tapping the Move button when
-   * grab is already active drops back to teleport, so the one button both
-   * enters and leaves "pull the data around" mode. Uses the same
-   * VRExplorationManager.setNavigationMode the launch modal's dropdown drives.
+   * Toggles a specific locomotion mode (grab / move-object / walk / teleport).
+   * Tapping the button of the ALREADY-active mode drops back to "fly" — the
+   * neutral default where the left stick flies, grip pulls the world, and the
+   * trigger stays free for tools and the menu. (It used to fall back to
+   * "teleport", which silently parked the user in a mode whose trigger is
+   * captured by teleport aiming; teleport is now its own explicit button.)
+   * Uses the same VRExplorationManager.setNavigationMode the launch modal's
+   * dropdown drives.
    * @private
    */
   _setNavMode(mode) {
     const current = this._call("getNavigationMode");
-    const next = current === mode ? "teleport" : mode;
+    const next = current === mode ? "fly" : mode;
     this._call("setNavigationMode", next);
     return { handled: true, action: "nav-mode-set", mode: next };
   }
@@ -327,9 +450,108 @@ export class VRSpatialMenuModel {
     return { handled: true, action: "glyphs-toggled", enabled };
   }
 
+  /** Inverts the active Clip tool's plane direction (VRExplorationManager.invertClipPlane). */
+  _invertClipPlane() {
+    this._call("invertClipPlane");
+    return { handled: true, action: "clip-inverted" };
+  }
+
+  /** Resets the active Clip tool's plane (VRExplorationManager.resetClipPlane). */
+  _resetClipPlane() {
+    this._call("resetClipPlane");
+    return { handled: true, action: "clip-reset" };
+  }
+
+  /** Cycles the active Annotate tool's placement mode: marker → text → drawing. */
+  _cycleAnnotationMode() {
+    const mode = this._call("cycleAnnotationMode");
+    return { handled: true, action: "annotation-mode-changed", mode: mode ?? null };
+  }
+
+  /** Toggles the active Probe tool's continuous-sampling mode. */
+  _toggleProbeContinuous() {
+    const enabled = !!this._call("toggleProbeContinuous");
+    return { handled: true, action: "probe-continuous-toggled", enabled };
+  }
+
+  /** Clears the active Probe tool's sample history. */
+  _clearProbeHistory() {
+    this._call("clearProbeHistory");
+    return { handled: true, action: "probe-history-cleared" };
+  }
+
+  /**
+   * Quick-saves a VR session snapshot (VRExplorationManager.createSnapshot).
+   * Fire-and-forget like _exit() — createSnapshot is async, but dispatch must
+   * return synchronously.
+   * @private
+   */
+  _saveSnapshot() {
+    try {
+      const r = this._call("createSnapshot");
+      if (r && typeof r.catch === "function") {
+        r.catch((err) => log.warn("VR snapshot save failed:", err?.message));
+      }
+    } catch (err) {
+      log.warn("VR snapshot save threw:", err?.message);
+    }
+    return { handled: true, action: "snapshot-saved" };
+  }
+
+  /**
+   * Cycles to the next saved session snapshot and loads it — mirrors
+   * _pickNextParticipant's "cycle to next X" pattern since there's no
+   * per-item picker UI in VR.
+   * @private
+   */
+  _loadNextSnapshot() {
+    const snapshots = this._call("getSessionSnapshots") || [];
+    if (!snapshots.length) {
+      return { handled: true, action: "snapshot-load", ok: false, reason: "no-snapshots" };
+    }
+    this._snapshotCycleIndex = (this._snapshotCycleIndex + 1) % snapshots.length;
+    const snap = snapshots[this._snapshotCycleIndex];
+    try {
+      const r = this._call("loadSnapshot", snap?.id);
+      if (r && typeof r.catch === "function") {
+        r.catch((err) => log.warn("VR snapshot load failed:", err?.message));
+      }
+    } catch (err) {
+      log.warn("VR snapshot load threw:", err?.message);
+    }
+    return { handled: true, action: "snapshot-load", snapshotId: snap?.id ?? null, ok: true };
+  }
+
+  /** Toggles the local participant's voice mute state (voiceRoomService via manager). */
+  _toggleVoiceMute() {
+    const muted = !!this._call("toggleVoiceMute");
+    return { handled: true, action: "voice-mute-toggled", muted };
+  }
+
+  /** Joins or leaves the session's voice room (voiceRoomService via manager). */
+  _toggleVoiceConnection() {
+    const connected = !!this._call("toggleVoiceConnection");
+    return { handled: true, action: "voice-connection-toggled", connected };
+  }
+
+  /**
+   * Hides the panel. Local UI chrome, NOT manager state — unlike every other
+   * button, this does not go through this._call(). VTKVRSpatialUI shows a
+   * tiny always-on "reshow tab" (using the same hit-test machinery as the
+   * full panel) to bring it back; see VTKVRSpatialUI._updateReshowTab.
+   * @private
+   */
+  _hideMenu() {
+    this._visible = false;
+    return { handled: true, action: "menu-hidden" };
+  }
+
   _activateTool(toolId) {
     // Toggle semantics: tapping the already-active tool turns it off, so the
     // user can drop back to plain navigation without a separate "none" button.
+    // Stamp the tap so syncFromManager() honours this optimistic value while
+    // the manager's async tool switch settles (see TOOL_SYNC_HOLD_MS).
+    this._toolTapAtMs = Date.now();
     if (this._activeToolId === toolId) {
       this._call("deactivateTool");
       this._activeToolId = null;
@@ -360,6 +582,7 @@ export class VRSpatialMenuModel {
   }
 
   _toggleGrid() {
+    const wasEnabled = this._gridEnabled;
     let enabled = this._gridEnabled;
     if (typeof this._manager?.toggleGridMode === "function") {
       // toggleGridMode returns the new enabled state (true/false)
@@ -368,6 +591,20 @@ export class VRSpatialMenuModel {
       enabled = !this._gridEnabled;
     }
     this._gridEnabled = !!enabled;
+
+    // Asking to turn the grid ON and still getting `false` back means there was
+    // nothing to show — the grid renders OTHER open VTK views, so with a single
+    // dataset open it silently did nothing. Report why, the same way
+    // snapshot-load and goto-participant do, so the hint line can say so
+    // instead of the button just refusing to light.
+    if (!wasEnabled && !this._gridEnabled) {
+      return {
+        handled: true,
+        action: "grid-toggled",
+        gridEnabled: false,
+        reason: "no-other-views",
+      };
+    }
     return { handled: true, action: "grid-toggled", gridEnabled: this._gridEnabled };
   }
 
@@ -415,10 +652,24 @@ export class VRSpatialMenuModel {
     this._isolated = false;
     this._gridEnabled = false;
     this._participantCycleIndex = -1;
+    this._snapshotCycleIndex = -1;
+    this._toolTapAtMs = null;
     return this._visible;
   }
 
   isVisible() {
+    return this._visible;
+  }
+
+  /**
+   * Manually show/hide the panel (the "Hide" button / reshow tab). Distinct
+   * from onSessionStart/onSessionEnd's lifecycle-driven visibility — a manual
+   * hide does not persist across sessions; onSessionStart always resets to
+   * visible, which is the simplest, least-surprising default.
+   * @param {boolean} visible
+   */
+  setVisible(visible) {
+    this._visible = !!visible;
     return this._visible;
   }
 
@@ -433,9 +684,24 @@ export class VRSpatialMenuModel {
    * time; missing manager methods are treated as "nothing active".
    */
   syncFromManager() {
-    const active = this._manager?.getActiveTool?.();
-    // getActiveTool() returns a tool instance (with .id) or null/undefined.
-    this._activeToolId = active?.id ?? null;
+    // Optimistic-hold window. VRExplorationManager.activateTool() drives the
+    // ASYNC VRToolManager.activateTool without awaiting it (the old tool's
+    // deactivate() is awaited first), so getActiveTool() keeps reporting the
+    // PREVIOUS tool for a frame or more after a tap. Since this runs every
+    // frame, it used to stomp the optimistic _activeToolId set on tap and then
+    // flip back once the promise settled — visibly flickering the highlight and
+    // tearing down/rebuilding the contextual row's actors on every tool press.
+    // Within the window we trust the local tap; after it, the manager wins.
+    const holding =
+      this._toolTapAtMs != null &&
+      Date.now() - this._toolTapAtMs < TOOL_SYNC_HOLD_MS;
+
+    if (!holding) {
+      const active = this._manager?.getActiveTool?.();
+      // getActiveTool() returns a tool instance (with .id) or null/undefined.
+      this._activeToolId = active?.id ?? null;
+      this._toolTapAtMs = null;
+    }
 
     if (typeof this._manager?.isIsolated === "function") {
       this._isolated = !!this._manager.isIsolated();
@@ -461,21 +727,43 @@ export class VRSpatialMenuModel {
   /**
    * Render-time button states for the geometry layer: which button is the
    * active tool and whether isolation is on, so it can tint/highlight them.
+   * Iterates getButtonLayout() (not the static constant) so contextual-row
+   * buttons get highlighting for free while their tool is active.
    * @returns {Array<{id:string, active:boolean}>}
    */
   getButtonStates() {
-    return VR_MENU_BUTTONS.map((btn) => {
+    return this.getButtonLayout().map((btn) => {
       let active = false;
       if (btn.kind === "tool") active = this._activeToolId === btn.toolId;
       else if (btn.id === "isolation") active = this._isolated;
       else if (btn.id === "grid") active = this._gridEnabled;
-      else if (btn.kind === "scale") active = this._call("getVRScale") === btn.scaleValue;
+      // Relative tolerance, not ===. Two-hand pinch mutates vrScale
+      // continuously, so exact equality made all three presets go dark after
+      // any zoom gesture and only relight on a pixel-perfect preset tap.
+      else if (btn.kind === "scale") {
+        const scale = this._call("getVRScale");
+        active =
+          typeof scale === "number" &&
+          Number.isFinite(scale) &&
+          Math.abs(scale - btn.scaleValue) <= btn.scaleValue * 0.02;
+      }
       else if (btn.kind === "nav-mode-set") active = this._call("getNavigationMode") === btn.mode;
       else if (btn.id === "follow-participant") active = !!this._call("isFollowingParticipant");
       else if (btn.kind === "representation") {
         const mode = this._call("getRepresentation");
         active = !!mode && mode !== "surface";
       } else if (btn.kind === "glyph-toggle") active = !!this._call("isGlyphsEnabled");
+      else if (btn.kind === "probe-continuous") active = !!this._call("isProbeContinuous");
+      // Only meaningful once connected: voiceRoomService.isMuted initialises to
+      // TRUE before any room is joined, which lit the Mute button from the
+      // moment VR started even though nothing was muted (nor mutable — its
+      // toggle early-returns while disconnected).
+      else if (btn.kind === "voice-mute") {
+        active = !!this._call("isVoiceConnected") && !!this._call("isVoiceMuted");
+      }
+      else if (btn.kind === "voice-join") active = !!this._call("isVoiceConnected");
+      // clip-invert/clip-reset/annotation-mode/snapshot-save/snapshot-load/
+      // toggle-visibility are momentary actions — never highlighted.
       return { id: btn.id, active };
     });
   }
@@ -524,6 +812,36 @@ export class VRSpatialMenuModel {
       return `${scale % 1 === 0 ? scale.toFixed(0) : scale.toFixed(1)}x`;
     }
     return `1:${(1 / scale).toFixed(1)}`;
+  }
+
+  // ===========================================================================
+  // HINT LINE — "how do I interact with this right now"
+  // ===========================================================================
+
+  /**
+   * A single "how do I use this" line for the geometry layer to render below
+   * the button grid — separate from getStatusLine() (session state: dataset/
+   * scale/mode/following) so the two don't get concatenated into one
+   * unreadably long canvas-texture line. While a tool is active, shows that
+   * tool's control summary; otherwise shows the current locomotion mode's
+   * controls (VRNavigationController.NAVIGATION_MODE_INFO, surfaced via
+   * VRExplorationManager.getNavigationModeInfo() — previously written but
+   * never called from anywhere in the UI). Never throws; missing manager data
+   * just yields an empty line.
+   * @returns {string}
+   */
+  getHintLine() {
+    if (this._activeToolId) {
+      const toolHints = {
+        clip: "Grip+drag to aim, A to invert, B to reset",
+        annotate: "Trigger to place, thumbstick to change type, A to undo",
+        measure: "Trigger to place start/end, B or Undo to cancel",
+        probe: "Trigger to probe, A for continuous, B to clear, thumbstick to browse history",
+      };
+      return toolHints[this._activeToolId] || "";
+    }
+    const info = this._call("getNavigationModeInfo");
+    return info?.controls || "";
   }
 }
 

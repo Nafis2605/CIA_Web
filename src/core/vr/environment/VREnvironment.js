@@ -62,11 +62,11 @@ export const VR_CLEAR_COLOR = [0.93, 0.92, 0.9];
 // Single-flip switch for the background strategy. The gradient (sky→floor)
 // reads best on desktop and in most headsets, but some XR OpenGL paths have
 // been observed to drop the gradient second-color and show black under the
-// custom per-eye projection. If in-headset verification shows the gradient
-// misbehaving, flip this to `false` for a guaranteed-bright FLAT BG_BOTTOM
-// fill (the same color the XR compositor clears to), trading the subtle
-// gradient for a black-proof surround. See _applyBackground below.
-const USE_GRADIENT_BG = true;
+// custom per-eye projection. This was reported on Oculus Quest 2 (the surround
+// rendered black), so it's set to `false` for a guaranteed-bright FLAT
+// BG_BOTTOM fill (the same colour the XR compositor clears to) — a black-proof
+// surround, trading only the subtle sky gradient. See _applyBackground below.
+const USE_GRADIENT_BG = false;
 
 export class VREnvironment {
   constructor() {

@@ -32,6 +32,25 @@ export class VRFlyMode {
   }
 
   /**
+   * Toggle ground-locking (walk mode) at runtime. update() reads
+   * this._options.groundLocked each frame, so mutating it here is enough — no
+   * need for a second FlyMode instance. When true, vertical (Y) stick/button
+   * movement is zeroed so the user stays on the floor plane.
+   * @param {boolean} locked
+   */
+  setGroundLocked(locked) {
+    this._options.groundLocked = !!locked;
+  }
+
+  /** No-op re-anchor hook (parity with grab layers) — fly holds no cross-frame
+   * anchor beyond smoothed velocity, so nothing to reset. @param */
+  onFrameSkipped() {
+    // Bleed velocity so locomotion doesn't lurch when a suppressed frame
+    // (two-hand scale) ends.
+    this._velocity = { x: 0, y: 0, z: 0 };
+  }
+
+  /**
    * Update navigation based on input.
    *
    * Returns an ABSOLUTE new vrOrigin (data space) in `position`, matching
@@ -47,7 +66,6 @@ export class VRFlyMode {
     if (!this._isActive) return { position: null, orientation: null };
 
     const leftController = inputState.controllers?.left;
-    const rightController = inputState.controllers?.right;
 
     // baseSpeed is "meters per second at scale 1.0" (a physical walking
     // pace); dividing by vrScale converts that into the equivalent
@@ -60,11 +78,10 @@ export class VRFlyMode {
     // Calculate desired movement from left thumbstick
     const moveInput = this._getMovementInput(leftController);
 
-    // Check for boost (trigger held)
-    const boost = rightController?.triggerValue > 0.5;
-    const speed = boost
-      ? scaledSpeed * this._options.boostMultiplier
-      : scaledSpeed;
+    // Constant speed. Boost USED to be "right trigger held", but the trigger is
+    // now the object-move gesture (see VRNavigationController layered model), so
+    // coupling boost to it would 3x fly speed whenever the user drags data.
+    const speed = scaledSpeed;
 
     // Calculate target velocity
     const targetVelocity = {
@@ -106,7 +123,7 @@ export class VRFlyMode {
     return {
       position,
       orientation: null,
-      isBoosting: boost,
+      isBoosting: false,
       speed: Math.sqrt(
         this._velocity.x ** 2 + this._velocity.y ** 2 + this._velocity.z ** 2
       ),

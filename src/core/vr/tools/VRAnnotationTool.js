@@ -288,6 +288,17 @@ export class VRAnnotationTool extends VRToolInterface {
     this._annotationMode = modes[newIndex];
   }
 
+  /**
+   * Cycle to the next placement mode: marker → text → drawing. Public
+   * single-direction wrapper around _cycleAnnotationMode, shared by the
+   * thumbstick-X shortcut and the spatial menu's contextual "Mode" button.
+   * @returns {string} the newly-selected mode
+   */
+  cycleMode() {
+    this._cycleAnnotationMode(1);
+    return this._annotationMode;
+  }
+
   _getAnnotationColor() {
     // Get user color from context or use default
     return this._context?.vrContext?.userColor || [1, 0.5, 0];

@@ -46,6 +46,15 @@ class VRAvatarSystem {
     this._manager?.setLocalAvatarUrl(url);
   }
 
+  /**
+   * Set the local user's speaking state (drives the avatar head pulse on remote
+   * clients). No-op when no VR session is active.
+   * @param {boolean} speaking
+   */
+  setLocalSpeaking(speaking) {
+    this._manager?.setLocalSpeaking(speaking);
+  }
+
   dispose() {
     this._manager?.dispose();
     this._manager = null;

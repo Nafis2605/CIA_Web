@@ -3,8 +3,9 @@
  * @description Modal for configuring and launching a VR exploration session.
  *
  * Features:
- * - Choose navigation mode (fly, teleport, walk, orbit)
+ * - Choose navigation mode (fly, teleport, walk, move, move object)
  * - Set initial VR scale
+ * - Review how to interact (selection, gripless input, in-VR menu features)
  * - Launch VR session
  */
 
@@ -14,38 +15,44 @@ import { Modal } from "../Modal";
 import { Button } from "@UI/react/components/atoms/Button";
 import { vrManager } from "@Core/vr/VRManager.js";
 import { vrExplorationManager } from "@Core/vr/VRExplorationManager.js";
+import { EXPLORATION_MODES } from "@Core/data/models/VRExplorationSession.js";
+import { NAVIGATION_MODE_INFO } from "@Core/vr/navigation/VRNavigationController.js";
 import { toast } from "@UI/react/store/toastStore.js";
 import "./VRLaunchModal.scss";
 
+// Icon registry keys for each mode. NAVIGATION_MODE_INFO's own `icon` field
+// uses a different, non-registry naming scheme (it also drives the in-VR
+// spatial menu's hint copy), so this is a separate, small display-only map.
+const MODE_ICONS = {
+  [EXPLORATION_MODES.FLY]: "compass",
+  [EXPLORATION_MODES.TELEPORT]: "target",
+  [EXPLORATION_MODES.WALK]: "footprints",
+  [EXPLORATION_MODES.GRAB]: "move",
+  [EXPLORATION_MODES.MOVE_OBJECT]: "move",
+};
+
 /**
- * Navigation mode options
+ * Navigation mode options, derived from NAVIGATION_MODE_INFO (the single
+ * source of truth also used by the in-VR spatial menu's hint line) instead of
+ * a second hand-maintained list — the previous version included a fake
+ * "orbit" mode that didn't correspond to any real EXPLORATION_MODES value and
+ * silently never worked. All 5 real modes are offered here (not just the 3
+ * locomotion ones) so a user can see Move/Move Object's controls before
+ * entering VR, even though they're most often reached via the in-VR menu.
  */
 const NAVIGATION_MODES = [
-  {
-    id: "fly",
-    label: "Fly",
-    description: "Free movement in 3D space",
-    icon: "plane",
-  },
-  {
-    id: "teleport",
-    label: "Teleport",
-    description: "Point-and-click movement",
-    icon: "cursor",
-  },
-  {
-    id: "walk",
-    label: "Walk",
-    description: "Ground-based movement",
-    icon: "footprints",
-  },
-  {
-    id: "orbit",
-    label: "Orbit",
-    description: "Rotate around center point",
-    icon: "orbit",
-  },
-];
+  EXPLORATION_MODES.FLY,
+  EXPLORATION_MODES.TELEPORT,
+  EXPLORATION_MODES.WALK,
+  EXPLORATION_MODES.GRAB,
+  EXPLORATION_MODES.MOVE_OBJECT,
+].map((id) => ({
+  id,
+  label: NAVIGATION_MODE_INFO[id].name,
+  description: NAVIGATION_MODE_INFO[id].description,
+  controls: NAVIGATION_MODE_INFO[id].controls,
+  icon: MODE_ICONS[id],
+}));
 
 /**
  * Scale preset options
@@ -91,8 +98,11 @@ function VRLaunchModal({
   const [vrCapabilities, setVrCapabilities] = useState(null);
   const [checkingSupport, setCheckingSupport] = useState(true);
 
-  // Configuration state
-  const [navigationMode, setNavigationMode] = useState("teleport");
+  // Configuration state. Default to "fly" so the left stick works on entry
+  // (smooth locomotion + snap turn on right stick). Teleport is now an
+  // optional toggle available via the in-VR menu. See NAVIGATION_MODE_INFO
+  // for the new control mappings.
+  const [navigationMode, setNavigationMode] = useState("fly");
   const [scalePreset, setScalePreset] = useState("normal");
   const [customScale, setCustomScale] = useState(1.0);
   const [useCustomScale, setUseCustomScale] = useState(false);
@@ -278,9 +288,21 @@ function VRLaunchModal({
                 <Icon name={mode.icon} size={20} />
                 <span className="vr-launch-modal__mode-label">{mode.label}</span>
                 <span className="vr-launch-modal__mode-desc">{mode.description}</span>
+                <span className="vr-launch-modal__mode-controls">{mode.controls}</span>
               </button>
             ))}
           </div>
+        </div>
+
+        {/* How to Interact */}
+        <div className="vr-launch-modal__section">
+          <h4 className="vr-launch-modal__section-title">How to Interact</h4>
+          <ul className="vr-launch-modal__hints">
+            <li>Point and pull the trigger (or pinch, on Vision Pro) to select a menu button or place a tool marker.</li>
+            <li>On Vision Pro there's no trigger or thumbstick — look at a control and pinch to select it.</li>
+            <li>Pinch/squeeze with both hands and pull apart to zoom, twist to rotate.</li>
+            <li>Save/load session snapshots and mute or join voice chat from the in-VR menu — no need to remove your headset.</li>
+          </ul>
         </div>
 
         {/* Scale Settings */}

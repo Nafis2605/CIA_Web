@@ -48,6 +48,7 @@ export class AvatarManager {
       displayName: getUserName(),
       color: getUserColor(),
       avatarUrl: this._localAvatarUrl,
+      isSpeaking: false,
       isLocal: true,
     };
 
@@ -58,11 +59,7 @@ export class AvatarManager {
     this._networkSync.initialize();
 
     // Broadcast local metadata so remotes can show our name/color/url
-    this._networkSync.sendLocalPresence({
-      displayName: this._localUserInfo.displayName,
-      color: this._localUserInfo.color,
-      avatarUrl: this._localAvatarUrl,
-    });
+    this._broadcastPresence();
 
     // Add any participants that were already in the session when we joined
     if (session?.getParticipants) {
@@ -121,12 +118,35 @@ export class AvatarManager {
     this._localAvatarUrl = url;
     if (this._localUserInfo) {
       this._localUserInfo.avatarUrl = url;
-      this._networkSync.sendLocalPresence({
-        displayName: this._localUserInfo.displayName,
-        color: this._localUserInfo.color,
-        avatarUrl: url,
-      });
+      this._broadcastPresence();
     }
+  }
+
+  /**
+   * Set the local user's speaking state and re-broadcast presence so remote
+   * clients pulse this user's avatar head. No-op if unchanged.
+   * @param {boolean} speaking
+   */
+  setLocalSpeaking(speaking) {
+    if (!this._localUserInfo) return;
+    if (this._localUserInfo.isSpeaking === speaking) return;
+    this._localUserInfo.isSpeaking = speaking;
+    this._broadcastPresence();
+  }
+
+  /**
+   * Broadcast the full current local metadata (name/color/url/isSpeaking) so no
+   * individual field update clobbers the others.
+   * @private
+   */
+  _broadcastPresence() {
+    if (!this._localUserInfo) return;
+    this._networkSync.sendLocalPresence({
+      displayName: this._localUserInfo.displayName,
+      color: this._localUserInfo.color,
+      avatarUrl: this._localUserInfo.avatarUrl || null,
+      isSpeaking: this._localUserInfo.isSpeaking || false,
+    });
   }
 
   /**

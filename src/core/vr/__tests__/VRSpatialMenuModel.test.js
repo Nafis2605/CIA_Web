@@ -10,7 +10,7 @@ vi.mock("@Utils/logger.js", () => {
   return { vr: mkLog(), app: mkLog(), sync: mkLog(), view: mkLog(), createLogger: () => mkLog() };
 });
 
-import { VRSpatialMenuModel, VR_MENU_BUTTONS } from "../VRSpatialMenuModel.js";
+import { VRSpatialMenuModel, VR_MENU_BUTTONS, VR_MENU_CONTEXTUAL_BUTTONS } from "../VRSpatialMenuModel.js";
 
 /** Minimal manager stub matching the methods the model calls. */
 function makeManager(overrides = {}) {
@@ -39,6 +39,20 @@ function makeManager(overrides = {}) {
     getRepresentation: vi.fn(() => "surface"),
     toggleGlyphs: vi.fn(() => true),
     isGlyphsEnabled: vi.fn(() => false),
+    invertClipPlane: vi.fn(),
+    resetClipPlane: vi.fn(),
+    cycleAnnotationMode: vi.fn(() => "text"),
+    toggleProbeContinuous: vi.fn(() => true),
+    isProbeContinuous: vi.fn(() => false),
+    clearProbeHistory: vi.fn(),
+    createSnapshot: vi.fn(() => Promise.resolve()),
+    loadSnapshot: vi.fn(() => Promise.resolve()),
+    getSessionSnapshots: vi.fn(() => []),
+    isVoiceMuted: vi.fn(() => false),
+    toggleVoiceMute: vi.fn(() => true),
+    isVoiceConnected: vi.fn(() => false),
+    toggleVoiceConnection: vi.fn(() => true),
+    getNavigationModeInfo: vi.fn(() => ({ name: "Fly", controls: "Thumbstick to move, trigger to boost" })),
     ...overrides,
   };
 }
@@ -76,7 +90,7 @@ describe("VRSpatialMenuModel — layout & hit testing", () => {
     }
   });
 
-  it("rows are stacked bottom-to-top without overlapping v-ranges", () => {
+  it("rows are stacked top-to-bottom without overlapping v-ranges", () => {
     const rowIds = [...new Set(model.getButtonLayout().map((r) => r.row))].sort((a, b) => a - b);
     for (const rowId of rowIds) {
       const cells = model.getButtonLayout().filter((r) => r.row === rowId);
@@ -86,10 +100,11 @@ describe("VRSpatialMenuModel — layout & hit testing", () => {
         expect(c.v0).toBe(v0);
         expect(c.v1).toBe(v1);
       }
-      // Higher row index sits strictly above lower row index
+      // v runs along +up, and the FIRST declared row renders at the TOP, so a
+      // higher row index sits strictly BELOW a lower one.
       const higherRow = model.getButtonLayout().find((r) => r.row === rowId + 1);
       if (higherRow) {
-        expect(higherRow.v0).toBeGreaterThanOrEqual(v1 - 1e-9);
+        expect(higherRow.v1).toBeLessThanOrEqual(v0 + 1e-9);
       }
     }
   });
@@ -110,10 +125,14 @@ describe("VRSpatialMenuModel — layout & hit testing", () => {
     expect(model.hitTest(r.cu, r.v0 - 0.01)).toBeNull();
   });
 
-  it("bottom row (row 0) starts with annotate and ends with exit", () => {
-    const row0 = model.getButtonLayout().filter((r) => r.row === 0);
+  it("top row (row 0) starts with annotate; the last (bottom) row ends with exit", () => {
+    const layout = model.getButtonLayout();
+    const row0 = layout.filter((r) => r.row === 0);
     expect(row0[0].id).toBe("annotate");
-    expect(row0[row0.length - 1].id).toBe("exit");
+
+    const maxRow = Math.max(...layout.map((r) => r.row));
+    const topRow = layout.filter((r) => r.row === maxRow);
+    expect(topRow[topRow.length - 1].id).toBe("exit");
   });
 });
 
@@ -180,9 +199,19 @@ describe("VRSpatialMenuModel — action dispatch", () => {
     expect(r).toMatchObject({ handled: true, action: "nav-mode-set", mode: "grab" });
   });
 
-  it("Move toggles back to teleport when grab is already active", () => {
+  it("Move toggles back to fly when grab is already active", () => {
+    // Untoggling returns to "fly" — the neutral mode where the trigger stays
+    // free for tools/menu. It used to fall back to "teleport", which silently
+    // handed the trigger to teleport aiming; teleport is now its own button.
     manager.getNavigationMode.mockReturnValue("grab");
     const r = model.activate("move");
+    expect(manager.setNavigationMode).toHaveBeenCalledWith("fly");
+    expect(r).toMatchObject({ handled: true, action: "nav-mode-set", mode: "fly" });
+  });
+
+  it("Teleport is a real selectable mode", () => {
+    manager.getNavigationMode.mockReturnValue("fly");
+    const r = model.activate("teleport");
     expect(manager.setNavigationMode).toHaveBeenCalledWith("teleport");
     expect(r).toMatchObject({ handled: true, action: "nav-mode-set", mode: "teleport" });
   });
@@ -231,16 +260,27 @@ describe("VRSpatialMenuModel — action dispatch", () => {
     expect(r2).toMatchObject({ handled: true, action: "follow-participant", following: null });
   });
 
+  // annotation-label is CONTEXTUAL to the annotate tool now (it only means
+  // anything while annotating), so it is only present in the layout — and
+  // therefore only activatable — while that tool is active.
   it("annotation-label cycles via manager.cycleAnnotationLabel", () => {
+    model.activate("annotate");
     const r = model.activate("annotation-label");
     expect(manager.cycleAnnotationLabel).toHaveBeenCalledTimes(1);
     expect(r).toMatchObject({ handled: true, action: "annotation-label-changed", label: "Anomaly" });
   });
 
   it("annotation-label is a safe no-op when no tool supports labels", () => {
+    model.activate("annotate");
     manager.cycleAnnotationLabel.mockReturnValue(null);
     const r = model.activate("annotation-label");
     expect(r).toMatchObject({ handled: true, action: "annotation-label-changed", label: null, reason: "no-active-tool" });
+  });
+
+  it("annotation-label is absent from the layout unless annotate is active", () => {
+    expect(model.getButtonLayout().some((b) => b.id === "annotation-label")).toBe(false);
+    model.activate("annotate");
+    expect(model.getButtonLayout().some((b) => b.id === "annotation-label")).toBe(true);
   });
 
   it("representation button cycles via manager.cycleRepresentation", () => {
@@ -263,6 +303,70 @@ describe("VRSpatialMenuModel — action dispatch", () => {
     manager.toggleGlyphs.mockReturnValue(false);
     const r2 = model.activate("glyphs");
     expect(r2).toMatchObject({ handled: true, action: "glyphs-toggled", enabled: false });
+  });
+
+  it("walk is a direct nav-mode-set button, same semantics as move", () => {
+    manager.getNavigationMode.mockReturnValue("teleport");
+    const r = model.activate("walk");
+    expect(manager.setNavigationMode).toHaveBeenCalledWith("walk");
+    expect(r).toMatchObject({ handled: true, action: "nav-mode-set", mode: "walk" });
+  });
+
+  it("snapshot-save routes through manager.createSnapshot", () => {
+    const r = model.activate("snapshot-save");
+    expect(manager.createSnapshot).toHaveBeenCalledTimes(1);
+    expect(r).toMatchObject({ handled: true, action: "snapshot-saved" });
+  });
+
+  it("snapshot-save swallows a rejected createSnapshot promise", () => {
+    const rejecting = makeManager({ createSnapshot: vi.fn(() => Promise.reject(new Error("x"))) });
+    const m = new VRSpatialMenuModel(rejecting);
+    expect(() => m.activate("snapshot-save")).not.toThrow();
+  });
+
+  it("snapshot-load cycles through getSessionSnapshots and calls manager.loadSnapshot", () => {
+    manager.getSessionSnapshots.mockReturnValue([{ id: "s1" }, { id: "s2" }]);
+    const r1 = model.activate("snapshot-load");
+    expect(manager.loadSnapshot).toHaveBeenCalledWith("s1");
+    expect(r1).toMatchObject({ handled: true, action: "snapshot-load", snapshotId: "s1", ok: true });
+
+    const r2 = model.activate("snapshot-load");
+    expect(manager.loadSnapshot).toHaveBeenCalledWith("s2");
+    expect(r2.snapshotId).toBe("s2");
+
+    // Wraps back to the first snapshot
+    const r3 = model.activate("snapshot-load");
+    expect(r3.snapshotId).toBe("s1");
+  });
+
+  it("snapshot-load is a safe no-op with nothing saved", () => {
+    manager.getSessionSnapshots.mockReturnValue([]);
+    const r = model.activate("snapshot-load");
+    expect(r).toMatchObject({ handled: true, action: "snapshot-load", ok: false, reason: "no-snapshots" });
+    expect(manager.loadSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("voice-mute toggles via manager.toggleVoiceMute", () => {
+    const r = model.activate("voice-mute");
+    expect(manager.toggleVoiceMute).toHaveBeenCalledTimes(1);
+    expect(r).toMatchObject({ handled: true, action: "voice-mute-toggled", muted: true });
+  });
+
+  it("voice-join toggles via manager.toggleVoiceConnection", () => {
+    const r = model.activate("voice-join");
+    expect(manager.toggleVoiceConnection).toHaveBeenCalledTimes(1);
+    expect(r).toMatchObject({ handled: true, action: "voice-connection-toggled", connected: true });
+  });
+
+  it("hide-menu sets visibility false directly, without calling the manager", () => {
+    model.onSessionStart();
+    expect(model.isVisible()).toBe(true);
+    const r = model.activate("hide-menu");
+    expect(r).toEqual({ handled: true, action: "menu-hidden" });
+    expect(model.isVisible()).toBe(false);
+    // Local UI chrome — must not touch any manager method.
+    expect(manager.leaveSession).not.toHaveBeenCalled();
+    expect(manager.activateTool).not.toHaveBeenCalled();
   });
 
   it("unknown button id is a no-op", () => {
@@ -427,5 +531,121 @@ describe("VRSpatialMenuModel — status line", () => {
     const model = new VRSpatialMenuModel(manager);
     model.syncFromManager();
     expect(model.getStatusLine()).not.toContain("Label:");
+  });
+});
+
+describe("VRSpatialMenuModel — contextual row", () => {
+  let manager;
+  let model;
+  beforeEach(() => {
+    manager = makeManager();
+    model = new VRSpatialMenuModel(manager);
+  });
+
+  it("adds no extra buttons when no tool, or a tool without contextual buttons (measure), is active", () => {
+    expect(model.getButtonLayout()).toHaveLength(VR_MENU_BUTTONS.length);
+
+    model.activate("measure");
+    expect(model.getButtonLayout()).toHaveLength(VR_MENU_BUTTONS.length);
+  });
+
+  it("appends exactly the matching tool's contextual buttons as one extra row above TOOLS", () => {
+    model.activate("clip");
+    const layout = model.getButtonLayout();
+    const clipContextual = VR_MENU_CONTEXTUAL_BUTTONS.filter((b) => b.contextTool === "clip");
+    expect(layout).toHaveLength(VR_MENU_BUTTONS.length + clipContextual.length);
+
+    // The contextual strip sits one row BEFORE the first static row, so it
+    // renders directly above TOOLS — next to the tool whose options it holds.
+    const minStaticRow = Math.min(...VR_MENU_BUTTONS.map((b) => b.row));
+    const contextualRow = layout.filter((r) => r.row === minStaticRow - 1);
+    expect(contextualRow.map((b) => b.id).sort()).toEqual(["clip-invert", "clip-reset"]);
+  });
+
+  it("annotate's contextual row is Mode + Label; probe's is Continuous + Clear", () => {
+    model.activate("annotate");
+    let ids = model.getButtonLayout().filter((b) => b.contextTool === "annotate").map((b) => b.id);
+    expect(ids.sort()).toEqual(["annotation-label", "annotation-mode"]);
+
+    model.activate("annotate"); // deactivate
+    model.activate("probe");
+    ids = model.getButtonLayout().filter((b) => b.contextTool === "probe").map((b) => b.id);
+    expect(ids.sort()).toEqual(["probe-clear", "probe-continuous"]);
+  });
+
+  it("contextual row disappears when the tool deactivates, and its buttons become unhittable", () => {
+    model.activate("clip");
+    expect(model.getButtonLayout()).toHaveLength(VR_MENU_BUTTONS.length + 2);
+
+    model.activate("clip"); // toggle off
+    expect(model.getButtonLayout()).toHaveLength(VR_MENU_BUTTONS.length);
+    const r = model.activate("clip-invert");
+    expect(r).toEqual({ handled: false });
+  });
+
+  it("contextual row disappears when switching to a different tool", () => {
+    model.activate("clip");
+    expect(model.getButtonLayout().some((b) => b.id === "clip-invert")).toBe(true);
+
+    model.activate("measure"); // switches active tool
+    expect(model.getButtonLayout().some((b) => b.id === "clip-invert")).toBe(false);
+  });
+
+  it("clip-invert/clip-reset route through the manager", () => {
+    model.activate("clip");
+    const r1 = model.activate("clip-invert");
+    expect(manager.invertClipPlane).toHaveBeenCalledTimes(1);
+    expect(r1).toMatchObject({ handled: true, action: "clip-inverted" });
+
+    const r2 = model.activate("clip-reset");
+    expect(manager.resetClipPlane).toHaveBeenCalledTimes(1);
+    expect(r2).toMatchObject({ handled: true, action: "clip-reset" });
+  });
+
+  it("annotation-mode routes through manager.cycleAnnotationMode", () => {
+    model.activate("annotate");
+    const r = model.activate("annotation-mode");
+    expect(manager.cycleAnnotationMode).toHaveBeenCalledTimes(1);
+    expect(r).toMatchObject({ handled: true, action: "annotation-mode-changed", mode: "text" });
+  });
+
+  it("probe-continuous/probe-clear route through the manager", () => {
+    model.activate("probe");
+    const r1 = model.activate("probe-continuous");
+    expect(manager.toggleProbeContinuous).toHaveBeenCalledTimes(1);
+    expect(r1).toMatchObject({ handled: true, action: "probe-continuous-toggled", enabled: true });
+
+    const r2 = model.activate("probe-clear");
+    expect(manager.clearProbeHistory).toHaveBeenCalledTimes(1);
+    expect(r2).toMatchObject({ handled: true, action: "probe-history-cleared" });
+  });
+
+  it("getButtonStates reflects probe-continuous active state while probe is active", () => {
+    manager.isProbeContinuous.mockReturnValue(true);
+    model.activate("probe");
+    const states = Object.fromEntries(model.getButtonStates().map((s) => [s.id, s.active]));
+    expect(states["probe-continuous"]).toBe(true);
+  });
+});
+
+describe("VRSpatialMenuModel — hint line", () => {
+  it("shows the active tool's control summary", () => {
+    const model = new VRSpatialMenuModel(makeManager());
+    model.activate("clip");
+    expect(model.getHintLine()).toBe("Grip+drag to aim, A to invert, B to reset");
+  });
+
+  it("falls back to the current nav mode's controls when no tool is active", () => {
+    const manager = makeManager({
+      getNavigationModeInfo: vi.fn(() => ({ name: "Teleport", controls: "Hold thumbstick to aim, release to teleport" })),
+    });
+    const model = new VRSpatialMenuModel(manager);
+    expect(model.getHintLine()).toBe("Hold thumbstick to aim, release to teleport");
+  });
+
+  it("never throws with a manager missing getNavigationModeInfo", () => {
+    const model = new VRSpatialMenuModel({});
+    expect(() => model.getHintLine()).not.toThrow();
+    expect(model.getHintLine()).toBe("");
   });
 });

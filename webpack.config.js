@@ -115,6 +115,20 @@ module.exports = {
         changeOrigin: true,
         pathRewrite: { "^/yjs-ws": "" },
       },
+      // LiveKit token server — same-origin so HTTPS pages (and LAN/tunnel clients
+      // like Oculus Quest / Apple Vision Pro) can fetch a voice token without a
+      // mixed-content block. The token server exposes /token and /health at its
+      // root, so the mount prefix is stripped: /livekit-token/token -> /token.
+      // NOTE: only the token fetch rides this proxy. The LiveKit media SFU
+      // (LIVEKIT_URL, wss://) cannot be proxied — WebRTC media is direct/ICE and
+      // must reach a TLS + TURN reachable SFU (LiveKit Cloud or self-host).
+      {
+        context: ["/livekit-token"],
+        target: "http://localhost:3002",
+        changeOrigin: true,
+        secure: false,
+        pathRewrite: { "^/livekit-token": "" },
+      },
       // Node.js API server
       {
         context: ["/api"],
@@ -229,8 +243,11 @@ module.exports = {
       __LIVEKIT_URL__: JSON.stringify(
         process.env.LIVEKIT_URL || "ws://localhost:7880"
       ),
+      // Default is the same-origin proxy path (see devServer proxy above), so
+      // it rides the page's TLS/host on LAN/tunnel. Override with an absolute
+      // URL only if the token server is hosted separately.
       __LIVEKIT_TOKEN_URL__: JSON.stringify(
-        process.env.LIVEKIT_TOKEN_URL || "http://localhost:3002"
+        process.env.LIVEKIT_TOKEN_URL || "/livekit-token"
       ),
       __DEV_BYPASS_AUTH__: JSON.stringify(
         process.env.DEV_BYPASS_AUTH === "true"

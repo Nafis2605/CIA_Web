@@ -26,6 +26,7 @@ export const EXPLORATION_MODES = Object.freeze({
   WALK: 'walk',         // Room-scale physical movement
   SCALE: 'scale',       // Pinch to resize relative to data
   GRAB: 'grab',         // Pinch-and-drag to pull the data closer / push it away
+  MOVE_OBJECT: 'move-object', // Pinch-and-drag to move the ACTIVE dataset's transform (shared)
 });
 
 export const PARTICIPATION_MODE = Object.freeze({

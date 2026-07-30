@@ -39,13 +39,25 @@ import { vr as log } from "@Utils/logger.js";
 // exactly so the manipulation feels direct.
 const GRAB_GAIN = 1.0;
 
+// Default engagement: the trigger (Vision Pro pinch or a controller's index
+// trigger). VRExplorationManager constructs the always-on WORLD grab with a
+// GRIP predicate instead (squeeze on tracked controllers, pinch on gripless
+// Vision Pro sources) so grip pulls the world while the trigger stays free for
+// object-move / tools / the menu — see VRNavigationController.
+const DEFAULT_IS_ENGAGED = (hand) => !!hand?.triggerPressed;
+
 export class VRGrabMode {
   /**
    * @param {Object} vrContext - live VR context (vrScale / vrOrigin are the
    *   locomotion state this mode writes through its returned result).
+   * @param {Object} [options]
+   * @param {(hand:Object)=>boolean} [options.isEngaged] - predicate deciding
+   *   whether a controller is currently "gripping" for this grab. Defaults to
+   *   the trigger so existing callers/tests are unchanged.
    */
-  constructor(vrContext) {
+  constructor(vrContext, options = {}) {
     this._vrContext = vrContext;
+    this._isEngaged = options.isEngaged || DEFAULT_IS_ENGAGED;
     this.reset();
   }
 
@@ -87,7 +99,7 @@ export class VRGrabMode {
    */
   update(inputState) {
     const hand = this._pickHand(inputState);
-    const pressed = !!hand?.triggerPressed;
+    const pressed = !!hand && this._isEngaged(hand);
     const pos = hand?.pose?.position;
 
     // Falling edge OR pose loss while grabbing → end the grab, hold last pose.
@@ -133,13 +145,18 @@ export class VRGrabMode {
   }
 
   /**
-   * Pick the grabbing hand: right if it has a pose, else left if it has one.
+   * Pick the grabbing hand. Prefer a hand that is BOTH posed and currently
+   * engaged (so gripping the left hand grabs with the left, not the right),
+   * falling back to any posed hand so the rising-edge anchor still fires the
+   * frame a grip begins.
    * @private
    */
   _pickHand(inputState) {
     const right = inputState?.controllers?.right;
-    if (right?.pose) return right;
     const left = inputState?.controllers?.left;
+    if (right?.pose && this._isEngaged(right)) return right;
+    if (left?.pose && this._isEngaged(left)) return left;
+    if (right?.pose) return right;
     if (left?.pose) return left;
     return null;
   }

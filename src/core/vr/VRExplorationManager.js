@@ -30,6 +30,7 @@ import { pushSharedVisualizationUpdate } from '@Services/visualizationSyncServic
 import { vrCursorSync } from '@Core/vr/VRCursorSync.js';
 import { mapXRPointToData, controllerForward } from '@Core/vr/tools/vrPlaneMath.js';
 import { vrEnvironment } from '@Core/vr/environment/VREnvironment.js';
+import { voiceRoomService, getVoiceRoomName } from '@Services/voice/voiceRoomService.js';
 
 class VRExplorationManager extends BaseManager {
   constructor() {
@@ -202,8 +203,26 @@ class VRExplorationManager extends BaseManager {
     // Initialize tool manager with handler
     this._toolManager = new VRToolManager(handler, vrContext);
 
-    // Initialize navigation controller
-    this._navigationController = new VRNavigationController(session, vrContext);
+    // Initialize navigation controller. The onObjectMoved callback lets the
+    // MOVE_OBJECT mode broadcast the active dataset's transform to collaborators.
+    // Pass vrManager so snap-turn plumbing works in the layered controller.
+    this._navigationController = new VRNavigationController(session, vrContext, {
+      vrManager,
+      onObjectMoved: (final) => this._pushObjectTransformPatch(final),
+    });
+
+    // Set the world-grab engagement predicate: grip on tracked controllers
+    // (squeeze > 0.7), pinch on Vision Pro (triggerPressed). This keeps grip
+    // dedicated to "pull the world for navigation" while trigger stays free
+    // for object-move and the menu.
+    const gripPredicate = (hand) => {
+      if (!hand) return false;
+      // Vision Pro's transient-pointer is gripless (squeezeValue always 0)
+      if (hand.isTransientPointer) return hand.triggerPressed === true;
+      // Tracked controllers: use squeeze (grip button)
+      return (hand.squeezeValue || 0) > 0.7;
+    };
+    this._navigationController.setWorldGrabEngagement(gripPredicate);
 
     // Store active context
     this._activeSession = session;
@@ -229,25 +248,31 @@ class VRExplorationManager extends BaseManager {
     // Initialize avatar system
     const avatarRenderer = vrContext.sceneObjects?.renderer;
     if (avatarRenderer) {
-      vrAvatarSystem.initialize(avatarRenderer, session, vrContext);
+      this._safeInitStep('vrAvatarSystem.initialize', () =>
+        vrAvatarSystem.initialize(avatarRenderer, session, vrContext)
+      );
     }
 
     // Spatial environment: floor grid + horizon, physically anchored so the
     // user has depth/scale cues rather than a dataset floating in a void.
     if (avatarRenderer) {
-      vrEnvironment.initialize(avatarRenderer, vrContext);
+      this._safeInitStep('vrEnvironment.initialize', () =>
+        vrEnvironment.initialize(avatarRenderer, vrContext)
+      );
     }
 
     // Pointer-ray broadcasting: desktop collaborators render this VR user's
     // controller ray via vrCursorSync (consumed by VTKRemoteVRRays).
-    vrCursorSync.initialize(getUserId(), getUserName(), getUserColor(getUserId()));
+    this._safeInitStep('vrCursorSync.initialize', () =>
+      vrCursorSync.initialize(getUserId(), getUserName(), getUserColor(getUserId()))
+    );
 
     // Initialize the in-scene spatial tool menu. WebXR immersive sessions do
     // not render the DOM, so this VTK panel — not the React VRWristMenu — is
     // the guaranteed in-headset UI. It shares this manager as its source of
     // truth (tool select / undo / isolation toggle / exit all route back here).
     if (avatarRenderer) {
-      vrSpatialUI.initialize(avatarRenderer, this);
+      this._safeInitStep('vrSpatialUI.initialize', () => vrSpatialUI.initialize(avatarRenderer, this));
     }
 
     // Emit event
@@ -409,6 +434,29 @@ class VRExplorationManager extends BaseManager {
       await fn();
     } catch (e) {
       log.error(`VR leaveSession: ${label} failed`, e);
+    }
+  }
+
+  /**
+   * Run one VR sub-system init step, logging and swallowing any failure
+   * instead of letting it abort the rest of startExploration()'s setup. By
+   * the time these run, session.start() and the XR frame loop are already
+   * live — the user is fully immersed — so without this, a single sub-system
+   * throwing (e.g. vrSpatialUI.initialize() building ~25 button actors) would
+   * silently reject the whole startExploration() promise. The caller only
+   * sees a desktop toast, invisible from inside the headset, and everything
+   * after the failed step (critically the spatial menu, since it initializes
+   * last) never gets a chance to run. Each step is independently guarded so
+   * one failure can never take out the others, and the error is logged with
+   * enough detail (message + stack) to diagnose from a headset's remote
+   * console (chrome://inspect for Quest, Safari Develop menu for Vision Pro).
+   * @private
+   */
+  _safeInitStep(label, fn) {
+    try {
+      fn();
+    } catch (e) {
+      log.error(`VR startExploration: ${label} failed — ${e?.message}`, e?.stack || e);
     }
   }
 
@@ -690,6 +738,122 @@ class VRExplorationManager extends BaseManager {
   getPendingAnnotationLabel() {
     const tool = this._toolManager?.getActiveTool?.();
     return typeof tool?.getPendingLabel === 'function' ? tool.getPendingLabel() : null;
+  }
+
+  /**
+   * Invert the active Clip tool's plane direction. Routes the resulting
+   * clip-box-updated action through the same _handleToolAction path the
+   * A-button shortcut uses, so persistence/broadcast stays consistent.
+   * No-ops if Clip isn't the active tool. Invoked by the spatial menu's
+   * contextual "Invert" button.
+   */
+  invertClipPlane() {
+    const tool = this._toolManager?.getActiveTool?.();
+    if (tool?.id !== 'clip' || typeof tool.invert !== 'function') return;
+    const action = tool.invert();
+    if (action) this._handleToolAction(action);
+  }
+
+  /**
+   * Reset the active Clip tool's plane. Same routing as invertClipPlane().
+   * Invoked by the spatial menu's contextual "Reset" button.
+   */
+  resetClipPlane() {
+    const tool = this._toolManager?.getActiveTool?.();
+    if (tool?.id !== 'clip' || typeof tool.reset !== 'function') return;
+    const action = tool.reset();
+    if (action) this._handleToolAction(action);
+  }
+
+  /**
+   * Cycle the active Annotate tool's placement mode: marker → text → drawing.
+   * No-ops (returns null) if Annotate isn't the active tool. Invoked by the
+   * spatial menu's contextual "Mode" button.
+   * @returns {string|null} the newly-selected mode
+   */
+  cycleAnnotationMode() {
+    const tool = this._toolManager?.getActiveTool?.();
+    if (tool?.id !== 'annotate' || typeof tool.cycleMode !== 'function') return null;
+    return tool.cycleMode();
+  }
+
+  /**
+   * Toggle the active Probe tool's continuous-sampling mode. No-ops (returns
+   * false) if Probe isn't the active tool. Invoked by the spatial menu's
+   * contextual "Continuous" button.
+   * @returns {boolean} the new continuous-mode state
+   */
+  toggleProbeContinuous() {
+    const tool = this._toolManager?.getActiveTool?.();
+    if (tool?.id !== 'probe' || typeof tool.setContinuousMode !== 'function') return false;
+    const next = !tool.isContinuousMode();
+    tool.setContinuousMode(next);
+    return next;
+  }
+
+  /** @returns {boolean} whether the active Probe tool is in continuous-sampling mode */
+  isProbeContinuous() {
+    const tool = this._toolManager?.getActiveTool?.();
+    if (tool?.id !== 'probe' || typeof tool.isContinuousMode !== 'function') return false;
+    return tool.isContinuousMode();
+  }
+
+  /**
+   * Clear the active Probe tool's sample history. No-ops if Probe isn't the
+   * active tool. Invoked by the spatial menu's contextual "Clear" button.
+   */
+  clearProbeHistory() {
+    const tool = this._toolManager?.getActiveTool?.();
+    if (tool?.id !== 'probe' || typeof tool.clearHistory !== 'function') return;
+    tool.clearHistory();
+  }
+
+  // ===========================================================================
+  // VOICE (delegated to voiceRoomService)
+  // ===========================================================================
+  //
+  // Thin pass-through so the spatial menu's Mute/Voice buttons can control the
+  // same LiveKit voice room the voice bar/tab use, without leaving VR. Room
+  // name is derived from the collaboration session (getVoiceRoomName), not
+  // reinvented here.
+
+  /** @returns {boolean} whether the local participant is currently muted */
+  isVoiceMuted() {
+    return voiceRoomService.isMuted;
+  }
+
+  /**
+   * Toggle the local participant's mute state. Fire-and-forget: toggleMute()
+   * is async, but the spatial menu's activate() must return synchronously —
+   * the button's tint catches up on the next frame once isVoiceMuted()
+   * re-reads the (by-then-updated) state.
+   * @returns {boolean} the new muted state, read optimistically before the
+   *   promise resolves
+   */
+  toggleVoiceMute() {
+    voiceRoomService.toggleMute().catch((err) => log.warn('Voice mute toggle failed:', err?.message));
+    return !voiceRoomService.isMuted;
+  }
+
+  /** @returns {boolean} whether currently connected to the session's voice room */
+  isVoiceConnected() {
+    return voiceRoomService.isConnected();
+  }
+
+  /**
+   * Join or leave the session's voice room. Fire-and-forget, same rationale
+   * as toggleVoiceMute().
+   * @returns {boolean} the new connected state, read optimistically
+   */
+  toggleVoiceConnection() {
+    if (voiceRoomService.isConnected()) {
+      voiceRoomService.leaveRoom().catch((err) => log.warn('Voice leave failed:', err?.message));
+      return false;
+    }
+    voiceRoomService
+      .joinRoom(getVoiceRoomName(), getUserName())
+      .catch((err) => log.warn('Voice join failed:', err?.message));
+    return true;
   }
 
   // ===========================================================================
@@ -1096,9 +1260,42 @@ class VRExplorationManager extends BaseManager {
     return this._snapshotManager.quickSave(name);
   }
 
+  /**
+   * Load a snapshot and reapply the VR-side state it captured.
+   *
+   * VRSnapshotManager restores the ViewConfiguration (camera, appearance, clip
+   * box, ...), but the VR zoom level and navigation mode live on the session's
+   * participant record, so they were saved and then never reapplied — "Load"
+   * restored strictly less than its name implied. Reapply the LOCAL
+   * participant's captured vrScale + mode here, where vrContext and the
+   * navigation controller are in scope.
+   *
+   * Note: vrOrigin is intentionally not restored — createSessionSnapshot does
+   * not capture it (see VRExplorationSession.createSessionSnapshot), so there
+   * is nothing saved to put back.
+   */
   async loadSnapshot(snapshotId) {
     if (!this._snapshotManager) throw new Error('No active session');
-    return this._snapshotManager.loadSnapshot(snapshotId);
+    const snapshot = await this._snapshotManager.loadSnapshot(snapshotId);
+
+    try {
+      const mine = snapshot?.participantStates?.find(
+        (p) => p.odUserId === getUserId()
+      );
+      const vrContext = this._activeContext?.vrContext;
+      if (mine && vrContext) {
+        if (Number.isFinite(mine.vrScale) && mine.vrScale > 0) {
+          vrContext.vrScale = mine.vrScale;
+          this._navigationController?.setScale?.(mine.vrScale);
+        }
+        if (mine.mode) this.setNavigationMode(mine.mode);
+      }
+    } catch (err) {
+      // Never let a partial restore break loading the view snapshot itself.
+      log.warn(`VR snapshot: placement restore failed: ${err?.message}`);
+    }
+
+    return snapshot;
   }
 
   getSessionSnapshots() {
@@ -1139,55 +1336,57 @@ class VRExplorationManager extends BaseManager {
       // cloned inputState with the offending trigger stripped, never mutating
       // the object _gatherInputState returned (other consumers below — pose
       // sync, avatars, pointer broadcast — still read the raw poses).
-      const menuResult =
-        vrSpatialUI.update(inputState, {
-          vrScale: vrContext.vrScale,
-          vrOrigin: vrContext.vrOrigin,
-        }) || null;
+      //
+      // Isolated in its own try/catch (unlike the rest of this frame body,
+      // which shares one try/catch below): vrSpatialUI.update() is the
+      // newest, highest-risk per-frame call (canvas/texture work), and this
+      // whole method runs every frame — an uncaught throw here would repeat
+      // on every subsequent frame and stall nav/tools/avatar sync right along
+      // with the menu. Isolating it means a menu-only failure stays
+      // menu-only, and gets logged instead of silently freezing the session.
+      let menuResult = null;
+      try {
+        menuResult =
+          vrSpatialUI.update(inputState, {
+            vrScale: vrContext.vrScale,
+            vrOrigin: vrContext.vrOrigin,
+          }) || null;
+      } catch (e) {
+        log.error(`VR frame: vrSpatialUI.update failed — ${e?.message}`, e?.stack || e);
+      }
       const menuHovering = !!menuResult?.hovering;
       const menuHand = menuResult?.hand || 'right';
       // A pinch used to place/aim an active tool must not ALSO aim teleport.
       const toolActive = !!this._toolManager?.getActiveTool?.();
 
+      // INPUT GATING: in the new layered model, grip stays ALWAYS ON for
+      // world-grab navigation; only trigger is gated by menu/tool. Grip is
+      // never stripped so pulling the world is always available (standard VR
+      // convention, e.g. Meta Quest 3 — the hand is never "interrupted" by UI).
       const navStripHands = new Set();
       const toolStripHands = new Set();
       if (menuHovering) {
+        // Only strip the trigger, not grip (grip is always-on world-grab)
         navStripHands.add(menuHand);
         toolStripHands.add(menuHand);
       }
       if (toolActive) {
-        // Strip both hands' triggers from nav so a tool pinch never drives
-        // locomotion; thumbstick locomotion is untouched (only triggers gated).
+        // Strip both hands' triggers from nav/tools so a tool placement never
+        // drives object-move or menu hover. Grip remains (world navigation).
         navStripHands.add('left');
         navStripHands.add('right');
       }
       const navInput = this._gateInputState(inputState, navStripHands);
       const toolInput = this._gateInputState(inputState, toolStripHands);
 
-      // One-shot input-profile detection: Vision Pro's transient-pointer
-      // sources are grip-less and usually absent from xrSession.inputSources
-      // until the user pinches, so this can't be decided at session start —
-      // it has to happen lazily, on the first frame that actually reports a
-      // controller. If every controller seen is a transient-pointer and the
-      // session is still on the default fly mode (which reads
-      // thumbstick/triggerValue/squeezeValue/buttons — all inert for
-      // gripless sources), switch the default to teleport so the user isn't
-      // frozen in place. Fires at most once per session; the user can still
-      // switch back to fly via the menu afterward.
-      if (!this._inputProfileDetected) {
-        const seenControllers = [inputState.controllers.left, inputState.controllers.right].filter(Boolean);
-        if (seenControllers.length > 0) {
-          this._inputProfileDetected = true;
-          const allTransientPointer = seenControllers.every((c) => c.isTransientPointer === true);
-          if (allTransientPointer && this.getNavigationMode() === EXPLORATION_MODES.FLY) {
-            // Safety net for any session still defaulting to FLY (inert for
-            // gripless input): fall back to GRAB — direct pinch-drag
-            // manipulation — not teleport, so the first pinch moves the data.
-            log.info('Gripless input detected (Vision Pro) — switching default navigation to grab');
-            this.setNavigationMode(EXPLORATION_MODES.GRAB);
-          }
-        }
-      }
+      // NOTE: Vision Pro input detection (transient-pointer) used to trigger a
+      // mode switch here, but the new layered model handles it transparently:
+      // the world-grab predicate checks isTransientPointer and routes pinches
+      // correctly (pinch = grip on Vision Pro, squeeze on tracked controllers).
+      // Locomotion (left stick) and snap turn (right stick) still work on
+      // Vision Pro even though there's no hardware stick (they read zero but
+      // don't hurt). The first time the user pinches, it will pull the world
+      // (world-grab via the injected grip predicate) — no mode switch needed.
 
       // Update navigation (handles movement, teleport, scale). Nav consumes the
       // arbitration-gated clone so a menu pinch / tool pinch can't drive it.
@@ -1602,6 +1801,45 @@ class VRExplorationManager extends BaseManager {
       ).catch((err) => log.warn(`VR visualization sync failed: ${err?.message}`));
     } catch (err) {
       log.warn(`VR visualization sync failed: ${err?.message}`);
+    }
+  }
+
+  /**
+   * Broadcast the active dataset's full transform (position/rotation/scale) after
+   * an in-VR object move, reusing the desktop InstanceToolsPanel patch shape
+   * ({ transform: { position:[x,y,z], rotation:[x,y,z], scale:[x,y,z] } }). The
+   * whole transform is always sent because the Y.js/ViewConfiguration merge is
+   * shallow. Non-final (mid-drag) frames are throttled to ~20/sec; the final
+   * frame (gesture release) is always sent so the resting pose is authoritative.
+   * @param {boolean} final - true on gesture release
+   * @private
+   */
+  _pushObjectTransformPatch(final) {
+    try {
+      const instanceId = this._activeContext?.instance?.instanceId;
+      if (!instanceId) return;
+
+      if (!final) {
+        const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+        if (now - (this._lastObjTransformSentAt || 0) < 50) return;
+        this._lastObjTransformSentAt = now;
+      } else {
+        this._lastObjTransformSentAt = 0; // let the next drag send immediately
+      }
+
+      const position = instanceTools.getPosition?.(instanceId) || [0, 0, 0];
+      const rotation = instanceTools.getRotation?.(instanceId) || [0, 0, 0];
+      const scale = instanceTools.getScale?.(instanceId) || [1, 1, 1];
+
+      this._pushVisualizationPatch({
+        transform: {
+          position: [position[0], position[1], position[2]],
+          rotation: [rotation[0], rotation[1], rotation[2]],
+          scale: [scale[0], scale[1], scale[2]],
+        },
+      });
+    } catch (err) {
+      log.warn(`VR object transform sync failed: ${err?.message}`);
     }
   }
 

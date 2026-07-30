@@ -33,7 +33,9 @@
 // dispatch lives in VRSpatialMenuModel (pure, unit-tested).
 
 import { vr as log } from "@Utils/logger.js";
-import { VRSpatialMenuModel } from "@Core/vr/VRSpatialMenuModel.js";
+import { VRSpatialMenuModel, VR_MENU_GROUPS } from "@Core/vr/VRSpatialMenuModel.js";
+import { getSymbolName } from "@UI/react/components/atoms/Icon/iconRegistry.js";
+import { ICON_PATHS } from "@UI/react/components/atoms/Icon/iconPaths.js";
 
 import vtkActor from "@kitware/vtk.js/Rendering/Core/Actor";
 import vtkMapper from "@kitware/vtk.js/Rendering/Core/Mapper";
@@ -42,11 +44,13 @@ import vtkTexture from "@kitware/vtk.js/Rendering/Core/Texture";
 import vtkImageData from "@kitware/vtk.js/Common/DataModel/ImageData";
 import vtkDataArray from "@kitware/vtk.js/Common/Core/DataArray";
 
-// Physical panel size in meters (WebXR world units before vrScale). Height
-// covers three button rows (0.14m each, matching the original single-row
-// size) — bump by 0.14 if VR_MENU_BUTTONS ever grows another row.
-const PANEL_WIDTH = 0.6;
-const PANEL_HEIGHT = 0.42;
+// Physical panel size in meters (WebXR world units before vrScale). Width is
+// fixed; height is DERIVED per-frame from the model's current row count
+// (ROW_HEIGHT_M * row count, see _currentRowCount/_panelHeight) — it grows by
+// one row automatically while a tool with contextual buttons is active, and
+// shrinks back when it deactivates, with no manual constant to maintain.
+const PANEL_WIDTH = 0.66;
+const ROW_HEIGHT_M = 0.14; // matches the original single-row height
 // Distance in front of head. PANEL_DROP is deliberately generous (well below
 // PANEL_DISTANCE would put a straight-ahead dataset) and PANEL_SIDE_OFFSET
 // nudges the panel off the dead-center forward ray — together they keep the
@@ -61,11 +65,60 @@ const PANEL_SIDE_OFFSET = 0.28; // lateral offset (toward +right), meters
 // Lazy re-anchor: only chase the head after it drifts this far (meters).
 const REANCHOR_DISTANCE = 0.5;
 
-const COLOR_IDLE = [0.14, 0.16, 0.22];
-const COLOR_HOVER = [0.24, 0.42, 0.62];
-const COLOR_ACTIVE = [0.16, 0.52, 0.5];
+// Button/state colours now live in CARD_STYLES (CSS strings) since cards are
+// canvas-drawn rather than solid-tinted quads. See below.
 const COLOR_LABEL = "#f3f5ff"; // matches old COLOR_LABEL = [0.95, 0.96, 1.0]
 const COLOR_STATUS = "#b3c2d9"; // matches old COLOR_STATUS = [0.7, 0.76, 0.85]
+
+// --- Card styling ---------------------------------------------------------
+// Each button background is now a ROUNDED CARD drawn on its own canvas texture
+// (rounded rect fill + border, tinted by state), instead of a flat solid-color
+// quad. Drawing the card on canvas — rather than tinting a textured quad via
+// setColor — sidesteps VTK.js texture/colour-modulation ambiguity: the pixels
+// are exactly what Canvas 2D paints. The card is only redrawn when a button's
+// visual state changes (idle/hover/active), dirty-checked in _applyButtonVisuals.
+const CARD_TEX_W = 220; // card canvas resolution (px) — stretched to the cell
+const CARD_TEX_H = 150;
+const CARD_CORNER_RADIUS = 30; // px on the CARD_TEX canvas
+const CARD_BORDER_WIDTH = 5; // px
+// CSS colour strings (canvas paints in CSS colours). Kept visually in step with
+// the COLOR_* RGB triples above but a touch richer, with an alpha so the dark
+// backing panel reads through the edges.
+const CARD_STYLES = {
+  idle: { fill: "rgba(30,35,48,0.94)", border: "rgba(96,110,146,0.55)" },
+  hover: { fill: "rgba(52,92,140,0.97)", border: "rgba(150,196,255,0.95)" },
+  active: { fill: "rgba(26,110,104,0.97)", border: "rgba(120,232,216,0.98)" },
+};
+
+// Per-activity accent, keyed by a button's `group` (VR_MENU_GROUPS). Applied as
+// the IDLE card's border + a thin top edge bar, so each row of the panel reads
+// as one activity at a glance. Hover/active borders are deliberately left alone
+// so state feedback still reads the same everywhere.
+const GROUP_ACCENTS = {
+  TOOLS: "rgba(255,176,90,0.95)", // amber — create/measure on the data
+  MOVE: "rgba(126,203,255,0.95)", // sky — locomotion + object manipulation
+  VIEW: "rgba(167,231,140,0.95)", // green — scale + appearance
+  SCENE: "rgba(206,160,255,0.95)", // violet — what's shown, save/restore
+  SESSION: "rgba(255,138,168,0.95)", // rose — people, voice, exit
+};
+const GROUP_ACCENT_FALLBACK = "rgba(96,110,146,0.55)";
+// Height of the accent bar along the card's top edge, in CARD_TEX px.
+const GROUP_BAR_H = 10;
+// Raise the hovered/active card slightly toward the user along the panel normal
+// for tactile depth (standard VR button feedback).
+const CARD_HOVER_LIFT = 0.01; // metres (physical), before vrScale
+
+// --- Backing panel --------------------------------------------------------
+// A single dark, rounded, semi-transparent card sits behind the whole grid so
+// the buttons read as one cohesive panel instead of floating tiles.
+const BACKING_TEX_W = 512;
+const BACKING_TEX_H = 512;
+const BACKING_CORNER_RADIUS = 48; // px on the BACKING_TEX canvas
+const BACKING_STYLE = { fill: "rgba(14,17,26,0.74)", border: "rgba(84,98,132,0.5)" };
+const BACKING_HEADER = { fill: "rgba(44,86,132,0.55)" }; // top header band
+const BACKING_PAD_M = 0.045; // padding around the grid, metres
+const BACKING_HEADER_M = 0.075; // header band height, metres
+const BACKING_BEHIND_M = 0.008; // push behind the button plane, metres
 
 // Text labels: rendered as canvas-texture billboards (see _createTextLabelActor),
 // not vtkVectorText — vtkVectorText requires an opentype.js-parsed font via
@@ -79,6 +132,21 @@ const LABEL_LIFT = 0.003; // float above the button quad so it never z-fights
 const STATUS_WORLD_HEIGHT = 0.032;
 const STATUS_MARGIN = 0.03;
 
+// Hint line ("how do I use this"): sits just below the panel's bottom edge —
+// a separate line from the status line above, so the two never get
+// concatenated into one unreadably long piece of text (see
+// VRSpatialMenuModel.getHintLine).
+const HINT_WORLD_HEIGHT = 0.026;
+const HINT_MARGIN = 0.03;
+
+// Reshow tab: the tiny always-on quad shown in place of the full panel while
+// it's manually hidden (VR_MENU_BUTTONS "Hide" button). Anchored at the same
+// point the full panel would occupy, just small — so a user instinctively
+// finds it by looking back where the menu used to be. Uses the exact same
+// ray/pinch hit-test machinery as the full panel (see _intersectReshowTab),
+// so it works identically on gamepad and gripless (Vision Pro) input.
+const RESHOW_TAB_SIZE_M = 0.09;
+
 /**
  * VRSpatialUI — renders the in-session tool panel and routes ray taps back
  * through VRSpatialMenuModel → VRExplorationManager.
@@ -90,11 +158,19 @@ export class VRSpatialUI {
   constructor() {
     this._renderer = null;
     this._model = null;
-    this._buttonActors = new Map(); // buttonId → { actor, region }
+    this._buttonActors = new Map(); // buttonId → { actor, labelActor }
     this._panelAnchor = null; // { center:[x,y,z], right:[..], up:[..], normal:[..] }
     this._lastHeadPos = null;
     this._lastSelectPressed = false;
     this._hoverButtonId = null;
+    // Panel height in metres, derived per-frame from the model's current row
+    // count (ROW_HEIGHT_M * rows) — see _currentRowCount(). Defaults to the 5
+    // static rows so geometry math is sane before the first update() call.
+    this._panelHeight = ROW_HEIGHT_M * 5;
+    // Tracks which tool was active last frame, so the contextual row's actors
+    // are only rebuilt on an actual change (see _reconcileButtonActors),
+    // not every frame.
+    this._lastActiveToolId = null;
     // Status line (dataset / scale / nav mode) — a single dynamic label kept
     // separate from the static button labels since its text changes. Canvas/
     // context/texture/plane are kept around so _redrawStatusLabel can update
@@ -106,6 +182,25 @@ export class VRSpatialUI {
     this._statusActor = null;
     this._statusWorldWidth = 0;
     this._lastStatusText = null;
+    // Hint line ("how do I use this") — same pattern as the status line, kept
+    // as a fully separate actor/canvas so the two lines never collide.
+    this._hintCanvas = null;
+    this._hintCtx = null;
+    this._hintTexture = null;
+    this._hintPlaneSource = null;
+    this._hintActor = null;
+    this._hintWorldWidth = 0;
+    this._lastHintText = null;
+    // Reshow tab — shown instead of the full panel while manually hidden.
+    this._reshowTabActor = null;
+    this._reshowTabLabelActor = null;
+    this._reshowTabCard = null; // {canvas, ctx, texture, stateKey} for hover redraw
+    // Backing panel — one dark rounded card behind the whole button grid.
+    this._backingPanelActor = null;
+    this._backingCanvas = null;
+    this._backingCtx = null;
+    this._backingTexture = null;
+    this._backingPlaneSource = null;
     // XR→data affine (dataPos = xrPos/vrScale + vrOrigin). All panel geometry
     // and hit-testing is computed in physical (XR) metres; these convert the
     // final actor placements into the data-space renderer the VR camera draws,
@@ -156,18 +251,197 @@ export class VRSpatialUI {
 
   _buildActors() {
     if (!this._renderer || !this._model) return;
-    for (const region of this._model.getButtonLayout()) {
-      const actor = this._createButtonActor();
-      const label = this._createTextLabelActor(
-        region.label,
-        BUTTON_LABEL_WORLD_HEIGHT,
-        COLOR_LABEL
-      );
-      this._buttonActors.set(region.id, { actor, region, labelActor: label?.actor ?? null });
-      this._renderer.addActor(actor);
-      if (label) this._renderer.addActor(label.actor);
-    }
+    this._buildBackingPanel();
+    this._reconcileButtonActors();
     this._buildStatusLabel();
+    this._buildHintLabel();
+    this._buildReshowTab();
+  }
+
+  /**
+   * Backing panel: a single dark, rounded, semi-transparent card behind the
+   * whole grid (with a subtle header band) so the buttons read as one cohesive
+   * panel. Drawn once at a fixed texture resolution; the plane is re-sized to
+   * the live panel footprint each frame in _layoutBackingPanel.
+   * @private
+   */
+  _buildBackingPanel() {
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = BACKING_TEX_W;
+      canvas.height = BACKING_TEX_H;
+      const ctx = canvas.getContext("2d");
+
+      const w = canvas.width;
+      const h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+      // Body
+      this._roundRectPath(ctx, 4, 4, w - 8, h - 8, BACKING_CORNER_RADIUS);
+      ctx.fillStyle = BACKING_STYLE.fill;
+      ctx.fill();
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = BACKING_STYLE.border;
+      ctx.stroke();
+      // Header band across the top (proportional to the texture height).
+      const headerPx = Math.round(h * 0.14);
+      this._roundRectPath(ctx, 4, 4, w - 8, headerPx, BACKING_CORNER_RADIUS);
+      ctx.fillStyle = BACKING_HEADER.fill;
+      ctx.fill();
+
+      // Activity legend: one accent swatch + name per group, in row order.
+      // This lives in the header (drawn once at a fixed resolution) rather than
+      // as per-row labels, because the backing plane is STRETCHED to a panel
+      // height that changes whenever the contextual row appears — row-aligned
+      // text on this texture would drift out of register with the actual rows.
+      const cellW = (w - 16) / VR_MENU_GROUPS.length;
+      const midY = 4 + headerPx / 2;
+      const swatch = Math.round(headerPx * 0.3);
+      ctx.font = `600 ${Math.round(headerPx * 0.32)}px Arial, sans-serif`;
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      VR_MENU_GROUPS.forEach((groupName, i) => {
+        const x = 8 + i * cellW;
+        ctx.fillStyle = GROUP_ACCENTS[groupName] || GROUP_ACCENT_FALLBACK;
+        this._roundRectPath(ctx, x, midY - swatch / 2, swatch, swatch, 3);
+        ctx.fill();
+        ctx.fillStyle = COLOR_LABEL;
+        ctx.fillText(groupName, x + swatch + 6, midY + 1);
+      });
+
+      const texture = vtkTexture.newInstance();
+      texture.setInterpolate(true);
+      this._uploadCanvasTexture(canvas, ctx, texture);
+
+      // Seeded as a real unit quad, not the degenerate all-zero plane vtk.js
+      // warns about ("Bad plane definition"); _layoutBackingPanel resizes it
+      // to the live panel footprint on the first frame anyway.
+      const planeSource = vtkPlaneSource.newInstance({
+        origin: [-0.5, -0.5, 0],
+        point1: [0.5, -0.5, 0],
+        point2: [-0.5, 0.5, 0],
+      });
+      const mapper = vtkMapper.newInstance();
+      mapper.setInputConnection(planeSource.getOutputPort());
+      const actor = vtkActor.newInstance();
+      actor.setMapper(mapper);
+      actor.addTexture(texture);
+      actor.getProperty().setLighting(false);
+      actor.getProperty().setOpacity(1.0);
+      actor.setForceTranslucent(true); // see _createButtonActor
+      actor.setVisibility(false);
+      actor.setPickable(false);
+
+      this._backingCanvas = canvas;
+      this._backingCtx = ctx;
+      this._backingTexture = texture;
+      this._backingPlaneSource = planeSource;
+      this._backingPanelActor = actor;
+      this._renderer.addActor(actor);
+    } catch (err) {
+      log.warn(`VR menu backing panel failed: ${err?.message}`);
+    }
+  }
+
+  /**
+   * Size + place the backing panel to sit just behind the button grid, covering
+   * the grid plus padding and a header band above it.
+   * @private
+   */
+  _layoutBackingPanel() {
+    const a = this._panelAnchor;
+    if (!a || !this._backingPanelActor || !this._backingPlaneSource) return;
+    const { center, normal } = a;
+    const yawDeg = (Math.atan2(normal[0], normal[2]) * 180) / Math.PI;
+    const inv = 1 / (this._vrScale || 1.0);
+
+    const width = PANEL_WIDTH + BACKING_PAD_M * 2;
+    const height = this._panelHeight + BACKING_PAD_M * 2 + BACKING_HEADER_M;
+    const hw = width / 2;
+    const hh = height / 2;
+    this._backingPlaneSource.setOrigin(-hw, -hh, 0);
+    this._backingPlaneSource.setPoint1(hw, -hh, 0);
+    this._backingPlaneSource.setPoint2(-hw, hh, 0);
+
+    // Center shifts up by half the header so the grid stays centred below it,
+    // and pushes slightly behind the button plane so cards float in front.
+    const ov = BACKING_HEADER_M / 2;
+    const cx = center[0] + a.up[0] * ov - normal[0] * BACKING_BEHIND_M;
+    const cy = center[1] + a.up[1] * ov - normal[1] * BACKING_BEHIND_M;
+    const cz = center[2] + a.up[2] * ov - normal[2] * BACKING_BEHIND_M;
+    this._backingPanelActor.setPosition(...this._toData([cx, cy, cz]));
+    this._backingPanelActor.setOrientation(0, yawDeg, 0);
+    this._backingPanelActor.setScale(inv, inv, inv);
+    this._backingPanelActor.setVisibility(true);
+  }
+
+  /**
+   * Bring this._buttonActors in sync with the model's CURRENT button layout
+   * (static rows + any active contextual row). Only adds/removes the actors
+   * that actually changed — the 25 static buttons never do, so in practice
+   * this only ever touches the 0-2 contextual-row actors when a tool with
+   * contextual buttons (clip/annotate/probe) activates or deactivates.
+   * Called once at init (empty map → adds everything) and again from
+   * update() whenever the active tool id changes.
+   * @private
+   */
+  _reconcileButtonActors() {
+    if (!this._renderer || !this._model) return;
+    const layout = this._model.getButtonLayout();
+    const currentIds = new Set(layout.map((r) => r.id));
+
+    for (const [id, entry] of this._buttonActors) {
+      if (currentIds.has(id)) continue;
+      this._renderer.removeActor(entry.actor);
+      if (entry.labelActor) this._renderer.removeActor(entry.labelActor);
+      this._buttonActors.delete(id);
+    }
+
+    for (const region of layout) {
+      if (this._buttonActors.has(region.id)) continue;
+      // Per-button isolation: _createButtonContentActor already catches its
+      // own errors and degrades to a label-less quad, but _createButtonActor
+      // and the addActor calls themselves are not guarded. Without this
+      // try/catch, one bad button (e.g. a future icon/vtk.js edge case) would
+      // throw out of the whole loop and leave every button after it — and on
+      // the very first iteration, the ENTIRE panel — missing with no
+      // indication why. Isolating per-button means the rest of the panel
+      // still renders, and the specific failing button is named in the log.
+      try {
+        const card = this._createButtonActor("idle", region.group);
+        const label = this._createButtonContentActor(
+          region.label,
+          region.icon,
+          BUTTON_LABEL_WORLD_HEIGHT,
+          COLOR_LABEL
+        );
+        this._buttonActors.set(region.id, {
+          actor: card.actor,
+          labelActor: label?.actor ?? null,
+          canvas: card.canvas,
+          ctx: card.ctx,
+          texture: card.texture,
+          stateKey: card.stateKey,
+          group: region.group ?? null,
+        });
+        this._renderer.addActor(card.actor);
+        if (label) this._renderer.addActor(label.actor);
+      } catch (err) {
+        log.error(`VR menu button "${region.id}" failed to build — ${err?.message}`, err?.stack || err);
+      }
+    }
+  }
+
+  /**
+   * Panel height (metres) for the CURRENT frame, derived from the model's
+   * live row count so it grows/shrinks automatically with the contextual
+   * row — no hardcoded constant to bump when VR_MENU_BUTTONS changes shape.
+   * @private
+   */
+  _currentRowCount() {
+    if (!this._model) return 5;
+    const layout = this._model.getButtonLayout();
+    if (!layout.length) return 5;
+    return Math.max(...layout.map((r) => r.row)) + 1;
   }
 
   /**
@@ -183,13 +457,18 @@ export class VRSpatialUI {
       canvas.height = 1;
       const ctx = canvas.getContext("2d");
 
-      const texture = vtkTexture.newInstance();
+      // resizable:true is REQUIRED here. This label's canvas is re-sized to fit
+      // each new string (see _redrawStatusLabel/_redrawHintLabel), and on WebGL2
+      // vtk.js allocates non-resizable textures with texStorage2D, which makes
+      // them immutable — every upload after the first would silently fail and
+      // the text would freeze on its first value.
+      const texture = vtkTexture.newInstance({ resizable: true });
       texture.setInterpolate(true);
 
       const planeSource = vtkPlaneSource.newInstance({
-        origin: [0, 0, 0],
-        point1: [0, 0, 0],
-        point2: [0, 0, 0],
+        origin: [-0.5, -0.5, 0],
+        point1: [0.5, -0.5, 0],
+        point2: [-0.5, 0.5, 0],
       });
       const mapper = vtkMapper.newInstance();
       mapper.setInputConnection(planeSource.getOutputPort());
@@ -199,6 +478,7 @@ export class VRSpatialUI {
       actor.addTexture(texture);
       actor.getProperty().setOpacity(1.0);
       actor.getProperty().setLighting(false);
+      actor.setForceTranslucent(true); // see _createButtonActor
       actor.setVisibility(false);
       actor.setPickable(false);
 
@@ -214,8 +494,36 @@ export class VRSpatialUI {
     }
   }
 
-  _createButtonActor() {
+  /**
+   * Build a rounded-card button background: a plane textured with a canvas that
+   * paints a rounded-rect fill + border in the given visual state. Returns a
+   * bundle (actor + the canvas/ctx/texture needed to redraw it on state change,
+   * plus the current stateKey for dirty-checking). Replaces the old flat
+   * solid-colour quad — the "just a rectangle" look the redesign removes.
+   * @param {"idle"|"hover"|"active"} [stateKey]
+   * @private
+   */
+  _createButtonActor(stateKey = "idle", group = null) {
+    const canvas = document.createElement("canvas");
+    canvas.width = CARD_TEX_W;
+    canvas.height = CARD_TEX_H;
+    const ctx = canvas.getContext("2d");
+
+    const texture = vtkTexture.newInstance();
+    texture.setInterpolate(true);
+
+    // CENTERED on its own local origin, spanning [-0.5,0.5]². vtkPlaneSource's
+    // DEFAULTS (origin [0,0,0], point1 [1,0,0], point2 [0,1,0]) span [0,1]²
+    // instead — relying on them here put every card half a cell up-and-right of
+    // the cell centre _layoutButtons positions it at, so the visible card no
+    // longer coincided with the hit region hitTest() uses (you pressed the
+    // card's neighbour) nor with its own centred icon+label billboard (which
+    // landed on the card's bottom-left corner). Every other plane in this file
+    // is authored centred; this one must be too.
     const plane = vtkPlaneSource.newInstance({
+      origin: [-0.5, -0.5, 0],
+      point1: [0.5, -0.5, 0],
+      point2: [-0.5, 0.5, 0],
       xResolution: 1,
       yResolution: 1,
     });
@@ -223,12 +531,74 @@ export class VRSpatialUI {
     mapper.setInputConnection(plane.getOutputPort());
     const actor = vtkActor.newInstance();
     actor.setMapper(mapper);
-    actor.getProperty().setColor(...COLOR_IDLE);
+    actor.addTexture(texture);
     actor.getProperty().setLighting(false);
+    actor.getProperty().setOpacity(1.0);
+    // vtkActor.getIsOpaque() inspects model.texture, which addTexture() never
+    // writes (it appends to model.textures), so a textured-but-opacity-1 actor
+    // is classified opaque and renders with depthMask(true) — its transparent
+    // rounded corners then punch holes in the backing panel behind it. Forcing
+    // the translucent pass makes the alpha composite correctly.
+    actor.setForceTranslucent(true);
     actor.setVisibility(false);
     // Menu chrome must never be picked by the data-space tools.
     actor.setPickable(false);
-    return actor;
+
+    this._drawCard(ctx, canvas, texture, stateKey, group);
+    return { actor, canvas, ctx, texture, stateKey, group };
+  }
+
+  /**
+   * Trace a rounded-rect path (works without native ctx.roundRect, which jsdom
+   * and some canvases lack). Corners are clamped so tiny cards stay valid.
+   * @private
+   */
+  _roundRectPath(ctx, x, y, w, h, r) {
+    const rr = Math.max(0, Math.min(r, w / 2, h / 2));
+    ctx.beginPath();
+    ctx.moveTo(x + rr, y);
+    ctx.lineTo(x + w - rr, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + rr);
+    ctx.lineTo(x + w, y + h - rr);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+    ctx.lineTo(x + rr, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - rr);
+    ctx.lineTo(x, y + rr);
+    ctx.quadraticCurveTo(x, y, x + rr, y);
+    ctx.closePath();
+  }
+
+  /**
+   * Paint a button card (rounded rect fill + border) for the given state onto
+   * its canvas and re-upload the texture. Cheap; only called on state change.
+   * @private
+   */
+  _drawCard(ctx, canvas, texture, stateKey, group) {
+    const style = CARD_STYLES[stateKey] || CARD_STYLES.idle;
+    const accent = GROUP_ACCENTS[group] || GROUP_ACCENT_FALLBACK;
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    const inset = CARD_BORDER_WIDTH;
+    this._roundRectPath(ctx, inset, inset, w - inset * 2, h - inset * 2, CARD_CORNER_RADIUS);
+    ctx.fillStyle = style.fill;
+    ctx.fill();
+    // Idle cards carry their activity's accent as the border; hover/active keep
+    // their own state colour so the selection feedback stays unambiguous.
+    ctx.lineWidth = CARD_BORDER_WIDTH;
+    ctx.strokeStyle = stateKey === "idle" ? accent : style.border;
+    ctx.stroke();
+
+    // Accent bar along the top edge, clipped to the rounded card, so the group
+    // stays identifiable even while a card is hovered or active.
+    ctx.save();
+    this._roundRectPath(ctx, inset, inset, w - inset * 2, h - inset * 2, CARD_CORNER_RADIUS);
+    ctx.clip();
+    ctx.fillStyle = accent;
+    ctx.fillRect(inset, inset, w - inset * 2, GROUP_BAR_H);
+    ctx.restore();
+
+    this._uploadCanvasTexture(canvas, ctx, texture);
   }
 
   /**
@@ -300,6 +670,119 @@ export class VRSpatialUI {
   }
 
   /**
+   * Icon + label canvas-texture billboard for a menu button — same technique
+   * as _createTextLabelActor (offscreen canvas → vtkTexture on a plane sized
+   * to the canvas's own aspect ratio), extended to draw the button's Material
+   * Symbols glyph (from ICON_PATHS, reused from the desktop icon system — no
+   * separate VR asset pipeline) to the left of the label, both on one canvas
+   * so they upload as a single texture/actor. Falls back to label-only if the
+   * icon key doesn't resolve to path data (defensive; every current button
+   * has a valid icon).
+   *
+   * @param {string} text
+   * @param {string} iconKey - semantic icon name (VR_MENU_BUTTONS `icon` field)
+   * @param {number} worldHeight - label height in physical metres (before vrScale)
+   * @param {string} cssColor - fill color for both icon and text
+   * @returns {{actor:object, worldWidth:number, worldHeight:number}|null}
+   * @private
+   */
+  _createButtonContentActor(text, iconKey, worldHeight, cssColor) {
+    const str = text || "";
+    if (!str) return null;
+    try {
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d");
+      const pxHeight = 48;
+      const font = `600 ${Math.round(pxHeight * 0.6)}px Arial, sans-serif`;
+      ctx.font = font;
+      const measured = ctx.measureText(str).width;
+      const padding = pxHeight * 0.4;
+
+      const symbolName = iconKey ? getSymbolName(iconKey) : null;
+      const hasIconGlyph = !!(symbolName && ICON_PATHS[symbolName]);
+      const iconSize = pxHeight * 0.72;
+      const iconGap = pxHeight * 0.18;
+      const iconBlockWidth = hasIconGlyph ? iconSize + iconGap : 0;
+
+      canvas.width = Math.max(1, Math.ceil(iconBlockWidth + measured + padding * 2));
+      canvas.height = pxHeight;
+      // Resizing the canvas resets its 2D context state — re-apply the font.
+      ctx.font = font;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      let textStartX = padding;
+      if (hasIconGlyph) {
+        const iconTop = (pxHeight - iconSize) / 2;
+        this._drawIconGlyph(ctx, symbolName, padding, iconTop, iconSize, cssColor);
+        textStartX = padding + iconBlockWidth;
+      }
+
+      ctx.fillStyle = cssColor;
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      ctx.fillText(str, textStartX, canvas.height / 2 + 1);
+
+      const texture = vtkTexture.newInstance();
+      texture.setInterpolate(true);
+      this._uploadCanvasTexture(canvas, ctx, texture);
+
+      const worldWidth = worldHeight * (canvas.width / canvas.height);
+      const hw = worldWidth / 2;
+      const hh = worldHeight / 2;
+      const planeSource = vtkPlaneSource.newInstance({
+        origin: [-hw, -hh, 0],
+        point1: [hw, -hh, 0],
+        point2: [-hw, hh, 0],
+      });
+      const mapper = vtkMapper.newInstance();
+      mapper.setInputConnection(planeSource.getOutputPort());
+
+      const actor = vtkActor.newInstance();
+      actor.setMapper(mapper);
+      actor.addTexture(texture);
+      actor.getProperty().setOpacity(1.0);
+      actor.getProperty().setLighting(false);
+      // The icon/label canvas is transparent everywhere except the glyph and
+      // text, so it MUST composite rather than write depth. See _createButtonActor.
+      actor.setForceTranslucent(true);
+      actor.setVisibility(false);
+      actor.setPickable(false);
+      return { actor, worldWidth, worldHeight };
+    } catch (err) {
+      log.warn(`VR menu button content failed for "${str}": ${err?.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Draw a Material Symbols glyph (ICON_PATHS SVG path data, authored on the
+   * standard "0 -960 960 960" viewBox) into a square region of a 2D canvas.
+   *
+   * Path2D accepts SVG path syntax directly, so the only work is mapping the
+   * viewBox into the target square. The transform below reproduces exactly
+   * what an SVG viewer would do: translate to the target box origin, scale by
+   * (boxSize/960), then translate by (0, 960) so svgY=-960 (top of glyph)
+   * lands at the box's top edge and svgY=0 (bottom) lands at its bottom edge
+   * — i.e. standard top-down orientation, matching how the label text is
+   * already drawn on this same canvas. No extra vertical flip is needed here:
+   * _uploadCanvasTexture flips the WHOLE canvas uniformly for the WebGL
+   * texture, exactly as it already does for text.
+   * @private
+   */
+  _drawIconGlyph(ctx, symbolName, x, y, size, cssColor) {
+    const pathData = ICON_PATHS[symbolName];
+    if (!pathData) return;
+    const scale = size / 960;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(scale, scale);
+    ctx.translate(0, 960);
+    ctx.fillStyle = cssColor;
+    ctx.fill(new Path2D(pathData));
+    ctx.restore();
+  }
+
+  /**
    * Redraw the (dynamic) status canvas for new text, re-upload its texture,
    * and resize its plane to match the new text's aspect ratio.
    * @private
@@ -330,6 +813,112 @@ export class VRSpatialUI {
     this._statusPlaneSource.setPoint1(hw, -hh, 0);
     this._statusPlaneSource.setPoint2(-hw, hh, 0);
     this._statusWorldWidth = worldWidth;
+  }
+
+  /**
+   * Hint line actor ("how do I use this right now") — same canvas-texture/
+   * dirty-check pattern as the status label, kept as fully separate fields so
+   * the two lines never collide into one string.
+   * @private
+   */
+  _buildHintLabel() {
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = 1;
+      canvas.height = 1;
+      const ctx = canvas.getContext("2d");
+
+      // resizable:true is REQUIRED here. This label's canvas is re-sized to fit
+      // each new string (see _redrawStatusLabel/_redrawHintLabel), and on WebGL2
+      // vtk.js allocates non-resizable textures with texStorage2D, which makes
+      // them immutable — every upload after the first would silently fail and
+      // the text would freeze on its first value.
+      const texture = vtkTexture.newInstance({ resizable: true });
+      texture.setInterpolate(true);
+
+      const planeSource = vtkPlaneSource.newInstance({
+        origin: [-0.5, -0.5, 0],
+        point1: [0.5, -0.5, 0],
+        point2: [-0.5, 0.5, 0],
+      });
+      const mapper = vtkMapper.newInstance();
+      mapper.setInputConnection(planeSource.getOutputPort());
+
+      const actor = vtkActor.newInstance();
+      actor.setMapper(mapper);
+      actor.addTexture(texture);
+      actor.getProperty().setOpacity(1.0);
+      actor.getProperty().setLighting(false);
+      actor.setForceTranslucent(true); // see _createButtonActor
+      actor.setVisibility(false);
+      actor.setPickable(false);
+
+      this._hintCanvas = canvas;
+      this._hintCtx = ctx;
+      this._hintTexture = texture;
+      this._hintPlaneSource = planeSource;
+      this._hintActor = actor;
+      this._hintWorldWidth = 0;
+      this._renderer.addActor(actor);
+    } catch (err) {
+      log.warn(`VR menu hint label failed: ${err?.message}`);
+    }
+  }
+
+  /** @private */
+  _redrawHintLabel(text) {
+    const canvas = this._hintCanvas;
+    const ctx = this._hintCtx;
+    const pxHeight = 40; // slightly smaller than status/button text — secondary info
+    const font = `400 ${Math.round(pxHeight * 0.5)}px Arial, sans-serif`;
+    ctx.font = font;
+    const measured = ctx.measureText(text).width;
+    const padding = pxHeight * 0.4;
+    canvas.width = Math.max(1, Math.ceil(measured + padding * 2));
+    canvas.height = pxHeight;
+    ctx.font = font; // re-apply after resize
+    ctx.fillStyle = COLOR_STATUS;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillText(text, canvas.width / 2, canvas.height / 2 + 1);
+    this._uploadCanvasTexture(canvas, ctx, this._hintTexture);
+
+    const worldHeight = HINT_WORLD_HEIGHT;
+    const worldWidth = worldHeight * (canvas.width / canvas.height);
+    const hw = worldWidth / 2;
+    const hh = worldHeight / 2;
+    this._hintPlaneSource.setOrigin(-hw, -hh, 0);
+    this._hintPlaneSource.setPoint1(hw, -hh, 0);
+    this._hintPlaneSource.setPoint2(-hw, hh, 0);
+    this._hintWorldWidth = worldWidth;
+  }
+
+  /**
+   * The tiny always-on quad shown instead of the full panel while it's
+   * manually hidden. Built once at init alongside the rest of the panel; its
+   * own per-frame positioning/hit-testing happens in _updateReshowTab.
+   * @private
+   */
+  _buildReshowTab() {
+    if (!this._renderer) return;
+    try {
+      const card = this._createButtonActor();
+      this._reshowTabActor = card.actor;
+      this._reshowTabCard = card; // keep canvas/ctx/texture for hover redraw
+      this._renderer.addActor(card.actor);
+
+      const label = this._createButtonContentActor(
+        "Menu",
+        "menu",
+        BUTTON_LABEL_WORLD_HEIGHT * 0.85,
+        COLOR_LABEL
+      );
+      this._reshowTabLabelActor = label?.actor ?? null;
+      if (this._reshowTabLabelActor) this._renderer.addActor(this._reshowTabLabelActor);
+    } catch (err) {
+      log.error(`VR menu reshow tab failed to build — ${err?.message}`, err?.stack || err);
+    }
   }
 
   /**
@@ -373,12 +962,14 @@ export class VRSpatialUI {
    * @returns {{hovering:boolean, buttonId:string|null, hand:string}|null}
    *   Input-arbitration result for the frame loop: whether the pointer is over
    *   a menu button (so its pinch should NOT also drive nav/tools) and which
-   *   hand did the picking. Returns null when the menu is not initialized /
-   *   not visible / has no input — the frame loop treats that as "no menu
-   *   interaction this frame".
+   *   hand did the picking. Returns null when the menu is not initialized or
+   *   has no input — the frame loop treats that as "no menu interaction this
+   *   frame". While manually hidden, only the tiny reshow tab is hit-tested
+   *   (see _updateReshowTab) — the full button grid does not run at all, so
+   *   tool triggers elsewhere in the view behave completely normally.
    */
   update(inputState, transform) {
-    if (!this._model?.isVisible() || !inputState) return null;
+    if (!this._model || !inputState) return null;
 
     // Latch the current XR→data transform so _layoutButtons/_layoutStatus can
     // place the panel in the data-space renderer at a fixed physical size.
@@ -387,13 +978,32 @@ export class VRSpatialUI {
       this._vrOrigin = transform.vrOrigin || [0, 0, 0];
     }
 
+    if (!this._model.isVisible()) {
+      this._hideFullPanelActors();
+      return this._updateReshowTab(inputState);
+    }
+    if (this._reshowTabActor) this._reshowTabActor.setVisibility(false);
+    if (this._reshowTabLabelActor) this._reshowTabLabelActor.setVisibility(false);
+
     // Keep highlights aligned with the manager (tool may have changed via the
     // DOM menu, isolation via the B-button).
     this._model.syncFromManager();
 
+    // Rebuild only the contextual row's actors when the active tool changes
+    // (not the whole panel) — avoids tearing down/recreating all 25 static
+    // buttons every time a tool toggles.
+    const activeToolId = this._model.getActiveToolId();
+    if (activeToolId !== this._lastActiveToolId) {
+      this._lastActiveToolId = activeToolId;
+      this._reconcileButtonActors();
+    }
+    this._panelHeight = ROW_HEIGHT_M * this._currentRowCount();
+
     this._updateAnchor(inputState.headPose);
+    this._layoutBackingPanel();
     this._layoutButtons();
     this._layoutStatus();
+    this._layoutHint();
 
     const ray = this._pickRay(inputState);
     const hit = ray ? this._intersectPanel(ray.origin, ray.direction) : null;
@@ -406,11 +1016,22 @@ export class VRSpatialUI {
     }
     this._lastSelectPressed = selectPressed;
 
-    this._applyColors();
+    this._applyButtonVisuals();
 
     // The picking hand mirrors _pickRay's preference (right, else left).
     const hand = inputState.controllers?.right ? "right" : "left";
     return { hovering: !!this._hoverButtonId, buttonId: this._hoverButtonId ?? null, hand };
+  }
+
+  /** Hide every full-panel actor (backing/buttons/labels/status/hint) while the reshow tab is shown. @private */
+  _hideFullPanelActors() {
+    if (this._backingPanelActor) this._backingPanelActor.setVisibility(false);
+    for (const { actor, labelActor } of this._buttonActors.values()) {
+      actor.setVisibility(false);
+      if (labelActor) labelActor.setVisibility(false);
+    }
+    if (this._statusActor) this._statusActor.setVisibility(false);
+    if (this._hintActor) this._hintActor.setVisibility(false);
   }
 
   /**
@@ -462,6 +1083,10 @@ export class VRSpatialUI {
 
   /**
    * Position each button quad inside the panel frame from its UV region.
+   * Always reads a FRESH getButtonLayout() (not a cached region from
+   * _buttonActors) because row heights depend on total row count — when the
+   * contextual row appears/disappears, every static button's v-position
+   * shifts too, even though its own actor didn't change.
    * @private
    */
   _layoutButtons() {
@@ -476,20 +1101,34 @@ export class VRSpatialUI {
     const yawDeg = (Math.atan2(a.normal[0], a.normal[2]) * 180) / Math.PI;
     const inv = 1 / (this._vrScale || 1.0);
 
-    for (const { actor, region, labelActor } of this._buttonActors.values()) {
+    // Gap between adjacent cards (fraction of the cell) so the rounded cards
+    // read as distinct tiles rather than a merged sheet.
+    const CARD_FILL = 0.88;
+
+    for (const region of this._model.getButtonLayout()) {
+      const entry = this._buttonActors.get(region.id);
+      if (!entry) continue; // reconciled out this frame; skip
+      const { actor, labelActor } = entry;
+
+      // Raise the hovered card toward the user for tactile depth (uses the
+      // previous frame's hover — a 1-frame lag is imperceptible and keeps this
+      // hot path from re-running the hit-test).
+      const lift = region.id === this._hoverButtonId ? CARD_HOVER_LIFT : 0;
+
       // UV center → offset from panel center, in meters
       const ou = (region.cu - 0.5) * PANEL_WIDTH;
-      const ov = (region.cv - 0.5) * PANEL_HEIGHT;
-      const cx = center[0] + right[0] * ou + up[0] * ov;
-      const cy = center[1] + right[1] * ou + up[1] * ov;
-      const cz = center[2] + right[2] * ou + up[2] * ov;
+      const ov = (region.cv - 0.5) * this._panelHeight;
+      const cx = center[0] + right[0] * ou + up[0] * ov + a.normal[0] * lift;
+      const cy = center[1] + right[1] * ou + up[1] * ov + a.normal[1] * lift;
+      const cz = center[2] + right[2] * ou + up[2] * ov + a.normal[2] * lift;
       actor.setPosition(...this._toData([cx, cy, cz]));
       actor.setOrientation(0, yawDeg, 0);
 
-      // Scale unit plane to cell size (plane source spans [-0.5,0.5]), then by
+      // Scale the centred unit plane (spans [-0.5,0.5], see _createButtonActor)
+      // to cell size, inset by CARD_FILL for the inter-card gap, then by
       // 1/vrScale so it renders at its authored physical size in data space.
-      const w = (region.u1 - region.u0) * PANEL_WIDTH;
-      const h = (region.v1 - region.v0) * PANEL_HEIGHT;
+      const w = (region.u1 - region.u0) * PANEL_WIDTH * CARD_FILL;
+      const h = (region.v1 - region.v0) * this._panelHeight * CARD_FILL;
       actor.setScale(w * inv, h * inv, inv);
       actor.setVisibility(true);
 
@@ -497,7 +1136,8 @@ export class VRSpatialUI {
         // The label plane is already centered on its own local origin and
         // sized to the text's measured aspect ratio (see
         // _createTextLabelActor), so it just needs to sit at the cell center,
-        // lifted slightly off the quad along the normal so it never z-fights.
+        // lifted slightly off the card along the normal (plus the hover lift)
+        // so it never z-fights.
         labelActor.setPosition(
           ...this._toData([
             cx + a.normal[0] * LABEL_LIFT,
@@ -536,7 +1176,7 @@ export class VRSpatialUI {
     const { center, up } = a;
     const yawDeg = (Math.atan2(a.normal[0], a.normal[2]) * 180) / Math.PI;
 
-    const topEdgeOv = 0.5 * PANEL_HEIGHT;
+    const topEdgeOv = 0.5 * this._panelHeight;
     const ov = topEdgeOv + STATUS_MARGIN + STATUS_WORLD_HEIGHT * 0.5;
 
     const cx = center[0] + up[0] * ov;
@@ -556,13 +1196,67 @@ export class VRSpatialUI {
     this._statusActor.setVisibility(true);
   }
 
-  _applyColors() {
+  /**
+   * Position the "how do I use this" hint line just BELOW the panel's bottom
+   * edge (mirrors _layoutStatus, which sits above the top edge) — kept
+   * separate so it never gets concatenated with the status line's session
+   * state into one unreadable string.
+   * @private
+   */
+  _layoutHint() {
+    const a = this._panelAnchor;
+    if (!a || !this._hintActor) return;
+
+    const text = this._model.getHintLine();
+    if (text !== this._lastHintText) {
+      this._lastHintText = text;
+      if (text) this._redrawHintLabel(text);
+    }
+    if (!text) {
+      this._hintActor.setVisibility(false);
+      return;
+    }
+
+    const { center, up } = a;
+    const yawDeg = (Math.atan2(a.normal[0], a.normal[2]) * 180) / Math.PI;
+
+    const bottomEdgeOv = -0.5 * this._panelHeight;
+    const ov = bottomEdgeOv - HINT_MARGIN - HINT_WORLD_HEIGHT * 0.5;
+
+    const cx = center[0] + up[0] * ov;
+    const cy = center[1] + up[1] * ov;
+    const cz = center[2] + up[2] * ov;
+
+    const inv = 1 / (this._vrScale || 1.0);
+    this._hintActor.setPosition(
+      ...this._toData([
+        cx + a.normal[0] * LABEL_LIFT,
+        cy + a.normal[1] * LABEL_LIFT,
+        cz + a.normal[2] * LABEL_LIFT,
+      ])
+    );
+    this._hintActor.setOrientation(0, yawDeg, 0);
+    this._hintActor.setScale(inv, inv, inv);
+    this._hintActor.setVisibility(true);
+  }
+
+  /**
+   * Repaint each button card for its current visual state (idle / hover /
+   * active), but only when that state actually changed — the card canvas +
+   * texture upload is far more work than the old setColor, so a dirty-check per
+   * button keeps it to the 0-2 buttons whose state flips on a given frame.
+   * @private
+   */
+  _applyButtonVisuals() {
     const states = new Map(this._model.getButtonStates().map((s) => [s.id, s.active]));
-    for (const [id, { actor }] of this._buttonActors) {
-      let color = COLOR_IDLE;
-      if (states.get(id)) color = COLOR_ACTIVE;
-      else if (id === this._hoverButtonId) color = COLOR_HOVER;
-      actor.getProperty().setColor(...color);
+    for (const [id, entry] of this._buttonActors) {
+      let key = "idle";
+      if (states.get(id)) key = "active";
+      else if (id === this._hoverButtonId) key = "hover";
+      if (entry.stateKey !== key && entry.ctx) {
+        this._drawCard(entry.ctx, entry.canvas, entry.texture, key, entry.group);
+        entry.stateKey = key;
+      }
     }
   }
 
@@ -629,9 +1323,110 @@ export class VRSpatialUI {
     const mu = this._dot(local, right);
     const mv = this._dot(local, up);
     const u = mu / PANEL_WIDTH + 0.5;
-    const v = mv / PANEL_HEIGHT + 0.5;
+    const v = mv / this._panelHeight + 0.5;
     if (u < 0 || u > 1 || v < 0 || v > 1) return null;
     return { u, v, t };
+  }
+
+  /**
+   * Same ray/plane intersection as _intersectPanel, but against the tiny
+   * fixed-size reshow-tab region centered on the panel anchor, instead of the
+   * full button grid. Returns a boolean hover flag (the tab has no sub-regions
+   * to distinguish).
+   * @private
+   */
+  _intersectReshowTab(origin, direction) {
+    const a = this._panelAnchor;
+    if (!a) return false;
+    const { center, right, up, normal } = a;
+
+    const denom = this._dot(direction, normal);
+    if (Math.abs(denom) < 1e-6) return false;
+
+    const diff = [center[0] - origin[0], center[1] - origin[1], center[2] - origin[2]];
+    const t = this._dot(diff, normal) / denom;
+    if (t < 0) return false;
+
+    const hit = [
+      origin[0] + direction[0] * t,
+      origin[1] + direction[1] * t,
+      origin[2] + direction[2] * t,
+    ];
+    const local = [hit[0] - center[0], hit[1] - center[1], hit[2] - center[2]];
+    const mu = this._dot(local, right);
+    const mv = this._dot(local, up);
+    const half = RESHOW_TAB_SIZE_M / 2;
+    return Math.abs(mu) <= half && Math.abs(mv) <= half;
+  }
+
+  /**
+   * Per-frame update while the panel is manually hidden: position the tiny
+   * reshow tab at the same anchor the full panel would occupy, hit-test it
+   * against the current ray, and on rising-edge select, show the panel again.
+   * Uses the exact same anchoring/ray/select machinery as the full panel, so
+   * it works identically on gamepad and gripless (Vision Pro) input.
+   * @private
+   */
+  _updateReshowTab(inputState) {
+    if (!this._reshowTabActor) return null;
+    this._updateAnchor(inputState.headPose);
+    const a = this._panelAnchor;
+    if (!a) {
+      this._reshowTabActor.setVisibility(false);
+      if (this._reshowTabLabelActor) this._reshowTabLabelActor.setVisibility(false);
+      return null;
+    }
+
+    const { center, normal } = a;
+    const yawDeg = (Math.atan2(normal[0], normal[2]) * 180) / Math.PI;
+    const inv = 1 / (this._vrScale || 1.0);
+
+    this._reshowTabActor.setPosition(...this._toData(center));
+    this._reshowTabActor.setOrientation(0, yawDeg, 0);
+    this._reshowTabActor.setScale(RESHOW_TAB_SIZE_M * inv, RESHOW_TAB_SIZE_M * inv, inv);
+    this._reshowTabActor.setVisibility(true);
+
+    const ray = this._pickRay(inputState);
+    const hovering = ray ? this._intersectReshowTab(ray.origin, ray.direction) : false;
+    // Redraw the reshow card only on hover-state change (dirty-checked), same
+    // as the button cards — setColor no longer tints a textured card.
+    const key = hovering ? "hover" : "idle";
+    if (this._reshowTabCard && this._reshowTabCard.stateKey !== key) {
+      this._drawCard(
+        this._reshowTabCard.ctx,
+        this._reshowTabCard.canvas,
+        this._reshowTabCard.texture,
+        key,
+        this._reshowTabCard.group
+      );
+      this._reshowTabCard.stateKey = key;
+    }
+
+    if (this._reshowTabLabelActor) {
+      this._reshowTabLabelActor.setPosition(
+        ...this._toData([
+          center[0] + normal[0] * LABEL_LIFT,
+          center[1] + normal[1] * LABEL_LIFT,
+          center[2] + normal[2] * LABEL_LIFT,
+        ])
+      );
+      this._reshowTabLabelActor.setOrientation(0, yawDeg, 0);
+      this._reshowTabLabelActor.setScale(inv, inv, inv);
+      this._reshowTabLabelActor.setVisibility(true);
+    }
+
+    const selectPressed = this._isSelectPressed(inputState);
+    if (selectPressed && !this._lastSelectPressed && hovering) {
+      this._model.setVisible(true);
+      // Hide immediately so the tab doesn't linger under the full panel this
+      // same frame — the next update() call rebuilds the full panel's state.
+      this._reshowTabActor.setVisibility(false);
+      if (this._reshowTabLabelActor) this._reshowTabLabelActor.setVisibility(false);
+    }
+    this._lastSelectPressed = selectPressed;
+
+    const hand = inputState.controllers?.right ? "right" : "left";
+    return { hovering, buttonId: hovering ? "__reshow__" : null, hand };
   }
 
   /** Forward (-Z) vector of a quaternion {x,y,z,w}. @private */
@@ -658,17 +1453,23 @@ export class VRSpatialUI {
   dispose() {
     if (this._model) this._model.onSessionEnd();
     if (this._renderer) {
+      if (this._backingPanelActor) this._renderer.removeActor(this._backingPanelActor);
       for (const { actor, labelActor } of this._buttonActors.values()) {
         this._renderer.removeActor(actor);
         if (labelActor) this._renderer.removeActor(labelActor);
       }
       if (this._statusActor) this._renderer.removeActor(this._statusActor);
+      if (this._hintActor) this._renderer.removeActor(this._hintActor);
+      if (this._reshowTabActor) this._renderer.removeActor(this._reshowTabActor);
+      if (this._reshowTabLabelActor) this._renderer.removeActor(this._reshowTabLabelActor);
     }
     this._buttonActors.clear();
     this._panelAnchor = null;
     this._lastHeadPos = null;
     this._hoverButtonId = null;
     this._lastSelectPressed = false;
+    this._panelHeight = ROW_HEIGHT_M * 5;
+    this._lastActiveToolId = null;
     this._statusCanvas = null;
     this._statusCtx = null;
     this._statusTexture = null;
@@ -676,6 +1477,21 @@ export class VRSpatialUI {
     this._statusActor = null;
     this._statusWorldWidth = 0;
     this._lastStatusText = null;
+    this._hintCanvas = null;
+    this._hintCtx = null;
+    this._hintTexture = null;
+    this._hintPlaneSource = null;
+    this._hintActor = null;
+    this._hintWorldWidth = 0;
+    this._lastHintText = null;
+    this._reshowTabActor = null;
+    this._reshowTabLabelActor = null;
+    this._reshowTabCard = null;
+    this._backingPanelActor = null;
+    this._backingCanvas = null;
+    this._backingCtx = null;
+    this._backingTexture = null;
+    this._backingPlaneSource = null;
     this._renderer = null;
     this._model = null;
     log.debug("VR spatial UI disposed");

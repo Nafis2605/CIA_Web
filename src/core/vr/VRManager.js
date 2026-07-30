@@ -42,6 +42,15 @@ class VRManager extends BaseManager {
     this._mode = "inactive"; // 'inactive' | 'grid' | 'isolated'
     this._xrSession = null;
     this._referenceSpace = null;
+    // The ORIGINAL reference space returned by requestReferenceSpace, kept
+    // separate from _referenceSpace so snap turn can rebuild _referenceSpace as
+    // a fresh yaw-offset of this base each time (getOffsetReferenceSpace is
+    // relative to the space it's called on, so re-offsetting an already-offset
+    // space would compound instead of replace). _referenceSpace is what every
+    // getPose/getViewerPose caller reads, so rotating it turns the whole
+    // world — head, controllers, floor, dataset — together. See applySnapTurn.
+    this._baseReferenceSpace = null;
+    this._yawOffset = 0; // accumulated snap-turn yaw (radians)
     this._xrLayer = null;
     this._isolatedViewId = null;
     this._inputSources = new Map(); // XRInputSource -> controller data
@@ -218,6 +227,9 @@ class VRManager extends BaseManager {
         );
         log.debug("Using local-floor reference space");
       }
+      // Snap turn rebuilds _referenceSpace as a yaw-offset of this base.
+      this._baseReferenceSpace = this._referenceSpace;
+      this._yawOffset = 0;
 
       // Set up WebGL layer if context provided
       if (glContext) {
@@ -343,6 +355,8 @@ class VRManager extends BaseManager {
     // Clear WebXR state
     this._xrSession = null;
     this._referenceSpace = null;
+    this._baseReferenceSpace = null;
+    this._yawOffset = 0;
     this._xrLayer = null;
     this._glContext = null;
     this._frameId = null;
@@ -820,6 +834,59 @@ class VRManager extends BaseManager {
    */
   getReferenceSpace() {
     return this._referenceSpace;
+  }
+
+  /**
+   * Snap-turn the user by a fixed step. This is the standard WebXR way to turn
+   * in place without touching camera/tool math: it replaces _referenceSpace
+   * with a yaw-rotated offset of _baseReferenceSpace, so the NEXT frame's
+   * getViewerPose (head) AND every getPose (controllers) come back already
+   * rotated — head, hands, floor and dataset all turn together, consistently.
+   * The dataset placement (vrOrigin/vrScale) is untouched.
+   *
+   * WebXR's getOffsetReferenceSpace applies the transform as the new space's
+   * origin expressed in the old space, which moves the world OPPOSITE the
+   * intended head turn — so to turn the user by +θ we rotate the space by −θ.
+   * Pivot is the world origin (seated/standing exploration); a head-pivot
+   * refinement can come later if it feels off in-headset.
+   *
+   * @param {number} sign - +1 or -1 (right/left); magnitude ignored
+   * @param {number} [stepRad=Math.PI/6] - turn step in radians (default 30°)
+   * @returns {number} the new accumulated yaw offset (radians)
+   */
+  applySnapTurn(sign, stepRad = Math.PI / 6) {
+    if (!sign) return this._yawOffset;
+    return this.setYaw(this._yawOffset + Math.sign(sign) * stepRad);
+  }
+
+  /**
+   * Set the absolute snap-turn yaw offset (radians), rebuilding _referenceSpace
+   * from _baseReferenceSpace. No-ops (leaving _referenceSpace as-is) if there's
+   * no base space yet or the platform lacks getOffsetReferenceSpace/XRRigidTransform.
+   * @param {number} radians
+   * @returns {number} the applied yaw offset
+   */
+  setYaw(radians) {
+    this._yawOffset = radians;
+    const base = this._baseReferenceSpace;
+    if (
+      !base ||
+      typeof base.getOffsetReferenceSpace !== "function" ||
+      typeof XRRigidTransform !== "function"
+    ) {
+      return this._yawOffset;
+    }
+    try {
+      // Rotate the space by −yaw about world-up (Y). Quaternion for a rotation
+      // of angle a about +Y is (0, sin(a/2), 0, cos(a/2)).
+      const half = -this._yawOffset / 2;
+      const orientation = { x: 0, y: Math.sin(half), z: 0, w: Math.cos(half) };
+      const transform = new XRRigidTransform({ x: 0, y: 0, z: 0 }, orientation);
+      this._referenceSpace = base.getOffsetReferenceSpace(transform);
+    } catch (e) {
+      log.warn(`Snap turn failed: ${e?.message}`);
+    }
+    return this._yawOffset;
   }
 
   /**

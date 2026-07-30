@@ -147,87 +147,9 @@ describe("VRExplorationManager._gatherInputState — transient-pointer support",
   });
 });
 
-describe("VRExplorationManager._onFrame — one-shot gripless navigation-mode switch", () => {
-  const GRIPLESS_SOURCE = {
-    handedness: "none",
-    targetRayMode: "transient-pointer",
-    targetRaySpace: {},
-    gripSpace: null,
-    gamepad: null,
-    hand: null,
-  };
-  const TRACKED_SOURCE = {
-    handedness: "right",
-    targetRaySpace: {},
-    gripSpace: {},
-    gamepad: { buttons: [{ pressed: false, value: 0 }], axes: [] },
-    hand: null,
-  };
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    vrExplorationManager._inputProfileDetected = false;
-    vrExplorationManager._activeContext = { handler: {}, vrContext: {} };
-    vrExplorationManager._navigationController = {
-      getMode: vi.fn(() => "fly"),
-      setMode: vi.fn(),
-      update: vi.fn(() => ({ vrScale: null, position: null })),
-    };
-  });
-
-  afterEach(() => {
-    vrExplorationManager._activeContext = null;
-    vrExplorationManager._navigationController = null;
-    vrExplorationManager._inputProfileDetected = false;
-  });
-
-  it("switches the default fly mode to grab on the first frame that is gripless-only", () => {
-    const frame = makeFrame([GRIPLESS_SOURCE]);
-
-    vrExplorationManager._onFrame({ time: 0, deltaTime: 16, frame, viewerPose: null });
-
-    expect(vrExplorationManager._navigationController.setMode).toHaveBeenCalledTimes(1);
-    expect(vrExplorationManager._navigationController.setMode).toHaveBeenCalledWith("grab");
-    expect(vrExplorationManager._inputProfileDetected).toBe(true);
-  });
-
-  it("does not switch again on a second frame (fires at most once per session)", () => {
-    const frame = makeFrame([GRIPLESS_SOURCE]);
-
-    vrExplorationManager._onFrame({ time: 0, deltaTime: 16, frame, viewerPose: null });
-    expect(vrExplorationManager._navigationController.setMode).toHaveBeenCalledTimes(1);
-
-    vrExplorationManager._navigationController.setMode.mockClear();
-    vrExplorationManager._onFrame({ time: 16, deltaTime: 16, frame, viewerPose: null });
-
-    expect(vrExplorationManager._navigationController.setMode).not.toHaveBeenCalled();
-  });
-
-  it("does not switch when a tracked (non-gripless) controller is present", () => {
-    const frame = makeFrame([TRACKED_SOURCE]);
-
-    vrExplorationManager._onFrame({ time: 0, deltaTime: 16, frame, viewerPose: null });
-
-    expect(vrExplorationManager._navigationController.setMode).not.toHaveBeenCalled();
-    expect(vrExplorationManager._inputProfileDetected).toBe(true);
-  });
-
-  it("does not switch when the current mode is already not fly", () => {
-    vrExplorationManager._navigationController.getMode = vi.fn(() => "teleport");
-    const frame = makeFrame([GRIPLESS_SOURCE]);
-
-    vrExplorationManager._onFrame({ time: 0, deltaTime: 16, frame, viewerPose: null });
-
-    expect(vrExplorationManager._navigationController.setMode).not.toHaveBeenCalled();
-    expect(vrExplorationManager._inputProfileDetected).toBe(true);
-  });
-
-  it("does not detect the input profile on a frame with no controllers at all", () => {
-    const frame = makeFrame([]);
-
-    vrExplorationManager._onFrame({ time: 0, deltaTime: 16, frame, viewerPose: null });
-
-    expect(vrExplorationManager._inputProfileDetected).toBe(false);
-    expect(vrExplorationManager._navigationController.setMode).not.toHaveBeenCalled();
-  });
-});
+// NOTE: The "one-shot gripless navigation-mode switch" feature has been
+// replaced by the always-on layered navigation model. With the new
+// architecture, Vision Pro's gripless input is handled transparently by the
+// grip engagement predicate in setWorldGrabEngagement — it routes pinches
+// to world-grab on Vision Pro (triggerPressed) and squeeze on tracked
+// controllers (squeezeValue > 0.7). No mode switch is needed.

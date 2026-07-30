@@ -108,28 +108,67 @@ export class VRClipBoxTool extends VRToolInterface {
     // A button: invert clipping direction.
     if (right?.buttons?.a && !this._lastAButtonState) {
       this._lastAButtonState = true;
-      try {
-        vtkClippingFeature.invertClipping(instanceId);
-      } catch (err) {
-        log.warn(`Clip plane: invert failed: ${err?.message}`);
-      }
-      return { type: 'clip-box-updated', data: { instanceId, final: true } };
+      return this.invert();
     }
     this._lastAButtonState = right?.buttons?.a || false;
 
     // B button: reset the plane.
     if (right?.buttons?.b && !this._lastBButtonState) {
       this._lastBButtonState = true;
-      try {
-        vtkClippingFeature.resetPlane(instanceId);
-      } catch (err) {
-        log.warn(`Clip plane: reset failed: ${err?.message}`);
-      }
-      return { type: 'clip-box-updated', data: { instanceId, final: true } };
+      return this.reset();
     }
     this._lastBButtonState = right?.buttons?.b || false;
 
     return null;
+  }
+
+  /**
+   * Invert the clip plane's direction. Shared by the A-button shortcut and
+   * the spatial menu's contextual "Invert" button.
+   * @returns {{type:string,data:object}|null} clip-box-updated action, or
+   *   null if there's no active instance to clip.
+   */
+  invert() {
+    const instanceId = this._context?.vrContext?.instanceId;
+    if (!instanceId) return null;
+    try {
+      vtkClippingFeature.invertClipping(instanceId);
+    } catch (err) {
+      log.warn(`Clip plane: invert failed: ${err?.message}`);
+    }
+    return { type: 'clip-box-updated', data: { instanceId, final: true } };
+  }
+
+  /**
+   * Reset the clip plane to its default. Shared by the B-button shortcut and
+   * the spatial menu's contextual "Reset" button.
+   * @returns {{type:string,data:object}|null} clip-box-updated action, or
+   *   null if there's no active instance to clip.
+   */
+  reset() {
+    const instanceId = this._context?.vrContext?.instanceId;
+    if (!instanceId) return null;
+    try {
+      vtkClippingFeature.resetPlane(instanceId);
+    } catch (err) {
+      log.warn(`Clip plane: reset failed: ${err?.message}`);
+    }
+    return { type: 'clip-box-updated', data: { instanceId, final: true } };
+  }
+
+  /**
+   * Undo the last clip change. The clip plane is a single piece of shared
+   * state rather than a stack of discrete items, so the meaningful "undo" is
+   * to put it back to its default — the same thing the contextual Reset button
+   * does. Implements the optional `undoLast` hook that
+   * VRExplorationManager.undoLastToolAction() calls, so the menu's global Undo
+   * button is no longer a silent no-op while the clip tool is active.
+   *
+   * @returns {{type:string,data:object}|null} clip-box-updated action, or null
+   *   if there's no active instance to clip.
+   */
+  undoLast() {
+    return this.reset();
   }
 
   getControllerHints() {

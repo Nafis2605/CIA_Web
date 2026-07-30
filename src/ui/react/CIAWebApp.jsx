@@ -237,7 +237,10 @@ export function CIAWebApp({ username, userId, projectId }) {
   }, [canvasId]);
 
   // ── Voice ─────────────────────────────────────────────────────────────────
-  const voice = useVoiceControls();
+  // Pass the resolved collaboration room id so the voice room is tied to the
+  // session (the actual LiveKit room name is derived from sessionManager via
+  // getVoiceRoomName; roomId here also drives presence/display context).
+  const voice = useVoiceControls({ roomId: resolvedWorkspaceRoomId });
 
   // ── Modal state ───────────────────────────────────────────────────────────
   const [datasetSelectorTarget, setDatasetSelectorTarget] = useState(null);

@@ -44,18 +44,25 @@ export const config = Object.freeze({
     "/yjs-ws"
   ),
 
-  /** LiveKit server URL for voice chat */
+  /** LiveKit media server (SFU) URL for voice chat. Must be an absolute
+   *  ws(s):// URL — WebRTC media is direct/ICE and cannot ride a same-origin
+   *  proxy, so on a headset (Quest/Vision Pro) this has no working localhost
+   *  default and must point at a TLS + TURN reachable SFU (LiveKit Cloud or a
+   *  self-hosted server). See docs/quest-voice-setup.md. */
   liveKitUrl: resolveValue(
     "liveKitUrl",
     typeof __LIVEKIT_URL__ !== "undefined" ? __LIVEKIT_URL__ : undefined,
     "ws://localhost:7880"
   ),
 
-  /** LiveKit token server URL */
+  /** LiveKit token server URL. Defaults to the same-origin proxy path
+   *  "/livekit-token" (resolved against the page origin at fetch time via
+   *  resolveHttpUrl), so it rides the page's TLS/host on LAN/tunnel — see the
+   *  webpack devServer /livekit-token proxy. */
   liveKitTokenUrl: resolveValue(
     "liveKitTokenUrl",
     typeof __LIVEKIT_TOKEN_URL__ !== "undefined" ? __LIVEKIT_TOKEN_URL__ : undefined,
-    "http://localhost:3002"
+    "/livekit-token"
   ),
 
   // ---------------------------------------------------------------------------
