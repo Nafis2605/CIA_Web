@@ -11,12 +11,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | Role | Platform | Notes |
 |------|----------|-------|
 | Dev + render server | **Windows + NVIDIA GPU** | Run Docker with `docker-compose.gpu.yml` override; GPU-accelerated VTK rendering |
-| Primary client | **Apple Vision Pro** (Safari/visionOS) | Thin browser client; no local VTK parsing; receives rendered frames |
-| Secondary client | Desktop browser (Chrome/Firefox/Edge/Safari) | Full feature set |
+| VR client | **Apple Vision Pro** (Safari/visionOS) | Thin browser client; no local VTK parsing; receives rendered frames; gripless transient-pointer (pinch) input |
+| VR client | **Oculus/Meta Quest 2** (Quest Browser) | Full WebXR controller input (thumbstick locomotion, snap turn, grip/trigger); own navigation model in `src/core/vr/navigation/` |
+| Desktop client | Desktop browser (Chrome/Firefox/Edge/Safari) | Full feature set, no headset required |
 | macOS dev | macOS | CPU/Mesa rendering only — no NVIDIA Docker GPU support on macOS; good for frontend and API work |
 
 **For Windows GPU setup:** see `docs/windows-gpu-setup.md`  
-**For Apple Vision Pro:** see `docs/apple-vision-pro.md`
+**For Apple Vision Pro:** see `docs/apple-vision-pro.md`  
+**For Quest 2 (multi-headset voice/avatars):** see `docs/quest-voice-setup.md`
 
 GPU Docker command:
 ```bash
