@@ -6,11 +6,34 @@ import { vr as log } from '@Utils/logger.js';
 import vtkActor from '@kitware/vtk.js/Rendering/Core/Actor';
 import vtkMapper from '@kitware/vtk.js/Rendering/Core/Mapper';
 import vtkSphereSource from '@kitware/vtk.js/Filters/Sources/SphereSource';
+import { VRTextBillboard } from '@Core/vr/ui/VRTextBillboard.js';
 
 // Apparent radius (metres) of a placed-annotation marker sphere, kept constant
 // as the world scales via VRToolInterface._apparentScale.
 const MARKER_APPARENT_RADIUS_M = 0.015;
+const LABEL_APPARENT_HEIGHT_M = 0.02;
 const DEFAULT_MARKER_COLOR = [1, 0.5, 0];
+const LABEL_TEXT_COLOR = '#ffffff';
+const LABEL_BACKGROUND = 'rgba(28,18,6,0.82)';
+
+/**
+ * Marker colours, cycled by the contextual "Color" button.
+ *
+ * This replaced an "annotation mode" cycle (marker/text/drawing) that changed
+ * only stored metadata: render() drew a sphere regardless of mode, and
+ * 'drawing' produced a one-element point list with no stroke accumulation. So
+ * cycling mode changed nothing you could see. Colour is a small thing that is
+ * actually visible, and it already flows through metadata.color into
+ * _createMarkerActor and on to persistence.
+ * @type {ReadonlyArray<{name:string, rgb:number[]}>}
+ */
+export const ANNOTATION_COLORS = Object.freeze([
+  { name: 'Orange', rgb: [1, 0.5, 0] },
+  { name: 'Red', rgb: [0.95, 0.25, 0.25] },
+  { name: 'Green', rgb: [0.3, 0.85, 0.4] },
+  { name: 'Blue', rgb: [0.35, 0.6, 1] },
+  { name: 'Violet', rgb: [0.72, 0.45, 0.95] },
+]);
 
 // The only text-entry mechanism available in VR: a fixed set of preset
 // labels cycled by the spatial menu's "Label" button
@@ -38,12 +61,12 @@ export class VRAnnotationTool extends VRToolInterface {
 
     this._annotations = [];
     this._pendingAnnotation = null;
-    this._annotationMode = 'marker'; // 'marker' | 'text' | 'drawing'
     this._pendingLabel = ANNOTATION_LABEL_PRESETS[0];
+    this._colorIndex = 0;
 
-    // In-headset marker actors, keyed by annotation id. Reconciled against
-    // `this._annotations` in render() only when the count changes (dirty
-    // check), then rescaled every frame for constant apparent size.
+    // In-headset visuals, keyed by annotation id: { actor, label }. Reconciled
+    // against `this._annotations` in render() only when the count changes
+    // (dirty check), then rescaled every frame for constant apparent size.
     this._markerActors = new Map();
     this._renderer = null;
     this._lastRenderedCount = -1;
@@ -79,8 +102,24 @@ export class VRAnnotationTool extends VRToolInterface {
 
     // Constant apparent size regardless of world scale.
     const s = this._apparentScale(MARKER_APPARENT_RADIUS_M);
-    for (const actor of this._markerActors.values()) {
-      actor.setScale(s, s, s);
+    const labelScale = this._apparentScale(LABEL_APPARENT_HEIGHT_M);
+    // Float the label clear of the marker sphere it belongs to.
+    const lift = (MARKER_APPARENT_RADIUS_M * 2) / this._getVrScale();
+
+    for (const annotation of this._annotations) {
+      const entry = this._markerActors.get(annotation.id);
+      if (!entry) continue;
+
+      entry.actor.setScale(s, s, s);
+
+      if (entry.label) {
+        const p = annotation.position || {};
+        entry.label
+          .setPosition(p.x || 0, (p.y || 0) + lift, p.z || 0)
+          .setScale(labelScale)
+          .faceCamera(renderer)
+          .setVisible(true);
+      }
     }
   }
 
@@ -92,10 +131,11 @@ export class VRAnnotationTool extends VRToolInterface {
   _reconcileMarkers(renderer) {
     const liveIds = new Set(this._annotations.map((a) => a.id));
 
-    for (const [id, actor] of this._markerActors) {
+    for (const [id, entry] of this._markerActors) {
       if (!liveIds.has(id)) {
-        renderer.removeActor(actor);
-        actor.delete?.();
+        renderer.removeActor(entry.actor);
+        entry.actor.delete?.();
+        entry.label?.dispose();
         this._markerActors.delete(id);
       }
     }
@@ -103,10 +143,24 @@ export class VRAnnotationTool extends VRToolInterface {
     for (const annotation of this._annotations) {
       if (this._markerActors.has(annotation.id)) continue;
       const actor = this._createMarkerActor(annotation);
-      if (actor) {
-        renderer.addActor(actor);
-        this._markerActors.set(annotation.id, actor);
+      if (!actor) continue;
+      renderer.addActor(actor);
+
+      // The preset label is the ONLY text an annotation can carry in VR
+      // (WebXR's dom-overlay is unsupported in immersive-vr on both target
+      // headsets, so there is no keyboard). Rendering it is what makes an
+      // annotation say something rather than just mark a spot.
+      let label = null;
+      if (annotation.text) {
+        label = new VRTextBillboard({
+          text: annotation.text,
+          worldHeight: LABEL_APPARENT_HEIGHT_M,
+          color: LABEL_TEXT_COLOR,
+          background: LABEL_BACKGROUND,
+        }).attach(renderer);
       }
+
+      this._markerActors.set(annotation.id, { actor, label });
     }
   }
 
@@ -142,11 +196,12 @@ export class VRAnnotationTool extends VRToolInterface {
 
   /** @private Remove all marker actors from the renderer they were added to. */
   _clearMarkers() {
-    if (this._renderer) {
-      for (const actor of this._markerActors.values()) {
-        this._renderer.removeActor(actor);
-        actor.delete?.();
+    for (const entry of this._markerActors.values()) {
+      if (this._renderer) {
+        this._renderer.removeActor(entry.actor);
+        entry.actor.delete?.();
       }
+      entry.label?.dispose();
     }
     this._markerActors.clear();
     this._lastRenderedCount = -1;
@@ -183,20 +238,11 @@ export class VRAnnotationTool extends VRToolInterface {
       }
     }
 
-    // Thumbstick to cycle annotation types
-    const thumbstickX = rightCtrl.thumbstick?.x || 0;
-    if (Math.abs(thumbstickX) > 0.8 && !this._lastThumbstickState) {
-      if (thumbstickX > 0) {
-        this._cycleAnnotationMode(1);
-      } else {
-        this._cycleAnnotationMode(-1);
-      }
-      return {
-        type: 'annotation-mode-changed',
-        data: { mode: this._annotationMode }
-      };
-    }
-    this._lastThumbstickState = Math.abs(thumbstickX) > 0.8;
+    // The thumbstick used to cycle annotation "mode" here. That is gone: it
+    // changed only stored metadata (render() drew a sphere regardless), and the
+    // thumbstick is hardcoded inert for Vision Pro transient pointers anyway,
+    // so it was a Quest-only control for a no-op. Label and Color live on the
+    // menu's contextual row, where both headsets can reach them.
 
     // A button to undo last annotation
     if (rightCtrl.buttons?.a && !this._lastAButtonState) {
@@ -226,42 +272,47 @@ export class VRAnnotationTool extends VRToolInterface {
     return {
       left: {},
       right: {
-        trigger: `Place ${this._annotationMode}`,
-        thumbstick: 'Change annotation type',
+        trigger: 'Place marker',
         a: 'Undo last',
       },
     };
   }
 
+  /**
+   * Advance to the next marker colour (wrapping). Backs the contextual "Color"
+   * button, which replaced the old mode cycle.
+   * @returns {string} the newly-selected colour name
+   */
+  cycleColor() {
+    this._colorIndex = (this._colorIndex + 1) % ANNOTATION_COLORS.length;
+    return ANNOTATION_COLORS[this._colorIndex].name;
+  }
+
+  /** @returns {string} the current colour's name */
+  getPendingColorName() {
+    return ANNOTATION_COLORS[this._colorIndex].name;
+  }
+
   _createAnnotation(hit) {
-    const annotation = {
+    return {
       id: `annot_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      type: this._annotationMode,
+      // Always 'marker'. The old 'text' and 'drawing' modes are gone: the
+      // preset label now renders for EVERY annotation (which is what 'text'
+      // was reaching for), and 'drawing' never accumulated a stroke — it
+      // stored a one-element point list and drew the same sphere. Real
+      // freehand drawing needs trigger-held point accumulation, a polydata
+      // stroke actor, a new persisted type, and desktop rendering support; it
+      // is a separate feature, not a mode flag.
+      type: 'marker',
       position: { ...hit.position },
       normal: hit.normal ? { ...hit.normal } : null,
       timestamp: Date.now(),
-      // The currently-selected preset label (see cycleLabel/ANNOTATION_LABEL_PRESETS)
-      // applies regardless of marker/text/drawing mode — it's the same
-      // underlying "what does this annotation say" concern either way.
+      // The currently-selected preset label — the only text an annotation can
+      // carry in VR (see ANNOTATION_LABEL_PRESETS).
       text: this._pendingLabel || '',
       color: this._getAnnotationColor(),
+      size: 0.02, // 2cm marker
     };
-
-    // Add type-specific data
-    switch (this._annotationMode) {
-      case 'marker':
-        annotation.size = 0.02; // 2cm marker
-        break;
-      case 'text':
-        annotation.fontSize = 0.05;
-        break;
-      case 'drawing':
-        annotation.points = [hit.position];
-        annotation.strokeWidth = 0.005;
-        break;
-    }
-
-    return annotation;
   }
 
   /**
@@ -281,27 +332,15 @@ export class VRAnnotationTool extends VRToolInterface {
     return this._pendingLabel;
   }
 
-  _cycleAnnotationMode(direction) {
-    const modes = ['marker', 'text', 'drawing'];
-    const currentIndex = modes.indexOf(this._annotationMode);
-    const newIndex = (currentIndex + direction + modes.length) % modes.length;
-    this._annotationMode = modes[newIndex];
-  }
-
   /**
-   * Cycle to the next placement mode: marker → text → drawing. Public
-   * single-direction wrapper around _cycleAnnotationMode, shared by the
-   * thumbstick-X shortcut and the spatial menu's contextual "Mode" button.
-   * @returns {string} the newly-selected mode
+   * The colour the next placed annotation will carry. The explicitly-cycled
+   * colour wins; otherwise fall back to the participant's own session colour so
+   * annotations stay attributable at a glance in a shared session.
+   * @private
    */
-  cycleMode() {
-    this._cycleAnnotationMode(1);
-    return this._annotationMode;
-  }
-
   _getAnnotationColor() {
-    // Get user color from context or use default
-    return this._context?.vrContext?.userColor || [1, 0.5, 0];
+    if (this._colorIndex > 0) return ANNOTATION_COLORS[this._colorIndex].rgb;
+    return this._context?.vrContext?.userColor || DEFAULT_MARKER_COLOR;
   }
 
   _performRaycast(controller, frame) {
@@ -318,22 +357,6 @@ export class VRAnnotationTool extends VRToolInterface {
    */
   getAnnotations() {
     return this._annotations;
-  }
-
-  /**
-   * Get current annotation mode
-   */
-  getAnnotationMode() {
-    return this._annotationMode;
-  }
-
-  /**
-   * Set annotation mode
-   */
-  setAnnotationMode(mode) {
-    if (['marker', 'text', 'drawing'].includes(mode)) {
-      this._annotationMode = mode;
-    }
   }
 
   /**

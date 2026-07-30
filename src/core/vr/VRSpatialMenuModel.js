@@ -200,7 +200,10 @@ export const VR_MENU_CONTEXTUAL_BUTTONS = Object.freeze([
   // is no grip to brace against while free-aiming a plane by hand.
   { id: "clip-axis", label: "Axis", icon: "axis3d", kind: "clip-axis", contextTool: "clip", group: "TOOLS" },
   { id: "clip-reset", label: "Reset", icon: "restore", kind: "clip-reset", contextTool: "clip", group: "TOOLS" },
-  { id: "annotation-mode", label: "Mode", icon: "penTool", kind: "annotation-mode", contextTool: "annotate", group: "TOOLS" },
+  // Replaced an "annotation mode" cycle (marker/text/drawing) that changed only
+  // stored metadata — every mode drew the same sphere. Colour is small but
+  // actually visible, and already flows through to persistence.
+  { id: "annotation-color", label: "Color", icon: "palette", kind: "annotation-color", contextTool: "annotate", group: "TOOLS" },
   // Cycles the annotate tool's pending preset label — the only VR text-entry
   // mechanism (see ANNOTATION_LABEL_PRESETS in VRAnnotationTool.js). Contextual
   // rather than static: it is meaningless unless the annotate tool is active,
@@ -467,8 +470,8 @@ export class VRSpatialMenuModel {
         return this._invertClipPlane();
       case "clip-reset":
         return this._resetClipPlane();
-      case "annotation-mode":
-        return this._cycleAnnotationMode();
+      case "annotation-color":
+        return this._cycleAnnotationColor();
       case "probe-continuous":
         return this._toggleProbeContinuous();
       case "probe-clear":
@@ -710,9 +713,9 @@ export class VRSpatialMenuModel {
   }
 
   /** Cycles the active Annotate tool's placement mode: marker → text → drawing. */
-  _cycleAnnotationMode() {
-    const mode = this._call("cycleAnnotationMode");
-    return { handled: true, action: "annotation-mode-changed", mode: mode ?? null };
+  _cycleAnnotationColor() {
+    const color = this._call("cycleAnnotationColor");
+    return { handled: true, action: "annotation-color-changed", color: color ?? null };
   }
 
   /** Toggles the active Probe tool's continuous-sampling mode. */
@@ -1135,7 +1138,10 @@ export class VRSpatialMenuModel {
     if (this._activeToolId) {
       const toolHints = {
         clip: "Grip+drag to aim, A to invert, B to reset",
-        annotate: "Trigger to place, thumbstick to change type, A to undo",
+        // No thumbstick reference: it is hardcoded inert for Vision Pro
+        // transient pointers, and the mode cycle it drove is gone. Label and
+        // Color are on the contextual row, reachable on both headsets.
+        annotate: "Trigger to place · Label/Color on the menu · Undo removes the last",
         // Chained: each pick continues the path from the last point. No
         // B-button reference — Vision Pro has no A/B, so Undo/New Path on the
         // menu are the only controls guaranteed on both headsets.

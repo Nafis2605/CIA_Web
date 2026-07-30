@@ -802,15 +802,19 @@ class VRExplorationManager extends BaseManager {
   }
 
   /**
-   * Cycle the active Annotate tool's placement mode: marker → text → drawing.
-   * No-ops (returns null) if Annotate isn't the active tool. Invoked by the
-   * spatial menu's contextual "Mode" button.
-   * @returns {string|null} the newly-selected mode
+   * Cycle the active Annotate tool's marker colour. No-ops (returns null) if
+   * Annotate isn't the active tool. Invoked by the spatial menu's contextual
+   * "Color" button.
+   *
+   * Replaced cycleAnnotationMode (marker/text/drawing), which changed only
+   * stored metadata — the tool drew the same sphere for every mode, so the
+   * button appeared to do nothing.
+   * @returns {string|null} the newly-selected colour name
    */
-  cycleAnnotationMode() {
+  cycleAnnotationColor() {
     const tool = this._toolManager?.getActiveTool?.();
-    if (tool?.id !== 'annotate' || typeof tool.cycleMode !== 'function') return null;
-    return tool.cycleMode();
+    if (tool?.id !== 'annotate' || typeof tool.cycleColor !== 'function') return null;
+    return tool.cycleColor();
   }
 
   /**

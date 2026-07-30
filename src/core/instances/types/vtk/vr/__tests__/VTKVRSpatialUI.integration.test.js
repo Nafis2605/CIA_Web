@@ -70,7 +70,7 @@ function makeManager(overrides = {}) {
     isGlyphsEnabled: vi.fn(() => false),
     invertClipPlane: vi.fn(),
     resetClipPlane: vi.fn(),
-    cycleAnnotationMode: vi.fn(() => "text"),
+    cycleAnnotationColor: vi.fn(() => "Red"),
     toggleProbeContinuous: vi.fn(() => true),
     isProbeContinuous: vi.fn(() => false),
     clearProbeHistory: vi.fn(),

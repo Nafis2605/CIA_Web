@@ -63,7 +63,7 @@ function makeManager(overrides = {}) {
     isGlyphsEnabled: vi.fn(() => false),
     invertClipPlane: vi.fn(),
     resetClipPlane: vi.fn(),
-    cycleAnnotationMode: vi.fn(() => "text"),
+    cycleAnnotationColor: vi.fn(() => "Red"),
     toggleProbeContinuous: vi.fn(() => true),
     isProbeContinuous: vi.fn(() => false),
     clearProbeHistory: vi.fn(),
@@ -628,10 +628,10 @@ describe("VRSpatialMenuModel — contextual row", () => {
     );
   });
 
-  it("annotate's contextual row is Mode + Label; probe's is Continuous + Clear", () => {
+  it("annotate's contextual row is Color + Label; probe's is Continuous + Clear", () => {
     model.activate("annotate");
     let ids = model.getButtonLayout().filter((b) => b.contextTool === "annotate").map((b) => b.id);
-    expect(ids.sort()).toEqual(["annotation-label", "annotation-mode"]);
+    expect(ids.sort()).toEqual(["annotation-color", "annotation-label"]);
 
     model.activate("annotate"); // deactivate
     model.activate("probe");
@@ -669,11 +669,13 @@ describe("VRSpatialMenuModel — contextual row", () => {
     expect(r2).toMatchObject({ handled: true, action: "clip-reset" });
   });
 
-  it("annotation-mode routes through manager.cycleAnnotationMode", () => {
+  it("annotation-color routes through manager.cycleAnnotationColor", () => {
+    // Replaced annotation-mode, whose marker/text/drawing cycle changed only
+    // stored metadata — every mode rendered the same sphere.
     model.activate("annotate");
-    const r = model.activate("annotation-mode");
-    expect(manager.cycleAnnotationMode).toHaveBeenCalledTimes(1);
-    expect(r).toMatchObject({ handled: true, action: "annotation-mode-changed", mode: "text" });
+    const r = model.activate("annotation-color");
+    expect(manager.cycleAnnotationColor).toHaveBeenCalledTimes(1);
+    expect(r).toMatchObject({ handled: true, action: "annotation-color-changed", color: "Red" });
   });
 
   it("probe-continuous/probe-clear route through the manager", () => {

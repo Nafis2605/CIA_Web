@@ -53,13 +53,31 @@ describe("VRAnnotationTool — preset label", () => {
     expect(action.data.text).toBe(ANNOTATION_LABEL_PRESETS[1]);
   });
 
-  it("works the same for 'text' mode — no more 'Note' placeholder", () => {
-    tool.setAnnotationMode("text");
+  it("carries whichever preset label is selected, with no 'Note' placeholder", () => {
     tool.cycleLabel();
     tool.cycleLabel(); // -> ANNOTATION_LABEL_PRESETS[2] ("Check this")
     const action = tool.handleInput(makeInputState({ triggerPressed: true }), {});
     expect(action.data.text).toBe(ANNOTATION_LABEL_PRESETS[2]);
     expect(action.data.text).not.toBe("Note");
+  });
+
+  it("always creates a 'marker' — text/drawing modes were cosmetic and are gone", () => {
+    // render() drew the same sphere for every mode, and 'drawing' stored a
+    // one-element point list with no stroke accumulation, so cycling mode
+    // changed stored metadata and nothing else.
+    const action = tool.handleInput(makeInputState({ triggerPressed: true }), {});
+    expect(action.data.type).toBe("marker");
+    expect(tool.setAnnotationMode).toBeUndefined();
+    expect(tool.cycleMode).toBeUndefined();
+  });
+
+  it("cycles marker colour, which is visible unlike the old mode cycle", () => {
+    const first = tool.getPendingColorName();
+    const second = tool.cycleColor();
+    expect(second).not.toBe(first);
+
+    const action = tool.handleInput(makeInputState({ triggerPressed: true }), {});
+    expect(Array.isArray(action.data.color)).toBe(true);
   });
 
   it("rising-edge trigger only places once per press", () => {
@@ -113,51 +131,68 @@ describe("VRAnnotationTool — marker rendering", () => {
     );
   }
 
-  it("adds one actor per placed annotation on render", () => {
+  it("builds a marker AND a label per placed annotation", () => {
+    // The label is the point: an annotation carrying "Anomaly" should SAY so
+    // in-headset. Under vtkVectorText it rendered as invisible geometry.
     place();
     tool._lastTriggerState = false; // re-arm trigger for a second placement
     place();
 
     tool.render(renderer);
 
-    expect(renderer.addActor).toHaveBeenCalledTimes(2);
-    expect(renderer.actors.length).toBe(2);
+    expect(tool._markerActors.size).toBe(2);
+    for (const entry of tool._markerActors.values()) {
+      expect(entry.actor).toBeTruthy();
+      expect(entry.label).toBeTruthy();
+    }
+  });
+
+  it("renders the preset label text on the billboard", () => {
+    tool.cycleLabel(); // -> "Anomaly"
+    place();
+    tool.render(renderer);
+
+    const entry = [...tool._markerActors.values()][0];
+    expect(entry.label.getText()).toBe(tool.getPendingLabel());
   });
 
   it("does not rebuild actors when the annotation count is unchanged", () => {
     place();
     tool.render(renderer);
-    expect(renderer.addActor).toHaveBeenCalledTimes(1);
+    const afterFirst = renderer.addActor.mock.calls.length;
 
     tool.render(renderer); // no new annotations
-    expect(renderer.addActor).toHaveBeenCalledTimes(1); // still just one
+    expect(renderer.addActor.mock.calls.length).toBe(afterFirst);
   });
 
   it("scales markers for constant apparent size (baseRadius / vrScale)", () => {
     place();
     tool.render(renderer);
     // MARKER_APPARENT_RADIUS_M (0.015) / vrScale (2) = 0.0075
-    expect(renderer.actors[0].getScale()[0]).toBeCloseTo(0.0075);
+    const entry = [...tool._markerActors.values()][0];
+    expect(entry.actor.getScale()[0]).toBeCloseTo(0.0075);
   });
 
-  it("removes all marker actors on deactivate", async () => {
+  it("removes every actor on deactivate — the renderer is shared with desktop", async () => {
     place();
     tool.render(renderer);
-    expect(renderer.actors.length).toBe(1);
+    expect(renderer.actors.length).toBeGreaterThan(0);
 
     await tool.deactivate();
-    expect(renderer.removeActor).toHaveBeenCalledTimes(1);
+
     expect(renderer.actors.length).toBe(0);
+    expect(tool._markerActors.size).toBe(0);
   });
 
-  it("removes the marker when its annotation is undone", () => {
+  it("removes the marker AND its label when the annotation is undone", () => {
     place();
     tool.render(renderer);
-    expect(renderer.actors.length).toBe(1);
+    expect(renderer.actors.length).toBeGreaterThan(0);
 
     tool.undoLast();
     tool.render(renderer); // reconcile against the now-empty set
-    expect(renderer.removeActor).toHaveBeenCalledTimes(1);
+
     expect(renderer.actors.length).toBe(0);
+    expect(tool._markerActors.size).toBe(0);
   });
 });
