@@ -79,15 +79,25 @@ export const VR_MENU_BUTTONS = Object.freeze([
   { id: "scale-overview", label: "Overview", icon: "minimize", kind: "scale", scaleValue: 0.1, row: 2, group: "VIEW" },
   { id: "scale-normal", label: "Normal", icon: "square", kind: "scale", scaleValue: 1.0, row: 2, group: "VIEW" },
   { id: "scale-detail", label: "Detail", icon: "maximize", kind: "scale", scaleValue: 10.0, row: 2, group: "VIEW" },
-  { id: "representation", label: "Style", icon: "cube", kind: "representation", row: 2, group: "VIEW" },
+  // Two drawers replace what used to be a single blind "Style" cycling button.
+  // Cycling gave no way to see which representation was live (and its highlight
+  // was "active if not surface", so wireframe and points looked identical), and
+  // there was nowhere to put threshold/isosurface at all. See VR_MENU_DRAWERS.
+  { id: "appearance", label: "Style", icon: "cube", kind: "drawer", drawerId: "appearance", row: 2, group: "VIEW" },
+  { id: "filters", label: "Filters", icon: "filter", kind: "drawer", drawerId: "filters", row: 2, group: "VIEW" },
   { id: "glyphs", label: "Glyphs", icon: "arrowUpRight", kind: "glyph-toggle", row: 2, group: "VIEW" },
 
   // ---- Row 3 — SCENE: what is shown, and saving/restoring it ---------------
   { id: "isolation", label: "Isolate", icon: "fullscreen", kind: "toggle", row: 3, group: "SCENE" },
-  { id: "grid", label: "Grid", icon: "layoutGrid", kind: "toggle", row: 3, group: "SCENE" },
+  // Labelled "Views", not "Grid": this lays out your OTHER open views in space
+  // (VRMultiViewGrid) and has nothing to do with a reference grid. The id stays
+  // "grid" so _toggleGrid/isGridModeEnabled/getButtonStates and the existing
+  // tests keep working — only the user-facing label was ever wrong.
+  { id: "grid", label: "Views", icon: "layoutGrid", kind: "toggle", row: 3, group: "SCENE" },
+  { id: "ref-grid", label: "Grid", icon: "grid", kind: "scene-grid", row: 3, group: "SCENE" },
+  { id: "axes", label: "Axes", icon: "axis3d", kind: "scene-axes", row: 3, group: "SCENE" },
   { id: "snapshot-save", label: "Save", icon: "save", kind: "snapshot-save", row: 3, group: "SCENE" },
   { id: "snapshot-load", label: "Load", icon: "folderOpen", kind: "snapshot-load", row: 3, group: "SCENE" },
-  { id: "hide-menu", label: "Hide", icon: "eyeOff", kind: "toggle-visibility", row: 3, group: "SCENE" },
 
   // ---- Row 4 — SESSION: other people, voice, and leaving -------------------
   // Go To/Follow cycle through other session participants rather than a full
@@ -98,8 +108,64 @@ export const VR_MENU_BUTTONS = Object.freeze([
   { id: "follow-participant", label: "Follow", icon: "user", kind: "follow-participant", row: 4, group: "SESSION" },
   { id: "voice-join", label: "Voice", icon: "headsetMic", kind: "voice-join", row: 4, group: "SESSION" },
   { id: "voice-mute", label: "Mute", icon: "mic", kind: "voice-mute", row: 4, group: "SESSION" },
+  { id: "hide-menu", label: "Hide", icon: "eyeOff", kind: "toggle-visibility", row: 4, group: "SESSION" },
   { id: "exit", label: "Exit VR", icon: "doorOpen", kind: "exit", row: 4, group: "SESSION" },
 ]);
+
+/**
+ * The shared numeric stepper row, instantiated into every drawer.
+ *
+ * Kept as a factory rather than a constant so each drawer gets its own frozen
+ * copies (with its own `drawerRow`) while the ids and kinds stay identical —
+ * one set of handlers, one active target, regardless of which drawer is open.
+ *
+ * @param {number} drawerRow - which row within the drawer these occupy
+ * @returns {Array<object>}
+ */
+function STEPPER_ROW_TEMPLATE(drawerRow) {
+  return [
+    { id: "value-target", label: "Target", icon: "target", kind: "value-target", drawerRow, group: "VIEW" },
+    { id: "value-dec", label: "−", icon: "minus", kind: "value-nudge", steps: -1, drawerRow, group: "VIEW" },
+    { id: "value-inc", label: "+", icon: "plus", kind: "value-nudge", steps: 1, drawerRow, group: "VIEW" },
+    { id: "value-reset", label: "Reset", icon: "restore", kind: "value-reset", drawerRow, group: "VIEW" },
+  ];
+}
+
+/**
+ * Drawers: extra button rows that appear above the static grid while their
+ * parent button is open, and vanish when it closes. Exactly one drawer may be
+ * open at a time — that mutual exclusion is what bounds the panel's height.
+ *
+ * The `value-*` stepper row is DELIBERATELY shared by both drawers (same ids,
+ * same kinds, one set of handlers). One stepper retargeted via `value-target`
+ * serves every numeric parameter — point size, line width, threshold bounds,
+ * isovalue, opacity — instead of each growing its own control. That is what
+ * makes these fit on the panel at all.
+ *
+ * Why buttons and not a thumbstick: `_gatherInputState` hardcodes
+ * `thumbstick:{x:0,y:0}`, `squeezePressed:false` and `buttons:{a:false,b:false}`
+ * for Vision Pro transient pointers, so a thumbstick-driven value control
+ * simply would not exist there. Discrete taps use the trigger/pinch — the only
+ * input guaranteed on both Quest and Vision Pro.
+ *
+ * @type {Readonly<Object<string, ReadonlyArray<object>>>}
+ */
+export const VR_MENU_DRAWERS = Object.freeze({
+  appearance: Object.freeze([
+    { id: "rep-surface", label: "Surface", icon: "square", kind: "representation-set", mode: "surface", drawerRow: 0, group: "VIEW" },
+    { id: "rep-wireframe", label: "Wire", icon: "grid", kind: "representation-set", mode: "wireframe", drawerRow: 0, group: "VIEW" },
+    { id: "rep-points", label: "Points", icon: "dotsHorizontal", kind: "representation-set", mode: "points", drawerRow: 0, group: "VIEW" },
+    { id: "grid-plane", label: "Plane", icon: "layers", kind: "grid-plane", drawerRow: 0, group: "VIEW" },
+    ...STEPPER_ROW_TEMPLATE(1),
+  ]),
+  filters: Object.freeze([
+    { id: "threshold-toggle", label: "Threshold", icon: "filter", kind: "threshold-toggle", drawerRow: 0, group: "VIEW" },
+    { id: "threshold-mode", label: "Mode", icon: "sliders", kind: "threshold-mode", drawerRow: 0, group: "VIEW" },
+    { id: "threshold-array", label: "Array", icon: "database", kind: "threshold-array", drawerRow: 0, group: "VIEW" },
+    { id: "iso-toggle", label: "Isosurface", icon: "layers", kind: "iso-toggle", drawerRow: 0, group: "VIEW" },
+    ...STEPPER_ROW_TEMPLATE(1),
+  ]),
+});
 
 /**
  * Ordered activity groups, one per static row (top → bottom). Drives the
@@ -160,6 +226,9 @@ export class VRSpatialMenuModel {
     this._activeToolId = null;
     this._isolated = false;
     this._gridEnabled = false;
+    // Which drawer (if any) is expanded. At most one at a time — that mutual
+    // exclusion is what bounds the panel's height (see VR_MENU_DRAWERS).
+    this._openDrawerId = null;
     // Cycle position through getOtherParticipants() for the Go To/Follow
     // buttons — see _pickNextParticipant.
     this._participantCycleIndex = -1;
@@ -197,16 +266,43 @@ export class VRSpatialMenuModel {
     const contextual = VR_MENU_CONTEXTUAL_BUTTONS.filter(
       (b) => b.contextTool === this._activeToolId
     );
+    const drawer = this._openDrawerId
+      ? VR_MENU_DRAWERS[this._openDrawerId] || []
+      : [];
+
+    // Extra rows stack ABOVE the static grid, assigned negative row indices
+    // (which sort before every static row and, with the top-down v inversion
+    // below, render upward toward eye level). Drawer rows go nearest the static
+    // grid — right under the drawer button that opened them — and the
+    // contextual row sits above those, next to the tool whose options it holds.
+    //
+    // Grouping drawer buttons by their own `drawerRow` first keeps a
+    // multi-row drawer's internal order intact no matter how many rows it has.
+    const extraRows = [];
+    if (drawer.length) {
+      const byDrawerRow = new Map();
+      for (const btn of drawer) {
+        const r = btn.drawerRow ?? 0;
+        if (!byDrawerRow.has(r)) byDrawerRow.set(r, []);
+        byDrawerRow.get(r).push(btn);
+      }
+      // Descending, because extraRows are assigned progressively MORE negative
+      // rows (-1, -2, ...) and more-negative renders higher up the panel. Put
+      // the drawer's own row 0 LAST here and it lands topmost, so a drawer
+      // reads top-down in its declared order — same as the static grid does.
+      const drawerRowIds = [...byDrawerRow.keys()].sort((a, b) => b - a);
+      for (const r of drawerRowIds) extraRows.push(byDrawerRow.get(r));
+    }
+    if (contextual.length) extraRows.push(contextual);
+
     let allButtons = VR_MENU_BUTTONS;
-    if (contextual.length) {
-      // Row -1 sorts before every static row, and with the top-down v mapping
-      // below that renders it as a strip ABOVE the TOOLS row — right next to
-      // the tool whose options it holds, rather than stranded at the far
-      // bottom of the panel.
+    if (extraRows.length) {
       const minStaticRow = Math.min(...VR_MENU_BUTTONS.map((b) => b.row ?? 0));
       allButtons = [
         ...VR_MENU_BUTTONS,
-        ...contextual.map((b) => ({ ...b, row: minStaticRow - 1 })),
+        ...extraRows.flatMap((buttons, i) =>
+          buttons.map((b) => ({ ...b, row: minStaticRow - 1 - i }))
+        ),
       ];
     }
 
@@ -313,6 +409,8 @@ export class VRSpatialMenuModel {
         return this._undo();
       case "toggle":
         return btn.id === "grid" ? this._toggleGrid() : this._toggleIsolation();
+      case "drawer":
+        return this._toggleDrawer(btn.drawerId);
       case "nav-mode":
         return this._cycleNavMode();
       case "nav-mode-set":
@@ -327,8 +425,33 @@ export class VRSpatialMenuModel {
         return this._cycleAnnotationLabel();
       case "representation":
         return this._cycleRepresentation();
+      case "representation-set":
+        return this._setRepresentation(btn.mode);
       case "glyph-toggle":
         return this._toggleGlyphs();
+      // --- Scene chrome (data reference grid + labelled axes) ---------------
+      case "scene-grid":
+        return this._toggleReferenceGrid();
+      case "scene-axes":
+        return this._toggleDataAxes();
+      case "grid-plane":
+        return this._cycleGridPlane();
+      // --- Filters ----------------------------------------------------------
+      case "threshold-toggle":
+        return this._toggleThreshold();
+      case "threshold-mode":
+        return this._cycleThresholdMode();
+      case "threshold-array":
+        return this._cycleThresholdArray();
+      case "iso-toggle":
+        return this._toggleIsosurface();
+      // --- Shared numeric stepper (see VR_MENU_DRAWERS) ----------------------
+      case "value-target":
+        return this._cycleValueTarget();
+      case "value-nudge":
+        return this._nudgeValue(btn.steps);
+      case "value-reset":
+        return this._resetValue();
       case "clip-invert":
         return this._invertClipPlane();
       case "clip-reset":
@@ -444,6 +567,107 @@ export class VRSpatialMenuModel {
     return { handled: true, action: "representation-changed", mode: mode ?? null };
   }
 
+  /**
+   * Set one specific representation (the Appearance drawer's Surface/Wire/
+   * Points buttons), rather than blind-cycling. Cycling gave no way to see
+   * which mode was live, and its highlight was "active if not surface" — so
+   * wireframe and points were indistinguishable on the panel.
+   * @param {'surface'|'wireframe'|'points'} mode
+   * @private
+   */
+  _setRepresentation(mode) {
+    const applied = this._call("setRepresentation", mode);
+    return {
+      handled: true,
+      action: "representation-changed",
+      mode: applied === undefined ? mode : applied ?? null,
+    };
+  }
+
+  /**
+   * Toggle the data reference grid. Distinct from the "Views" button, which
+   * toggles VRMultiViewGrid (other open views laid out in space).
+   * @private
+   */
+  _toggleReferenceGrid() {
+    const visible = this._call("toggleReferenceGrid");
+    return { handled: true, action: "reference-grid-toggled", visible: !!visible };
+  }
+
+  /** Toggle the labelled data axes. @private */
+  _toggleDataAxes() {
+    const visible = this._call("toggleDataAxes");
+    return { handled: true, action: "data-axes-toggled", visible: !!visible };
+  }
+
+  /** Cycle the reference grid's plane (xz -> xy -> yz). @private */
+  _cycleGridPlane() {
+    const plane = this._call("cycleGridPlane");
+    return { handled: true, action: "grid-plane-changed", plane: plane ?? null };
+  }
+
+  /**
+   * Toggle the threshold filter. Reports `available:false` rather than
+   * pretending to work when the dataset has no scalar arrays to threshold on —
+   * the render layer dims the card so a tap that cannot do anything at least
+   * says so (same reasoning as the Views button's "no-other-views").
+   * @private
+   */
+  _toggleThreshold() {
+    if (this._call("isThresholdAvailable") === false) {
+      return { handled: false, action: "threshold-toggled", available: false };
+    }
+    const enabled = this._call("toggleThresholdFilter");
+    return { handled: true, action: "threshold-toggled", enabled: !!enabled, available: true };
+  }
+
+  /** Cycle threshold mode (between -> above -> below). @private */
+  _cycleThresholdMode() {
+    const mode = this._call("cycleThresholdMode");
+    return { handled: true, action: "threshold-mode-changed", mode: mode ?? null };
+  }
+
+  /** Cycle which scalar array the threshold acts on. @private */
+  _cycleThresholdArray() {
+    const arrayName = this._call("cycleThresholdArray");
+    return { handled: true, action: "threshold-array-changed", arrayName: arrayName ?? null };
+  }
+
+  /**
+   * Toggle isosurface extraction. Requires volume/image data, so it is inert
+   * (and dimmed) for plain polydata.
+   * @private
+   */
+  _toggleIsosurface() {
+    if (this._call("isIsosurfaceAvailable") === false) {
+      return { handled: false, action: "isosurface-toggled", available: false };
+    }
+    const enabled = this._call("toggleIsosurface");
+    return { handled: true, action: "isosurface-toggled", enabled: !!enabled, available: true };
+  }
+
+  /** Retarget the shared stepper to the next editable value. @private */
+  _cycleValueTarget() {
+    const target = this._call("cycleValueTarget");
+    return { handled: true, action: "value-target-changed", targetId: target ?? null };
+  }
+
+  /**
+   * Step the active numeric target up or down.
+   * @param {number} steps - signed step count (+1 / -1)
+   * @private
+   */
+  _nudgeValue(steps) {
+    const value = this._call("nudgeValue", steps);
+    return { handled: true, action: "value-nudged", steps, value: value ?? null };
+  }
+
+  /** Restore the active numeric target to its default. @private */
+  _resetValue() {
+    const value = this._call("resetValue");
+    return { handled: true, action: "value-reset", value: value ?? null };
+  }
+
   /** Toggles glyphs via the same desktop VTKGlyphFeature (VRExplorationManager.toggleGlyphs). */
   _toggleGlyphs() {
     const enabled = !!this._call("toggleGlyphs");
@@ -532,6 +756,33 @@ export class VRSpatialMenuModel {
   _toggleVoiceConnection() {
     const connected = !!this._call("toggleVoiceConnection");
     return { handled: true, action: "voice-connection-toggled", connected };
+  }
+
+  /**
+   * Open/close a drawer. Local UI chrome only — no manager call.
+   *
+   * Tapping the open drawer closes it; tapping a different one switches to it.
+   * Opening is exclusive by construction (a single `_openDrawerId`, not a set),
+   * which is what caps the panel at a comfortable height: 5 static rows + at
+   * most 2 drawer rows + at most 1 contextual row.
+   *
+   * @param {string} drawerId - key into VR_MENU_DRAWERS
+   * @returns {{handled:boolean, action:string, drawerId:string|null, open:boolean}}
+   * @private
+   */
+  _toggleDrawer(drawerId) {
+    if (!drawerId || !VR_MENU_DRAWERS[drawerId]) {
+      log.warn(`VRSpatialMenu: unknown drawer "${drawerId}"`);
+      return { handled: false, action: "drawer-toggled", drawerId: null, open: false };
+    }
+    const open = this._openDrawerId !== drawerId;
+    this._openDrawerId = open ? drawerId : null;
+    return { handled: true, action: "drawer-toggled", drawerId, open };
+  }
+
+  /** @returns {string|null} the open drawer's id, or null */
+  getOpenDrawerId() {
+    return this._openDrawerId;
   }
 
   /**
@@ -651,6 +902,7 @@ export class VRSpatialMenuModel {
     this._activeToolId = null;
     this._isolated = false;
     this._gridEnabled = false;
+    this._openDrawerId = null;
     this._participantCycleIndex = -1;
     this._snapshotCycleIndex = -1;
     this._toolTapAtMs = null;
@@ -734,7 +986,12 @@ export class VRSpatialMenuModel {
   getButtonStates() {
     return this.getButtonLayout().map((btn) => {
       let active = false;
+      // `disabled` means "this button cannot do anything right now" (no scalar
+      // arrays to threshold, no volume to isosurface). The render layer dims
+      // the card, so a tap that no-ops at least looks like it will.
+      let disabled = false;
       if (btn.kind === "tool") active = this._activeToolId === btn.toolId;
+      else if (btn.kind === "drawer") active = this._openDrawerId === btn.drawerId;
       else if (btn.id === "isolation") active = this._isolated;
       else if (btn.id === "grid") active = this._gridEnabled;
       // Relative tolerance, not ===. Two-hand pinch mutates vrScale
@@ -752,7 +1009,27 @@ export class VRSpatialMenuModel {
       else if (btn.kind === "representation") {
         const mode = this._call("getRepresentation");
         active = !!mode && mode !== "surface";
-      } else if (btn.kind === "glyph-toggle") active = !!this._call("isGlyphsEnabled");
+      }
+      // Exact match, unlike the legacy cycling button above: each of
+      // Surface/Wire/Points lights only for its own mode, so the panel finally
+      // shows WHICH representation is live.
+      else if (btn.kind === "representation-set") {
+        active = this._call("getRepresentation") === btn.mode;
+      }
+      else if (btn.kind === "scene-grid") active = !!this._call("isReferenceGridVisible");
+      else if (btn.kind === "scene-axes") active = !!this._call("areDataAxesVisible");
+      else if (btn.kind === "threshold-toggle") {
+        active = !!this._call("isThresholdEnabled");
+        disabled = this._call("isThresholdAvailable") === false;
+      } else if (btn.kind === "iso-toggle") {
+        active = !!this._call("isIsosurfaceEnabled");
+        disabled = this._call("isIsosurfaceAvailable") === false;
+      }
+      // Threshold sub-controls are meaningless while threshold is off.
+      else if (btn.kind === "threshold-mode" || btn.kind === "threshold-array") {
+        disabled = !this._call("isThresholdEnabled");
+      }
+      else if (btn.kind === "glyph-toggle") active = !!this._call("isGlyphsEnabled");
       else if (btn.kind === "probe-continuous") active = !!this._call("isProbeContinuous");
       // Only meaningful once connected: voiceRoomService.isMuted initialises to
       // TRUE before any room is joined, which lit the Mute button from the
@@ -763,8 +1040,9 @@ export class VRSpatialMenuModel {
       }
       else if (btn.kind === "voice-join") active = !!this._call("isVoiceConnected");
       // clip-invert/clip-reset/annotation-mode/snapshot-save/snapshot-load/
-      // toggle-visibility are momentary actions — never highlighted.
-      return { id: btn.id, active };
+      // toggle-visibility and the value-* stepper are momentary actions —
+      // never highlighted.
+      return { id: btn.id, active, disabled };
     });
   }
 

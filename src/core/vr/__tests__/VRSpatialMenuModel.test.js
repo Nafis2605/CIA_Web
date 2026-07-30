@@ -10,7 +10,12 @@ vi.mock("@Utils/logger.js", () => {
   return { vr: mkLog(), app: mkLog(), sync: mkLog(), view: mkLog(), createLogger: () => mkLog() };
 });
 
-import { VRSpatialMenuModel, VR_MENU_BUTTONS, VR_MENU_CONTEXTUAL_BUTTONS } from "../VRSpatialMenuModel.js";
+import {
+  VRSpatialMenuModel,
+  VR_MENU_BUTTONS,
+  VR_MENU_CONTEXTUAL_BUTTONS,
+  VR_MENU_DRAWERS,
+} from "../VRSpatialMenuModel.js";
 
 /** Minimal manager stub matching the methods the model calls. */
 function makeManager(overrides = {}) {
@@ -36,6 +41,23 @@ function makeManager(overrides = {}) {
     cycleAnnotationLabel: vi.fn(() => "Anomaly"),
     getPendingAnnotationLabel: vi.fn(() => null),
     cycleRepresentation: vi.fn(() => "wireframe"),
+    setRepresentation: vi.fn((m) => m),
+    toggleReferenceGrid: vi.fn(() => true),
+    isReferenceGridVisible: vi.fn(() => false),
+    toggleDataAxes: vi.fn(() => true),
+    areDataAxesVisible: vi.fn(() => false),
+    cycleGridPlane: vi.fn(() => "xy"),
+    isThresholdAvailable: vi.fn(() => true),
+    isThresholdEnabled: vi.fn(() => false),
+    toggleThresholdFilter: vi.fn(() => true),
+    cycleThresholdMode: vi.fn(() => "above"),
+    cycleThresholdArray: vi.fn(() => "temperature"),
+    isIsosurfaceAvailable: vi.fn(() => true),
+    isIsosurfaceEnabled: vi.fn(() => false),
+    toggleIsosurface: vi.fn(() => true),
+    cycleValueTarget: vi.fn(() => "point-size"),
+    nudgeValue: vi.fn(() => 3),
+    resetValue: vi.fn(() => 1),
     getRepresentation: vi.fn(() => "surface"),
     toggleGlyphs: vi.fn(() => true),
     isGlyphsEnabled: vi.fn(() => false),
@@ -113,6 +135,19 @@ describe("VRSpatialMenuModel — layout & hit testing", () => {
     for (const r of model.getButtonLayout()) {
       const hit = model.hitTest(r.cu, r.cv);
       expect(hit?.id).toBe(r.id);
+    }
+  });
+
+  it("hitTest still maps every cell with a drawer AND a contextual row open", () => {
+    // The densest layout the panel can reach: 5 static + 2 drawer + 1
+    // contextual = 8 rows. Every cell must still round-trip.
+    model.activate("filters");
+    model.activate("clip"); // adds the contextual row
+    const layout = model.getButtonLayout();
+
+    expect(new Set(layout.map((r) => r.row)).size).toBe(8);
+    for (const r of layout) {
+      expect(model.hitTest(r.cu, r.cv)?.id).toBe(r.id);
     }
   });
 
@@ -283,16 +318,29 @@ describe("VRSpatialMenuModel — action dispatch", () => {
     expect(model.getButtonLayout().some((b) => b.id === "annotation-label")).toBe(true);
   });
 
-  it("representation button cycles via manager.cycleRepresentation", () => {
-    const r = model.activate("representation");
-    expect(manager.cycleRepresentation).toHaveBeenCalledTimes(1);
-    expect(r).toMatchObject({ handled: true, action: "representation-changed", mode: "wireframe" });
+  // The old single "representation" button blind-cycled surface->wireframe->
+  // points. It lives in the Appearance drawer now as three discrete buttons, so
+  // the panel can show WHICH mode is live (the cycling button's highlight was
+  // "active if not surface", making wireframe and points indistinguishable).
+  it("each representation button sets its own mode via manager.setRepresentation", () => {
+    model.activate("appearance"); // open the drawer that holds them
+
+    for (const [id, mode] of [
+      ["rep-surface", "surface"],
+      ["rep-wireframe", "wireframe"],
+      ["rep-points", "points"],
+    ]) {
+      manager.setRepresentation.mockClear();
+      const r = model.activate(id);
+      expect(manager.setRepresentation).toHaveBeenCalledWith(mode);
+      expect(r).toMatchObject({ handled: true, action: "representation-changed", mode });
+    }
   });
 
-  it("representation is a safe no-op without an active dataset", () => {
-    manager.cycleRepresentation.mockReturnValue(null);
-    const r = model.activate("representation");
-    expect(r).toMatchObject({ handled: true, action: "representation-changed", mode: null });
+  it("representation buttons are not dispatchable while the drawer is closed", () => {
+    const r = model.activate("rep-wireframe");
+    expect(r).toMatchObject({ handled: false });
+    expect(manager.setRepresentation).not.toHaveBeenCalled();
   });
 
   it("glyphs button toggles via manager.toggleGlyphs", () => {
@@ -462,21 +510,30 @@ describe("VRSpatialMenuModel — state reflection for render layer", () => {
     expect(Object.fromEntries(off.getButtonStates().map((s) => [s.id, s.active])).move).toBe(false);
   });
 
-  it("getButtonStates marks non-surface representation and enabled glyphs as active", () => {
-    const manager = makeManager({
-      getRepresentation: vi.fn(() => "wireframe"),
-      isGlyphsEnabled: vi.fn(() => true),
-    });
-    const model = new VRSpatialMenuModel(manager);
+  it("getButtonStates lights ONLY the live representation, not every non-surface one", () => {
+    // The regression this pins: the old cycling button used
+    // `active = mode !== "surface"`, so wireframe and points looked identical.
+    const model = new VRSpatialMenuModel(
+      makeManager({
+        getRepresentation: vi.fn(() => "wireframe"),
+        isGlyphsEnabled: vi.fn(() => true),
+      })
+    );
+    model.activate("appearance");
     const states = Object.fromEntries(model.getButtonStates().map((s) => [s.id, s.active]));
-    expect(states.representation).toBe(true);
+
+    expect(states["rep-wireframe"]).toBe(true);
+    expect(states["rep-points"]).toBe(false);
+    expect(states["rep-surface"]).toBe(false);
     expect(states.glyphs).toBe(true);
   });
 
   it("getButtonStates leaves representation/glyphs inactive at defaults", () => {
     const model = new VRSpatialMenuModel(makeManager());
+    model.activate("appearance");
     const states = Object.fromEntries(model.getButtonStates().map((s) => [s.id, s.active]));
-    expect(states.representation).toBe(false);
+    expect(states["rep-surface"]).toBe(true); // makeManager reports "surface"
+    expect(states["rep-wireframe"]).toBe(false);
     expect(states.glyphs).toBe(false);
   });
 });
@@ -647,5 +704,170 @@ describe("VRSpatialMenuModel — hint line", () => {
     const model = new VRSpatialMenuModel({});
     expect(() => model.getHintLine()).not.toThrow();
     expect(model.getHintLine()).toBe("");
+  });
+});
+
+describe("VRSpatialMenuModel — drawers", () => {
+  let manager;
+  let model;
+
+  beforeEach(() => {
+    manager = makeManager();
+    model = new VRSpatialMenuModel(manager);
+  });
+
+  const idsOf = (m) => m.getButtonLayout().map((b) => b.id);
+
+  it("hides drawer buttons until the drawer is opened", () => {
+    expect(idsOf(model)).not.toContain("rep-wireframe");
+
+    model.activate("appearance");
+    expect(idsOf(model)).toContain("rep-wireframe");
+    expect(model.getOpenDrawerId()).toBe("appearance");
+  });
+
+  it("tapping the open drawer closes it", () => {
+    model.activate("appearance");
+    const r = model.activate("appearance");
+
+    expect(r).toMatchObject({ action: "drawer-toggled", drawerId: "appearance", open: false });
+    expect(model.getOpenDrawerId()).toBeNull();
+    expect(idsOf(model)).not.toContain("rep-wireframe");
+  });
+
+  it("opening one drawer closes the other — this exclusivity bounds panel height", () => {
+    model.activate("appearance");
+    model.activate("filters");
+
+    expect(model.getOpenDrawerId()).toBe("filters");
+    const ids = idsOf(model);
+    expect(ids).toContain("threshold-toggle");
+    expect(ids).not.toContain("rep-wireframe");
+  });
+
+  it("highlights the open drawer's parent button", () => {
+    model.activate("filters");
+    const states = Object.fromEntries(model.getButtonStates().map((s) => [s.id, s.active]));
+
+    expect(states.filters).toBe(true);
+    expect(states.appearance).toBe(false);
+  });
+
+  it("shares one stepper row across both drawers (same ids, one handler set)", () => {
+    const stepperIds = ["value-target", "value-dec", "value-inc", "value-reset"];
+
+    for (const drawerId of ["appearance", "filters"]) {
+      model.activate(drawerId);
+      const ids = idsOf(model);
+      for (const s of stepperIds) expect(ids).toContain(s);
+      // Never duplicated within a layout — duplicate ids would make hitTest
+      // ambiguous and break the id->button lookup in activate().
+      expect(ids.length).toBe(new Set(ids).size);
+    }
+  });
+
+  it("keeps the row-0-annotate / last-row-exit invariants with a drawer open", () => {
+    model.activate("filters");
+    const layout = model.getButtonLayout();
+    const rowIds = [...new Set(layout.map((b) => b.row))].sort((a, b) => a - b);
+
+    const firstStatic = layout.filter((b) => b.row === 0);
+    expect(firstStatic[0].id).toBe("annotate");
+
+    const lastRow = layout.filter((b) => b.row === rowIds[rowIds.length - 1]);
+    expect(lastRow[lastRow.length - 1].id).toBe("exit");
+  });
+
+  it("renders drawer rows ABOVE the static grid, nearest the button that opened them", () => {
+    model.activate("appearance");
+    const layout = model.getButtonLayout();
+
+    // Negative rows sort above row 0; with the top-down v inversion that puts
+    // them higher on the panel (larger v) than the static TOOLS row.
+    const drawerRow = layout.find((b) => b.id === "rep-surface");
+    const toolsRow = layout.find((b) => b.id === "annotate");
+    expect(drawerRow.row).toBeLessThan(0);
+    expect(drawerRow.v0).toBeGreaterThan(toolsRow.v1 - 1e-9);
+
+    // Within the drawer, its own row 0 renders ABOVE row 1, so the drawer
+    // reads top-down in declared order (choices first, then the stepper) —
+    // matching how the static grid reads.
+    const stepper = layout.find((b) => b.id === "value-inc");
+    expect(stepper.v1).toBeLessThanOrEqual(drawerRow.v0 + 1e-9);
+  });
+
+  it("closes any open drawer on session end", () => {
+    model.activate("filters");
+    model.onSessionEnd();
+    expect(model.getOpenDrawerId()).toBeNull();
+  });
+
+  it("ignores an unknown drawer id without throwing", () => {
+    const r = model._toggleDrawer("nope");
+    expect(r.handled).toBe(false);
+    expect(model.getOpenDrawerId()).toBeNull();
+  });
+
+  it("every declared drawer button has a getButtonStates entry", () => {
+    for (const drawerId of Object.keys(VR_MENU_DRAWERS)) {
+      model.activate(drawerId);
+      const stateIds = new Set(model.getButtonStates().map((s) => s.id));
+      for (const btn of VR_MENU_DRAWERS[drawerId]) {
+        expect(stateIds.has(btn.id)).toBe(true);
+      }
+    }
+  });
+
+  it("marks threshold sub-controls disabled while threshold is off", () => {
+    const model = new VRSpatialMenuModel(
+      makeManager({ isThresholdEnabled: vi.fn(() => false) })
+    );
+    model.activate("filters");
+    const states = Object.fromEntries(model.getButtonStates().map((s) => [s.id, s.disabled]));
+
+    expect(states["threshold-mode"]).toBe(true);
+    expect(states["threshold-array"]).toBe(true);
+  });
+
+  it("marks threshold/isosurface disabled when the dataset cannot support them", () => {
+    const model = new VRSpatialMenuModel(
+      makeManager({
+        isThresholdAvailable: vi.fn(() => false),
+        isIsosurfaceAvailable: vi.fn(() => false),
+      })
+    );
+    model.activate("filters");
+    const states = Object.fromEntries(model.getButtonStates().map((s) => [s.id, s.disabled]));
+
+    expect(states["threshold-toggle"]).toBe(true);
+    expect(states["iso-toggle"]).toBe(true);
+
+    // ...and tapping one reports it did nothing, rather than silently no-oping.
+    expect(model.activate("threshold-toggle")).toMatchObject({ handled: false, available: false });
+    expect(model.activate("iso-toggle")).toMatchObject({ handled: false, available: false });
+  });
+
+  it("dispatches the shared stepper to the manager", () => {
+    model.activate("appearance");
+
+    expect(model.activate("value-target")).toMatchObject({ action: "value-target-changed" });
+    expect(manager.cycleValueTarget).toHaveBeenCalledTimes(1);
+
+    expect(model.activate("value-inc")).toMatchObject({ action: "value-nudged", steps: 1 });
+    expect(manager.nudgeValue).toHaveBeenCalledWith(1);
+
+    expect(model.activate("value-dec")).toMatchObject({ action: "value-nudged", steps: -1 });
+    expect(manager.nudgeValue).toHaveBeenCalledWith(-1);
+
+    expect(model.activate("value-reset")).toMatchObject({ action: "value-reset" });
+    expect(manager.resetValue).toHaveBeenCalledTimes(1);
+  });
+
+  it("never throws with a bare manager", () => {
+    const bare = new VRSpatialMenuModel({});
+    bare.activate("appearance");
+    expect(() => bare.getButtonStates()).not.toThrow();
+    expect(() => bare.activate("rep-points")).not.toThrow();
+    expect(() => bare.activate("value-inc")).not.toThrow();
   });
 });

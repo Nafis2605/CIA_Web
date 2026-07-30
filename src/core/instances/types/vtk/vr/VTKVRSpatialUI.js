@@ -53,8 +53,20 @@ import vtkTexture from "@kitware/vtk.js/Rendering/Core/Texture";
 // (ROW_HEIGHT_M * row count, see _currentRowCount/_panelHeight) — it grows by
 // one row automatically while a tool with contextual buttons is active, and
 // shrinks back when it deactivates, with no manual constant to maintain.
-const PANEL_WIDTH = 0.66;
+// 0.78 rather than the original 0.66 so the widest rows (6 columns, since
+// drawers arrived) still give ~0.13 m cells — about 6.2 degrees at
+// PANEL_DISTANCE, comfortable for both a Quest controller ray and a Vision Pro
+// gaze pinch.
+const PANEL_WIDTH = 0.78;
 const ROW_HEIGHT_M = 0.14; // matches the original single-row height
+// With a drawer open the panel can reach 8 rows (5 static + 2 drawer + 1
+// contextual). At a fixed 0.14 m that would be 1.12 m tall — taller than the
+// user and well outside a comfortable gaze cone. Rows shrink toward
+// ROW_HEIGHT_MIN_M instead, capping total height. _layoutButtons and
+// _intersectPanel both derive from this._panelHeight, so hit-testing follows
+// automatically — there is no second place to keep in sync.
+const MAX_PANEL_HEIGHT_M = 0.86;
+const ROW_HEIGHT_MIN_M = 0.1;
 // Distance in front of head. PANEL_DROP is deliberately generous (well below
 // PANEL_DISTANCE would put a straight-ahead dataset) and PANEL_SIDE_OFFSET
 // nudges the panel off the dead-center forward ray — together they keep the
@@ -92,6 +104,11 @@ const CARD_STYLES = {
   idle: { fill: "rgba(30,35,48,0.94)", border: "rgba(96,110,146,0.55)" },
   hover: { fill: "rgba(52,92,140,0.97)", border: "rgba(150,196,255,0.95)" },
   active: { fill: "rgba(26,110,104,0.97)", border: "rgba(120,232,216,0.98)" },
+  // A button that currently cannot do anything: no scalar arrays to threshold
+  // on, no volume to isosurface. Without this the card looks identical to a
+  // working one and a tap just silently does nothing — the failure mode the
+  // Views button's "no-other-views" result was added to avoid.
+  disabled: { fill: "rgba(24,27,36,0.72)", border: "rgba(70,78,100,0.38)" },
 };
 
 // Per-activity accent, keyed by a button's `group` (VR_MENU_GROUPS). Applied as
@@ -170,11 +187,12 @@ export class VRSpatialUI {
     // Panel height in metres, derived per-frame from the model's current row
     // count (ROW_HEIGHT_M * rows) — see _currentRowCount(). Defaults to the 5
     // static rows so geometry math is sane before the first update() call.
-    this._panelHeight = ROW_HEIGHT_M * 5;
+    this._panelHeight = this._computePanelHeight(5);
     // Tracks which tool was active last frame, so the contextual row's actors
     // are only rebuilt on an actual change (see _reconcileButtonActors),
     // not every frame.
     this._lastActiveToolId = null;
+    this._lastOpenDrawerId = null;
     // Status line (dataset / scale / nav mode) — a single dynamic label kept
     // separate from the static button labels since its text changes. Canvas/
     // context/texture/plane are kept around so _redrawStatusLabel can update
@@ -445,7 +463,30 @@ export class VRSpatialUI {
     if (!this._model) return 5;
     const layout = this._model.getButtonLayout();
     if (!layout.length) return 5;
-    return Math.max(...layout.map((r) => r.row)) + 1;
+    // Count DISTINCT rows, not max+1. Extra rows (drawers, the contextual row)
+    // carry NEGATIVE indices so they sort above the static grid — with static
+    // rows 0..4 and one contextual row at -1 there are six rows, but max+1
+    // returned five, so the panel never grew and every row silently shrank by
+    // a sixth. Harmless-looking (hit-testing stayed self-consistent, since
+    // layout and _intersectPanel both divide by the same _panelHeight) right
+    // up until drawers add a second and third negative row.
+    return new Set(layout.map((r) => r.row)).size;
+  }
+
+  /**
+   * Physical panel height for a given row count, with rows compressing rather
+   * than the panel growing without bound. See MAX_PANEL_HEIGHT_M.
+   * @param {number} rows
+   * @returns {number} height in metres
+   * @private
+   */
+  _computePanelHeight(rows) {
+    const n = Math.max(1, rows);
+    const rowH = Math.min(
+      ROW_HEIGHT_M,
+      Math.max(ROW_HEIGHT_MIN_M, MAX_PANEL_HEIGHT_M / n)
+    );
+    return rowH * n;
   }
 
   /**
@@ -964,12 +1005,19 @@ export class VRSpatialUI {
     // Rebuild only the contextual row's actors when the active tool changes
     // (not the whole panel) — avoids tearing down/recreating all 25 static
     // buttons every time a tool toggles.
+    // Opening/closing a drawer adds or removes whole rows of buttons, so it
+    // needs the same actor rebuild the contextual row already triggered.
     const activeToolId = this._model.getActiveToolId();
-    if (activeToolId !== this._lastActiveToolId) {
+    const openDrawerId = this._model.getOpenDrawerId?.() ?? null;
+    if (
+      activeToolId !== this._lastActiveToolId ||
+      openDrawerId !== this._lastOpenDrawerId
+    ) {
       this._lastActiveToolId = activeToolId;
+      this._lastOpenDrawerId = openDrawerId;
       this._reconcileButtonActors();
     }
-    this._panelHeight = ROW_HEIGHT_M * this._currentRowCount();
+    this._panelHeight = this._computePanelHeight(this._currentRowCount());
 
     this._updateAnchor(inputState.headPose);
     this._layoutBackingPanel();
@@ -1220,10 +1268,15 @@ export class VRSpatialUI {
    * @private
    */
   _applyButtonVisuals() {
-    const states = new Map(this._model.getButtonStates().map((s) => [s.id, s.active]));
+    const states = new Map(this._model.getButtonStates().map((s) => [s.id, s]));
     for (const [id, entry] of this._buttonActors) {
+      const state = states.get(id);
       let key = "idle";
-      if (states.get(id)) key = "active";
+      // Disabled wins over hover: pointing at a dead button must not make it
+      // look live. It loses to active, so a filter that is ON but momentarily
+      // unavailable still reads as ON.
+      if (state?.active) key = "active";
+      else if (state?.disabled) key = "disabled";
       else if (id === this._hoverButtonId) key = "hover";
       if (entry.stateKey !== key && entry.ctx) {
         this._drawCard(entry.ctx, entry.canvas, entry.texture, key, entry.group);
@@ -1440,8 +1493,9 @@ export class VRSpatialUI {
     this._lastHeadPos = null;
     this._hoverButtonId = null;
     this._lastSelectPressed = false;
-    this._panelHeight = ROW_HEIGHT_M * 5;
+    this._panelHeight = this._computePanelHeight(5);
     this._lastActiveToolId = null;
+    this._lastOpenDrawerId = null;
     this._statusCanvas = null;
     this._statusCtx = null;
     this._statusTexture = null;
