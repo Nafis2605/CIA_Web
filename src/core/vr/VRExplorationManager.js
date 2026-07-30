@@ -23,7 +23,13 @@ import { BaseManager } from '@Core/data/managers/BaseManager.js';
 import { vrAvatarSystem } from '@Core/instances/types/vtk/vr/VTKVRAvatars.js';
 import { vrSpatialUI } from '@Core/instances/types/vtk/vr/VTKVRSpatialUI.js';
 import { vrMultiViewGrid } from '@Core/vr/VRMultiViewGrid.js';
-import { vtkClippingFeature } from '@Core/instances/types/vtk/features/index.js';
+import {
+  vtkClippingFeature,
+  vtkSceneFeature,
+  vtkThresholdFeature,
+  vtkIsosurfaceFeature,
+} from '@Core/instances/types/vtk/features/index.js';
+import { VRValueEditorModel } from '@Core/vr/VRValueEditorModel.js';
 import { vtkGlyphFeature, isGlyphFeatureAvailable } from '@Core/instances/types/vtk/features/VTKGlyphFeature.js';
 import { instanceTools } from '@VTK/vtkInstanceTools.js';
 import { pushSharedVisualizationUpdate } from '@Services/visualizationSyncService.js';
@@ -920,6 +926,414 @@ class VRExplorationManager extends BaseManager {
     this._pushVisualizationPatch({ representation: next });
     this._emit('representationChanged', { representation: next });
     return next;
+  }
+
+  /**
+   * Set one specific representation, backing the Appearance drawer's discrete
+   * Surface/Wire/Points buttons. Same effect as cycleRepresentation without the
+   * guessing — cycleRepresentation is kept for voice commands and any other
+   * caller that genuinely wants "next".
+   * @param {'surface'|'wireframe'|'points'} mode
+   * @returns {string|null} the applied mode, or null with no active dataset
+   */
+  setRepresentation(mode) {
+    const instanceId = this._activeContext?.instance?.instanceId;
+    if (!instanceId) return null;
+    if (!['surface', 'wireframe', 'points'].includes(mode)) {
+      log.warn(`VR setRepresentation: unknown mode "${mode}"`);
+      return null;
+    }
+
+    instanceTools.setRepresentation?.(instanceId, mode);
+    this._pushVisualizationPatch({ representation: mode });
+    this._emit('representationChanged', { representation: mode });
+    return mode;
+  }
+
+  // ===========================================================================
+  // SCENE CHROME — data reference grid + labelled axes
+  // ===========================================================================
+  //
+  // These reuse VTKSceneFeature, the same code the desktop scene menu drives.
+  // Because VR shares the desktop renderer, a grid toggled on either side is
+  // already visible in the other — only the in-VR CONTROL was missing.
+  //
+  // Bounds are passed explicitly. VTKSceneFeature otherwise sizes itself from
+  // renderer.computeVisiblePropBounds(), which in a VR session also sees
+  // VREnvironment's floor and walls (~20 m) — so the grid would be built around
+  // the room rather than the data. vrContext.dataBounds is already scoped to
+  // the data actor alone.
+  //
+  // Deliberately NOT synced to collaborators: pushSharedVisualizationUpdate has
+  // no scene field and applySharedState no scene branch, and these are viewer
+  // chrome in the same category as isolation and the Views grid, both already
+  // session-local. Syncing would mean new Y.js schema + ViewConfiguration +
+  // applySharedState work for no collaborative value. If that changes, the
+  // shape is: patch { scene: vtkSceneFeature.getState(id) }, and an
+  // applySharedState branch calling setGridVisible/setGridPlane/setAxesVisible.
+
+  /** @private Shared preamble for the scene-chrome wrappers. */
+  _sceneTarget() {
+    const instanceId = this._activeContext?.instance?.instanceId;
+    if (!instanceId) return null;
+    return { instanceId, bounds: this._activeContext?.vrContext?.dataBounds || null };
+  }
+
+  /**
+   * Toggle the data reference grid.
+   * Distinct from toggleGridMode(), which lays out OTHER open views in space.
+   * @returns {boolean} whether the grid is now visible
+   */
+  toggleReferenceGrid() {
+    const t = this._sceneTarget();
+    if (!t) return false;
+    try {
+      vtkSceneFeature.toggleGrid(t.instanceId, { bounds: t.bounds });
+    } catch (err) {
+      log.warn(`VR reference grid toggle failed: ${err?.message}`);
+      return false;
+    }
+    const visible = this.isReferenceGridVisible();
+    this._emit('referenceGridToggled', { visible });
+    return visible;
+  }
+
+  /** @returns {boolean} */
+  isReferenceGridVisible() {
+    const t = this._sceneTarget();
+    if (!t) return false;
+    return !!vtkSceneFeature.getState?.(t.instanceId)?.showGrid;
+  }
+
+  /**
+   * Cycle the reference grid's plane. Starts at xz (the "floor" orientation,
+   * which is what a grid usually means in a room-scale headset).
+   * @returns {string|null} the new plane
+   */
+  cycleGridPlane() {
+    const t = this._sceneTarget();
+    if (!t) return null;
+    const order = ['xz', 'xy', 'yz'];
+    const current = vtkSceneFeature.getState?.(t.instanceId)?.gridPlane || 'xz';
+    const next = order[(order.indexOf(current) + 1) % order.length];
+    try {
+      vtkSceneFeature.setGridPlane(t.instanceId, next, { bounds: t.bounds });
+    } catch (err) {
+      log.warn(`VR grid plane cycle failed: ${err?.message}`);
+      return null;
+    }
+    this._emit('gridPlaneChanged', { plane: next });
+    return next;
+  }
+
+  /**
+   * Toggle the labelled cube axes around the data.
+   * @returns {boolean} whether the axes are now visible
+   */
+  toggleDataAxes() {
+    const t = this._sceneTarget();
+    if (!t) return false;
+    try {
+      vtkSceneFeature.toggleAxes(t.instanceId, { bounds: t.bounds });
+    } catch (err) {
+      log.warn(`VR data axes toggle failed: ${err?.message}`);
+      return false;
+    }
+    const visible = this.areDataAxesVisible();
+    this._emit('dataAxesToggled', { visible });
+    return visible;
+  }
+
+  /** @returns {boolean} */
+  areDataAxesVisible() {
+    const t = this._sceneTarget();
+    if (!t) return false;
+    return !!vtkSceneFeature.getState?.(t.instanceId)?.showAxes;
+  }
+
+  // ===========================================================================
+  // FILTERS — threshold + isosurface
+  // ===========================================================================
+
+  /** @private */
+  _instanceId() {
+    return this._activeContext?.instance?.instanceId || null;
+  }
+
+  /**
+   * Threshold needs at least one scalar array to act on. scanAvailableArrays
+   * runs at load time, so this is just a read.
+   * @returns {boolean}
+   */
+  isThresholdAvailable() {
+    const id = this._instanceId();
+    if (!id) return false;
+    const arrays = vtkThresholdFeature.getState?.(id)?.availableArrays;
+    return Array.isArray(arrays) && arrays.length > 0;
+  }
+
+  /** @returns {boolean} */
+  isThresholdEnabled() {
+    const id = this._instanceId();
+    return !!(id && vtkThresholdFeature.getState?.(id)?.enabled);
+  }
+
+  /** @returns {object|null} */
+  getThresholdState() {
+    const id = this._instanceId();
+    return id ? vtkThresholdFeature.getState?.(id) ?? null : null;
+  }
+
+  /**
+   * Toggle the threshold filter, syncing the result to collaborators through
+   * the existing `threshold` visualization channel (the desktop menu pushes the
+   * same patch).
+   * @returns {boolean} whether threshold is now enabled
+   */
+  toggleThresholdFilter() {
+    const id = this._instanceId();
+    if (!id || !this.isThresholdAvailable()) return false;
+    try {
+      vtkThresholdFeature.toggleThreshold(id);
+    } catch (err) {
+      log.warn(`VR threshold toggle failed: ${err?.message}`);
+      return false;
+    }
+    this._syncThreshold(id);
+    const enabled = this.isThresholdEnabled();
+    this._emit('thresholdToggled', { enabled });
+    return enabled;
+  }
+
+  /** Cycle threshold mode: between -> above -> below. @returns {string|null} */
+  cycleThresholdMode() {
+    const id = this._instanceId();
+    if (!id) return null;
+    const order = ['between', 'above', 'below'];
+    const current = vtkThresholdFeature.getState?.(id)?.mode || 'between';
+    const next = order[(order.indexOf(current) + 1) % order.length];
+    try {
+      vtkThresholdFeature.setMode(id, next);
+    } catch (err) {
+      log.warn(`VR threshold mode cycle failed: ${err?.message}`);
+      return null;
+    }
+    this._syncThreshold(id);
+    return next;
+  }
+
+  /** Cycle which scalar array the threshold acts on. @returns {string|null} */
+  cycleThresholdArray() {
+    const id = this._instanceId();
+    if (!id) return null;
+    const state = vtkThresholdFeature.getState?.(id);
+    const arrays = state?.availableArrays;
+    if (!Array.isArray(arrays) || arrays.length === 0) return null;
+
+    const names = arrays.map((a) => (typeof a === 'string' ? a : a?.name)).filter(Boolean);
+    if (!names.length) return null;
+    const next = names[(names.indexOf(state?.activeArray) + 1) % names.length];
+    try {
+      vtkThresholdFeature.selectArray(id, next);
+    } catch (err) {
+      log.warn(`VR threshold array cycle failed: ${err?.message}`);
+      return null;
+    }
+    this._syncThreshold(id);
+    return next;
+  }
+
+  /** @private Push the threshold config through the shared channel. */
+  _syncThreshold(instanceId) {
+    try {
+      const config = vtkThresholdFeature.getConfigForSync?.(instanceId);
+      if (config) this._pushVisualizationPatch({ threshold: config });
+    } catch (err) {
+      log.warn(`VR threshold sync failed: ${err?.message}`);
+    }
+  }
+
+  /**
+   * Isosurface requires volume/image data, so it is simply unavailable for
+   * plain polydata — the menu dims the button rather than letting it no-op.
+   * @returns {boolean}
+   */
+  isIsosurfaceAvailable() {
+    const id = this._instanceId();
+    const instanceData = this._activeContext?.instance?.instanceData;
+    if (!id || !instanceData?.imageData) return false;
+    try {
+      return vtkIsosurfaceFeature.isAvailable?.(id, instanceData) !== false;
+    } catch {
+      return false;
+    }
+  }
+
+  /** @returns {boolean} */
+  isIsosurfaceEnabled() {
+    const id = this._instanceId();
+    return !!(id && vtkIsosurfaceFeature.getState?.(id)?.enabled);
+  }
+
+  /** @returns {object|null} */
+  getIsosurfaceState() {
+    const id = this._instanceId();
+    return id ? vtkIsosurfaceFeature.getState?.(id) ?? null : null;
+  }
+
+  /**
+   * Toggle isosurface extraction.
+   *
+   * Session-local on purpose: unlike threshold, isosurface has no field in
+   * pushSharedVisualizationUpdate and no applySharedState branch, so syncing it
+   * would mean extending the Y.js schema and ViewConfiguration. Left as a
+   * follow-up rather than half-wired.
+   *
+   * enableIsosurface is async; the returned boolean is the optimistic target
+   * state, and the menu re-reads getState on the next frame regardless.
+   * @returns {boolean}
+   */
+  toggleIsosurface() {
+    const id = this._instanceId();
+    if (!id || !this.isIsosurfaceAvailable()) return false;
+    const enabled = this.isIsosurfaceEnabled();
+    try {
+      if (enabled) {
+        vtkIsosurfaceFeature.disableIsosurface(id);
+      } else {
+        const imageData = this._activeContext?.instance?.instanceData?.imageData;
+        const r = vtkIsosurfaceFeature.enableIsosurface?.(id, imageData);
+        // Fire-and-forget: must never block or break the XR frame loop.
+        if (r && typeof r.catch === 'function') {
+          r.catch((err) => log.warn(`VR isosurface enable failed: ${err?.message}`));
+        }
+      }
+    } catch (err) {
+      log.warn(`VR isosurface toggle failed: ${err?.message}`);
+      return enabled;
+    }
+    this._emit('isosurfaceToggled', { enabled: !enabled });
+    return !enabled;
+  }
+
+  // ===========================================================================
+  // SHARED NUMERIC STEPPER
+  // ===========================================================================
+
+  /** @private Lazily build the value editor, bound to this manager. */
+  _valueEditor() {
+    if (!this._valueEditorModel) {
+      this._valueEditorModel = new VRValueEditorModel(this);
+    }
+    return this._valueEditorModel;
+  }
+
+  /** Retarget the stepper to the next editable value. @returns {string|null} */
+  cycleValueTarget() {
+    return this._valueEditor().cycleTarget();
+  }
+
+  /** @returns {number|null} the new value */
+  nudgeValue(steps) {
+    return this._valueEditor().nudge(steps);
+  }
+
+  /** @returns {number|null} the restored value */
+  resetValue() {
+    return this._valueEditor().reset();
+  }
+
+  /** @returns {string} one-line readout for the status line */
+  getValueReadout() {
+    return this._valueEditor().getReadout();
+  }
+
+  // --- Value accessors the stepper's targets read/write ----------------------
+  //
+  // Thin passthroughs to instanceTools / the feature modules, each pushing the
+  // same sync patch the desktop controls push. Holding "+" fires these many
+  // times, so the sync side is throttled (see _pushThrottledPatch).
+
+  /** @returns {number|null} */
+  getPointSize() {
+    const id = this._instanceId();
+    return id ? instanceTools.getPointSize?.(id) ?? null : null;
+  }
+
+  setPointSize(value) {
+    const id = this._instanceId();
+    if (!id) return;
+    instanceTools.setPointSize?.(id, value);
+    this._pushThrottledPatch({ pointSize: value });
+  }
+
+  /** @returns {number|null} */
+  getLineWidth() {
+    const id = this._instanceId();
+    return id ? instanceTools.getLineWidth?.(id) ?? null : null;
+  }
+
+  setLineWidth(value) {
+    const id = this._instanceId();
+    if (!id) return;
+    instanceTools.setLineWidth?.(id, value);
+    this._pushThrottledPatch({ lineWidth: value });
+  }
+
+  /** @returns {string|null} current representation, for target availability */
+  getRepresentation() {
+    const id = this._instanceId();
+    return id ? instanceTools.getRepresentation?.(id) ?? null : null;
+  }
+
+  setThresholdMin(value) {
+    const id = this._instanceId();
+    if (!id) return;
+    vtkThresholdFeature.setMinValue?.(id, value);
+    this._pushThrottledPatch(null, () => ({
+      threshold: vtkThresholdFeature.getConfigForSync?.(id),
+    }));
+  }
+
+  setThresholdMax(value) {
+    const id = this._instanceId();
+    if (!id) return;
+    vtkThresholdFeature.setMaxValue?.(id, value);
+    this._pushThrottledPatch(null, () => ({
+      threshold: vtkThresholdFeature.getConfigForSync?.(id),
+    }));
+  }
+
+  setIsovalue(value) {
+    const id = this._instanceId();
+    if (!id) return;
+    // Session-local, like the isosurface toggle itself — see toggleIsosurface.
+    vtkIsosurfaceFeature.setIsovalue?.(id, value);
+  }
+
+  setIsosurfaceOpacity(value) {
+    const id = this._instanceId();
+    if (!id) return;
+    vtkIsosurfaceFeature.setOpacity?.(id, value);
+  }
+
+  /**
+   * Push a visualization patch at most ~20/sec. A held "+" button fires every
+   * frame; without this each tap would become a Y.js broadcast and a
+   * ViewConfiguration write. Mirrors the mid-drag throttle in
+   * _pushObjectTransformPatch.
+   *
+   * @param {object|null} patch - static patch, or null when it must be built lazily
+   * @param {Function} [build] - lazy builder, used when the patch is expensive
+   * @private
+   */
+  _pushThrottledPatch(patch, build) {
+    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    if (now - (this._lastValuePatchAt || 0) < 50) return;
+    this._lastValuePatchAt = now;
+
+    const payload = patch || (typeof build === 'function' ? build() : null);
+    if (payload) this._pushVisualizationPatch(payload);
   }
 
   /** Current surface representation of the active dataset (for menu highlight). */

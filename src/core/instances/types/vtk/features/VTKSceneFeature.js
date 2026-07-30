@@ -100,6 +100,11 @@ export class VTKSceneFeature extends FeatureInterface {
       // Scene actors (created lazily)
       gridActor: null,
       cubeAxesActor: null,
+      // Caller-supplied bounds for the grid/axes, overriding
+      // renderer.computeVisiblePropBounds(). Set by VR (which passes
+      // vrContext.dataBounds) so scene chrome wraps the DATA and not
+      // VREnvironment's room geometry. Null on desktop.
+      explicitBounds: null,
     };
 
     this.instanceStates.set(instanceId, state);
@@ -255,9 +260,10 @@ export class VTKSceneFeature extends FeatureInterface {
   /**
    * Toggle grid visibility
    */
-  toggleGrid(instanceId) {
+  toggleGrid(instanceId, { bounds = null } = {}) {
     const state = this.instanceStates.get(instanceId);
     if (!state) return;
+    if (bounds) state.explicitBounds = bounds;
 
     state.showGrid = !state.showGrid;
 
@@ -274,9 +280,10 @@ export class VTKSceneFeature extends FeatureInterface {
   /**
    * Set grid visibility
    */
-  setGridVisible(instanceId, visible) {
+  setGridVisible(instanceId, visible, { bounds = null } = {}) {
     const state = this.instanceStates.get(instanceId);
     if (!state) return;
+    if (bounds) state.explicitBounds = bounds;
 
     if (state.showGrid === visible) return;
     state.showGrid = visible;
@@ -293,9 +300,10 @@ export class VTKSceneFeature extends FeatureInterface {
   /**
    * Set grid plane orientation
    */
-  setGridPlane(instanceId, plane) {
+  setGridPlane(instanceId, plane, { bounds = null } = {}) {
     const state = this.instanceStates.get(instanceId);
     if (!state) return;
+    if (bounds) state.explicitBounds = bounds;
 
     if (!['xy', 'xz', 'yz'].includes(plane)) {
       log.warn(`Invalid grid plane: ${plane}`);
@@ -344,8 +352,15 @@ export class VTKSceneFeature extends FeatureInterface {
     // Remove existing grid
     this._removeGrid(state);
 
-    // Get data bounds to position grid appropriately
-    const bounds = renderer.computeVisiblePropBounds();
+    // Get data bounds to position grid appropriately.
+    //
+    // Prefer explicitly-supplied bounds when the caller has them. In a VR
+    // session this renderer ALSO holds VREnvironment's floor and walls (~20 m
+    // across), so computeVisiblePropBounds() would build a grid around the
+    // room rather than the dataset. VR passes vrContext.dataBounds, which is
+    // scoped to the data actor alone. Desktop callers pass nothing and keep
+    // the original behaviour.
+    const bounds = state.explicitBounds || renderer.computeVisiblePropBounds();
     const center = [
       (bounds[0] + bounds[1]) / 2,
       (bounds[2] + bounds[3]) / 2,
@@ -424,9 +439,10 @@ export class VTKSceneFeature extends FeatureInterface {
   /**
    * Toggle axes visibility
    */
-  toggleAxes(instanceId) {
+  toggleAxes(instanceId, { bounds = null } = {}) {
     const state = this.instanceStates.get(instanceId);
     if (!state) return;
+    if (bounds) state.explicitBounds = bounds;
 
     state.showAxes = !state.showAxes;
 
@@ -443,9 +459,10 @@ export class VTKSceneFeature extends FeatureInterface {
   /**
    * Set axes visibility
    */
-  setAxesVisible(instanceId, visible) {
+  setAxesVisible(instanceId, visible, { bounds = null } = {}) {
     const state = this.instanceStates.get(instanceId);
     if (!state) return;
+    if (bounds) state.explicitBounds = bounds;
 
     if (state.showAxes === visible) return;
     state.showAxes = visible;
@@ -491,8 +508,9 @@ export class VTKSceneFeature extends FeatureInterface {
     // Remove existing axes
     this._removeAxes(state);
 
-    // Get data bounds
-    const bounds = renderer.computeVisiblePropBounds();
+    // Get data bounds — explicit bounds win, so VR gets axes around the
+    // dataset rather than around VREnvironment's room. See _createGrid.
+    const bounds = state.explicitBounds || renderer.computeVisiblePropBounds();
 
     // Create CubeAxes actor
     const cubeAxesActor = vtkCubeAxesActor.newInstance();

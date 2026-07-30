@@ -4355,7 +4355,19 @@ console.log('Tools:', tools);
         }
 
         if (state.visualization.representation !== undefined) {
-          property.setRepresentation(state.visualization.representation);
+          // Route through instanceTools, which maps the STRING the menus and
+          // VR push ('surface'|'wireframe'|'points') to the integer vtk.js
+          // wants ({surface:2, wireframe:1, points:0}). Calling
+          // property.setRepresentation directly with the string silently did
+          // nothing, so a representation change made on one client never
+          // appeared on any other. instanceTools.setRepresentation also
+          // renders, and tolerates the raw integer form older peers may send.
+          const rep = state.visualization.representation;
+          if (typeof rep === "number") {
+            property.setRepresentation(rep);
+          } else {
+            instanceTools.setRepresentation(instanceId, rep);
+          }
         }
 
         if (state.visualization.pointSize !== undefined) {
