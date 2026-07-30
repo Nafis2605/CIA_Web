@@ -109,6 +109,52 @@ indexedDB.deleteDatabase('cia-datasets'); location.reload();
 npm run storybook          # Component development (port 6006)
 ```
 
+## Development Workflow
+
+**This project develops directly on `main`.** Do not create feature branches for new work.
+
+### Why direct-to-main?
+
+- **Faster iteration:** no merge friction, no branch sync overhead
+- **Simpler collaboration:** all work visible in git log; no cherry-picking or rebase complexity
+- **CI/CD confidence:** `main` is always deployable (breaking changes are caught in pre-commit hooks and tests)
+- **Smaller commits:** motivated to keep changes focused when they land immediately
+
+### Guidelines
+
+1. **Write tests first.** All new features must have test coverage in `src/**/*.test.{js,jsx,ts,tsx}`. Run `npm run test:run` before committing.
+
+2. **Run type checking.** `npm run typecheck` must pass. No `any` types without a comment explaining why.
+
+3. **Commit message convention:** 
+   - Imperative mood: "Add VR clipping" not "Added VR clipping"
+   - One sentence, under 60 characters, for the subject line
+   - Body (optional): describe *why* the change was needed, not what it does (the code shows that)
+
+4. **Small, focused commits.** One feature per commit. Easier to debug, easier to revert if needed.
+
+5. **No commits to `main` without passing tests.** Pre-commit hooks enforce this. If a hook fails, read the error, fix it, and create a new commit (do not amend an already-pushed commit).
+
+6. **Reserve amend only for unpushed commits.** Once pushed, make a new commit so collaborators' branches don't diverge.
+
+### Example workflow
+
+```bash
+# Start a new task
+npm start                    # Launch dev server; edit files
+
+# Write tests, implement feature
+npm test                     # Watch mode — tests re-run on save
+npm run typecheck            # Check types
+
+# Commit when ready
+git add src/path/to/file.js src/path/to/file.test.js
+git commit -m "Add VR annotation color cycling"
+
+# Push (CI runs tests again, and they must pass)
+git push origin main
+```
+
 ## Service URLs
 
 | Service | URL | Dev credentials |
