@@ -134,6 +134,14 @@ if (!DataAccessHelper.has("zip")) {
   );
 }
 
+// VR raycast pick tolerance (world units). vtkCellPicker.pick3DPoint derives
+// its tolerance from selectionPoint[2] treated as a display-space depth
+// (Picker.js), which is meaningless for a world-space ray — so raycastVR
+// sets it explicitly instead of letting pick3DPoint invent one. Start small;
+// step toward the desktop default (vtkRaycaster.js DEFAULT_TOLERANCE = 0.01)
+// if thin surfaces are missed in-headset.
+const VR_PICK_TOLERANCE = 1e-6;
+
 /**
  * VTKInstanceHandler
  *
@@ -842,6 +850,22 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
     // Initialize instance tools (needed for widgets and rendering controls)
     // Use instanceData.sceneObjects which is now guaranteed to be set
     instanceTools.initializeTools(instanceId, instanceData.sceneObjects);
+
+    // Bridge the shared vtkWidgetManager onto instanceData. Six features
+    // (VTKClippingFeature, VTKMeasurementWidgetsFeature, VTKAnnotationWidgets-
+    // Feature, VTKImageCroppingFeature, VTKResliceCursorFeature,
+    // VTKImplicitPlaneFeature) read `instanceData.widgetManager` in their own
+    // initialize() to decide whether an interactive widget path is available.
+    // Nothing ever assigned it, so all six silently degraded — the desktop
+    // clipping menu in particular rendered but did nothing. instanceTools owns
+    // the only vtkWidgetManager, and it receives sceneObjects rather than
+    // instanceData, so this is the correct seam to connect the two.
+    //
+    // VR deliberately does NOT use this: it calls
+    // vtkClippingFeature.enableClipping(id, { manual: true }), because
+    // vtkWidgetManager needs a mouse interactor and would add widget actors
+    // into the renderer VR shares with the desktop canvas.
+    instanceData.widgetManager = instanceTools.getWidgetManager(instanceId);
     log.debug(`Instance tools initialized`);
 
     // Initialize orientation widget (always create it, but start enabled)
@@ -4922,6 +4946,13 @@ console.log('Tools:', tools);
     // Clean up controller visuals
     this._cleanupVRExplorationControllers(vrContext);
 
+    // Dispose the cached VR raycast picker (see _getVRPicker) so it doesn't
+    // outlive the session it was created for. vtk.js macro objects don't all
+    // implement delete(), hence the optional chaining — this is a best-effort
+    // release, not a required one (the picker itself holds no GL resources).
+    vrContext._vrPicker?.delete?.();
+    vrContext._vrPicker = null;
+
     // Restore the desktop viewport and GL drawing-buffer size, both of which
     // were mutated per-eye during VR rendering. Without this the desktop
     // canvas would stay at the last eye's viewport/resolution until the next
@@ -4967,38 +4998,133 @@ console.log('Tools:', tools);
     }
     if (!origin || !dir) return null;
 
-    // Create VTK picker
-    const picker = vtkCellPicker.newInstance();
-    picker.setTolerance(0.001);
+    // Cached, pick-list-scoped, world-space cell picker. See the three
+    // helpers below for why each of these matters.
+    const picker = this._getVRPicker(vrContext);
+    picker.setTolerance(VR_PICK_TOLERANCE);
+    picker.setPickFromList(true);
+    picker.setPickList(this._getVRPickTargets(vrContext));
 
-    // Convert ray to VTK format
+    // World-space ray endpoints. Length is derived from the dataset, not a
+    // fixed magic number — see _vrPickRayLength for why a mismatched ray
+    // length silently returns the WRONG cell instead of no cell.
+    const rayLength = this._vrPickRayLength(vrContext);
     const p1 = [origin.x, origin.y, origin.z];
     const direction = [dir.x, dir.y, dir.z];
     const p2 = [
-      p1[0] + direction[0] * 1000,
-      p1[1] + direction[1] * 1000,
-      p1[2] + direction[2] * 1000,
+      p1[0] + direction[0] * rayLength,
+      p1[1] + direction[1] * rayLength,
+      p1[2] + direction[2] * rayLength,
     ];
 
-    const hit = picker.pick(p1, p2, renderer);
+    // pick3DPoint is the WORLD-space counterpart of pick() (which takes a
+    // 3-component DISPLAY/pixel coordinate — passing a world point there, as
+    // the old code did, corrupts renderer.getActiveCamera() downstream).
+    // Neither pick() nor pick3DPoint() returns a value; the hit test is done
+    // by reading back picker.getCellId() afterward, mirroring the proven
+    // desktop convention in vtkRaycaster.js (picker.pick + getCellId() < 0).
+    //
+    // No manual un-yaw needed here (unlike probeDataVR below): pick3DInternal
+    // intersects against prop.getMatrix(), which already includes the
+    // UserMatrix written by _applyVRDataRotation (:5222-ish), so the picker
+    // sees the actor exactly as rendered, twist and all.
+    picker.pick3DPoint(p1, p2, renderer);
 
-    if (hit) {
-      const position = picker.getPickPosition();
-      const normal = picker.getPickNormal() || [0, 1, 0];
+    const cellId = picker.getCellId();
+    if (cellId < 0) return null;
 
-      return {
-        hit: true,
-        position: { x: position[0], y: position[1], z: position[2] },
-        normal: { x: normal[0], y: normal[1], z: normal[2] },
-        distance: Math.sqrt(
-          Math.pow(position[0] - p1[0], 2) +
-            Math.pow(position[1] - p1[1], 2) +
-            Math.pow(position[2] - p1[2], 2)
-        ),
-      };
+    const position = picker.getPickPosition();
+    const normal = picker.getPickNormal() || [0, 1, 0];
+    // vtkCellPicker exposes the hit actor only via the plural getActors()
+    // list (no singular getActor()) — mirror vtkRaycaster.js's fallback.
+    let actor = null;
+    if (typeof picker.getActor === "function") {
+      actor = picker.getActor();
+    } else if (typeof picker.getActors === "function") {
+      const actors = picker.getActors();
+      actor = Array.isArray(actors) ? actors[0] : null;
     }
 
-    return null;
+    return {
+      hit: true,
+      position: { x: position[0], y: position[1], z: position[2] },
+      normal: { x: normal[0], y: normal[1], z: normal[2] },
+      distance: Math.sqrt(
+        Math.pow(position[0] - p1[0], 2) +
+          Math.pow(position[1] - p1[1], 2) +
+          Math.pow(position[2] - p1[2], 2)
+      ),
+      cellId,
+      actor,
+    };
+  }
+
+  /**
+   * Cached vtkCellPicker for VR raycasts. Creating a picker is real garbage
+   * (internal locator/tree state) and raycastVR runs once or more per XR
+   * frame (~90 Hz) — recreating it every call would be a steady allocation
+   * churn. Cached on vrContext (one per VR session) and disposed in
+   * exitVRExploration.
+   * @private
+   */
+  _getVRPicker(vrContext) {
+    if (!vrContext._vrPicker) {
+      vrContext._vrPicker = vtkCellPicker.newInstance();
+    }
+    return vrContext._vrPicker;
+  }
+
+  /**
+   * Actors the VR picker is allowed to hit. Filters the SHARED renderer's
+   * actor list (VR uses the same vtkRenderer as desktop — see the
+   * non-negotiable constraint documented near VR context creation above) down
+   * to actors that are pickable, visible, and actually have a mapper.
+   *
+   * Deliberately NOT hardcoded to [sceneObjects.actor]: VTKThresholdFeature
+   * and VTKIsosurfaceFeature HIDE the primary actor and add their own derived
+   * actor when active, so a hardcoded target would make every VR tool go
+   * blind the moment Threshold or Isosurface is toggled on. Falls back to
+   * sceneObjects.actor only if the filter comes up empty (e.g. before any
+   * actor has been marked pickable).
+   * @private
+   */
+  _getVRPickTargets(vrContext) {
+    const { renderer, actor } = vrContext?.sceneObjects || {};
+    const all =
+      typeof renderer?.getActors === "function" ? renderer.getActors() : [];
+    const targets = all.filter(
+      (a) =>
+        typeof a?.getPickable === "function" &&
+        a.getPickable() &&
+        typeof a.getVisibility === "function" &&
+        a.getVisibility() &&
+        typeof a.getMapper === "function" &&
+        !!a.getMapper()
+    );
+    if (targets.length > 0) return targets;
+    return actor ? [actor] : [];
+  }
+
+  /**
+   * World-space ray length for VR picking, derived from the dataset's own
+   * bounding-box diagonal rather than a fixed magic number (the old code
+   * used 1000). CellPicker.intersectActorWithLine compares candidate cells
+   * with `t <= tMin + tolerance`, where t is parametric along p1->p2 — a
+   * 1000-unit ray cast over a dataset that might be 0.01 units across
+   * collapses the real hit spread down near t=0 and picks the wrong cell.
+   * 4x the diagonal comfortably overshoots the data from any controller
+   * position inside the VR scale; clamped to a 1-unit minimum so degenerate
+   * (point-like) bounds still produce a usable ray.
+   * @private
+   */
+  _vrPickRayLength(vrContext) {
+    const b = vrContext?.dataBounds;
+    if (!Array.isArray(b) || b.length !== 6) return 1;
+    const dx = b[1] - b[0];
+    const dy = b[3] - b[2];
+    const dz = b[5] - b[4];
+    const diagonal = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    return Math.max(1, diagonal * 4);
   }
 
   /**

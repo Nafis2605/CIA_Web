@@ -6,8 +6,11 @@ import vtkActor from '@kitware/vtk.js/Rendering/Core/Actor';
 import vtkMapper from '@kitware/vtk.js/Rendering/Core/Mapper';
 import vtkPlaneSource from '@kitware/vtk.js/Filters/Sources/PlaneSource';
 import vtkTexture from '@kitware/vtk.js/Rendering/Core/Texture';
-import vtkImageData from '@kitware/vtk.js/Common/DataModel/ImageData';
-import vtkDataArray from '@kitware/vtk.js/Common/Core/DataArray';
+// Shared with the spatial menu and every tool label — see
+// src/core/vr/ui/VRTextBillboard.js. roundRectPath in particular replaces the
+// native ctx.roundRect this file used to call, which jsdom does not implement
+// (so any test touching _redraw threw).
+import { roundRectPath, uploadCanvasTexture } from '@Core/vr/ui/VRTextBillboard.js';
 
 const LABEL_W = 256;
 const LABEL_H = 64;
@@ -65,6 +68,12 @@ export class AvatarLabel {
     this._actor.addTexture(this._texture);
     this._actor.getProperty().setOpacity(1.0);
     this._actor.setVisibility(false);
+    // The VR renderer IS the desktop renderer, and VR raycasting
+    // (VTKInstanceHandler._getVRPickTargets) filters candidates by
+    // pickability — an unpickable-by-default name-label billboard would
+    // otherwise stand between the user and the data and absorb probe/
+    // measure/teleport hits.
+    this._actor.setPickable(false);
 
     renderer.addActor(this._actor);
 
@@ -126,16 +135,14 @@ export class AvatarLabel {
     // Background
     const bg = this._speaking ? 'rgba(60,220,120,0.85)' : 'rgba(20,20,20,0.82)';
     ctx.fillStyle = bg;
-    ctx.beginPath();
-    ctx.roundRect(2, 2, LABEL_W - 4, LABEL_H - 4, 10);
+    roundRectPath(ctx, 2, 2, LABEL_W - 4, LABEL_H - 4, 10);
     ctx.fill();
 
     // Border (speaking highlight)
     if (this._speaking) {
       ctx.strokeStyle = '#3dec78';
       ctx.lineWidth = 3;
-      ctx.beginPath();
-      ctx.roundRect(2, 2, LABEL_W - 4, LABEL_H - 4, 10);
+      roundRectPath(ctx, 2, 2, LABEL_W - 4, LABEL_H - 4, 10);
       ctx.stroke();
     }
 
@@ -166,31 +173,7 @@ export class AvatarLabel {
   }
 
   _uploadTexture() {
-    const imgData = this._ctx.getImageData(0, 0, LABEL_W, LABEL_H);
-
-    // Flip Y — WebGL origin is bottom-left, canvas is top-left
-    const flipped = new Uint8Array(LABEL_W * LABEL_H * 4);
-    for (let row = 0; row < LABEL_H; row++) {
-      const src = (LABEL_H - 1 - row) * LABEL_W * 4;
-      const dst = row * LABEL_W * 4;
-      flipped.set(imgData.data.subarray(src, src + LABEL_W * 4), dst);
-    }
-
-    const image = vtkImageData.newInstance();
-    image.setDimensions(LABEL_W, LABEL_H, 1);
-    image.setSpacing(1, 1, 1);
-    image.setOrigin(0, 0, 0);
-
-    const scalars = vtkDataArray.newInstance({
-      numberOfComponents: 4,
-      values: flipped,
-      dataType: 'Uint8Array',
-    });
-    scalars.setName('scalars');
-    image.getPointData().setScalars(scalars);
-
-    this._texture.setInputData(image);
-    this._texture.modified();
+    uploadCanvasTexture(this._canvas, this._ctx, this._texture);
   }
 }
 

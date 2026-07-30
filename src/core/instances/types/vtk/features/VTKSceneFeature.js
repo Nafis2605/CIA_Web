@@ -395,6 +395,12 @@ export class VTKSceneFeature extends FeatureInterface {
     property.setOpacity(gridOpacity);
     property.setLineWidth(1);
 
+    // Reference chrome, never a pick target. VR shares this renderer, and
+    // VTKInstanceHandler._getVRPickTargets picks from every pickable actor in
+    // it — an unmarked grid plane would swallow probe/measure/teleport rays
+    // that were aimed at the data behind it.
+    actor.setPickable(false);
+
     // Add to scene
     renderer.addActor(actor);
     state.gridActor = actor;
@@ -504,6 +510,9 @@ export class VTKSceneFeature extends FeatureInterface {
     for (let i = 0; i < 3; i++) {
       cubeAxesActor.getProperty().setColor(r, g, b);
     }
+
+    // Reference chrome, never a pick target — see _createGrid.
+    cubeAxesActor.setPickable(false);
 
     // Add to renderer
     renderer.addActor(cubeAxesActor);

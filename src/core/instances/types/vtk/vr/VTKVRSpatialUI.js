@@ -34,6 +34,12 @@
 
 import { vr as log } from "@Utils/logger.js";
 import { VRSpatialMenuModel, VR_MENU_GROUPS } from "@Core/vr/VRSpatialMenuModel.js";
+// Canvas->texture and rounded-rect tracing now live in the shared VR text
+// primitive (src/core/vr/ui/VRTextBillboard.js) so the menu, avatar labels and
+// every tool label use one implementation. The private methods below are kept
+// as thin delegating wrappers rather than removed — they're referenced
+// throughout this file and by VTKVRSpatialUI.integration.test.js.
+import { roundRectPath, uploadCanvasTexture } from "@Core/vr/ui/VRTextBillboard.js";
 import { getSymbolName } from "@UI/react/components/atoms/Icon/iconRegistry.js";
 import { ICON_PATHS } from "@UI/react/components/atoms/Icon/iconPaths.js";
 
@@ -41,8 +47,6 @@ import vtkActor from "@kitware/vtk.js/Rendering/Core/Actor";
 import vtkMapper from "@kitware/vtk.js/Rendering/Core/Mapper";
 import vtkPlaneSource from "@kitware/vtk.js/Filters/Sources/PlaneSource";
 import vtkTexture from "@kitware/vtk.js/Rendering/Core/Texture";
-import vtkImageData from "@kitware/vtk.js/Common/DataModel/ImageData";
-import vtkDataArray from "@kitware/vtk.js/Common/Core/DataArray";
 
 // Physical panel size in meters (WebXR world units before vrScale). Width is
 // fixed; height is DERIVED per-frame from the model's current row count
@@ -554,18 +558,7 @@ export class VRSpatialUI {
    * @private
    */
   _roundRectPath(ctx, x, y, w, h, r) {
-    const rr = Math.max(0, Math.min(r, w / 2, h / 2));
-    ctx.beginPath();
-    ctx.moveTo(x + rr, y);
-    ctx.lineTo(x + w - rr, y);
-    ctx.quadraticCurveTo(x + w, y, x + w, y + rr);
-    ctx.lineTo(x + w, y + h - rr);
-    ctx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
-    ctx.lineTo(x + rr, y + h);
-    ctx.quadraticCurveTo(x, y + h, x, y + h - rr);
-    ctx.lineTo(x, y + rr);
-    ctx.quadraticCurveTo(x, y, x + rr, y);
-    ctx.closePath();
+    roundRectPath(ctx, x, y, w, h, r);
   }
 
   /**
@@ -927,28 +920,7 @@ export class VRSpatialUI {
    * @private
    */
   _uploadCanvasTexture(canvas, ctx, texture) {
-    const w = canvas.width;
-    const h = canvas.height;
-    const imgData = ctx.getImageData(0, 0, w, h);
-    const flipped = new Uint8Array(w * h * 4);
-    for (let row = 0; row < h; row++) {
-      const src = (h - 1 - row) * w * 4;
-      const dst = row * w * 4;
-      flipped.set(imgData.data.subarray(src, src + w * 4), dst);
-    }
-    const image = vtkImageData.newInstance();
-    image.setDimensions(w, h, 1);
-    image.setSpacing(1, 1, 1);
-    image.setOrigin(0, 0, 0);
-    const scalars = vtkDataArray.newInstance({
-      numberOfComponents: 4,
-      values: flipped,
-      dataType: "Uint8Array",
-    });
-    scalars.setName("scalars");
-    image.getPointData().setScalars(scalars);
-    texture.setInputData(image);
-    texture.modified();
+    uploadCanvasTexture(canvas, ctx, texture);
   }
 
   // ===========================================================================

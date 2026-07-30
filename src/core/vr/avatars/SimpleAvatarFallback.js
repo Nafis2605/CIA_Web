@@ -53,6 +53,12 @@ export class SimpleAvatarFallback {
 
     for (const a of [this._headActor, this._leftHandActor, this._rightHandActor, this._pointerRayActor]) {
       a.setVisibility(false);
+      // The VR renderer IS the desktop renderer, and VR raycasting
+      // (VTKInstanceHandler._getVRPickTargets) filters candidates by
+      // pickability — an unpickable-by-default avatar body would otherwise
+      // stand between the user and the data and absorb probe/measure/
+      // teleport hits.
+      a.setPickable(false);
       renderer.addActor(a);
       this._actors.push(a);
     }

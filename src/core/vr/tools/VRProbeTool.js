@@ -10,12 +10,19 @@ import { vr as log } from '@Utils/logger.js';
 import vtkActor from '@kitware/vtk.js/Rendering/Core/Actor';
 import vtkMapper from '@kitware/vtk.js/Rendering/Core/Mapper';
 import vtkSphereSource from '@kitware/vtk.js/Filters/Sources/SphereSource';
-import vtkVectorText from '@kitware/vtk.js/Rendering/Core/VectorText';
+// The probe readout used vtkVectorText, which renders NOTHING in this codebase:
+// it requires an opentype.js-parsed font via setFont() that nothing ever
+// supplies (opentype.js isn't even a dependency), so it silently produced empty
+// geometry — the whole point of the probe tool was invisible.
+import { VRTextBillboard } from '@Core/vr/ui/VRTextBillboard.js';
 
 const MARKER_APPARENT_RADIUS_M = 0.012;
 const LABEL_APPARENT_HEIGHT_M = 0.02;
 const MARKER_COLOR = [0.2, 0.9, 0.4];
-const LABEL_COLOR = [0.1, 0.1, 0.1];
+// Light text on a dark plate reads against both pale and dark datasets; the old
+// near-black vtkVectorText color assumed a light background.
+const LABEL_TEXT_COLOR = '#f3f5ff';
+const LABEL_BACKGROUND = 'rgba(16,18,28,0.82)';
 
 export class VRProbeTool extends VRToolInterface {
   constructor() {
@@ -35,9 +42,8 @@ export class VRProbeTool extends VRToolInterface {
     this._renderer = null;
     this._markerActor = null;
     this._markerSource = null;
-    this._labelActor = null;
-    this._labelSource = null;
-    this._labelText = null; // dirty-check for vtkVectorText.setText
+    // Canvas-texture billboard; owns its own dirty-checking and disposal.
+    this._label = null;
   }
 
   async activate(context) {
@@ -52,8 +58,9 @@ export class VRProbeTool extends VRToolInterface {
   }
 
   /**
-   * Draw a marker sphere at the current probe point plus a vtkVectorText label
-   * showing the probed value(s). Hidden when there is no current probe.
+   * Draw a marker sphere at the current probe point plus a canvas-texture
+   * billboard showing the probed value(s). Hidden when there is no current
+   * probe.
    * @param {Object} renderer - VTK VR scene renderer
    */
   render(renderer) {
@@ -76,18 +83,16 @@ export class VRProbeTool extends VRToolInterface {
       this._markerActor.setVisibility(true);
     }
 
-    if (this._labelActor) {
-      const text = this._formatProbeText(probe.data);
-      if (text !== this._labelText && this._labelSource) {
-        this._labelSource.setText(text);
-        this._labelText = text;
-      }
+    if (this._label) {
+      // setText is dirty-checked internally, so this is cheap per frame.
+      this._label.setText(this._formatProbeText(probe.data));
       // Float the label slightly above the marker.
       const lift = MARKER_APPARENT_RADIUS_M / this._getVrScale();
-      this._labelActor.setPosition(pos.x, pos.y + lift, pos.z);
-      const ls = this._apparentScale(LABEL_APPARENT_HEIGHT_M);
-      this._labelActor.setScale(ls, ls, ls);
-      this._labelActor.setVisibility(true);
+      this._label
+        .setPosition(pos.x, pos.y + lift, pos.z)
+        .setScale(this._apparentScale(LABEL_APPARENT_HEIGHT_M))
+        .faceCamera(renderer)
+        .setVisible(true);
     }
   }
 
@@ -136,48 +141,31 @@ export class VRProbeTool extends VRToolInterface {
       this._markerActor = actor;
       renderer.addActor(actor);
     }
-    if (!this._labelActor) {
-      try {
-        this._labelSource = vtkVectorText.newInstance();
-        this._labelSource.setText('');
-        const mapper = vtkMapper.newInstance();
-        mapper.setInputConnection(this._labelSource.getOutputPort());
-        const actor = vtkActor.newInstance();
-        actor.setMapper(mapper);
-        actor.getProperty().setColor(...LABEL_COLOR);
-        actor.getProperty().setLighting(false);
-        actor.setPickable(false);
-        actor.setVisibility(false);
-        this._labelActor = actor;
-        renderer.addActor(actor);
-      } catch (err) {
-        log.warn(`VR probe label unavailable: ${err?.message}`);
-        this._labelSource = null;
-        this._labelActor = null;
-      }
+    if (!this._label) {
+      this._label = new VRTextBillboard({
+        worldHeight: LABEL_APPARENT_HEIGHT_M,
+        color: LABEL_TEXT_COLOR,
+        background: LABEL_BACKGROUND,
+      }).attach(renderer);
     }
   }
 
   /** @private */
   _setVisible(visible) {
     this._markerActor?.setVisibility(visible);
-    this._labelActor?.setVisibility(visible);
+    this._label?.setVisible(visible);
   }
 
   /** @private Remove all visual actors from the renderer they were added to. */
   _clearVisuals() {
     const r = this._renderer;
-    if (r) {
-      for (const actor of [this._markerActor, this._labelActor]) {
-        if (actor) {
-          r.removeActor(actor);
-          actor.delete?.();
-        }
-      }
+    if (r && this._markerActor) {
+      r.removeActor(this._markerActor);
+      this._markerActor.delete?.();
     }
+    this._label?.dispose();
     this._markerActor = this._markerSource = null;
-    this._labelActor = this._labelSource = null;
-    this._labelText = null;
+    this._label = null;
     this._renderer = null;
   }
 

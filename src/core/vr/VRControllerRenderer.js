@@ -135,6 +135,12 @@ export class VRControllerRenderer {
     actor.getProperty().setColor(...color);
     actor.getProperty().setOpacity(0.9);
 
+    // Never intercept tool/teleport raycasts. VR shares the desktop renderer,
+    // and VTKInstanceHandler._getVRPickTargets picks from every pickable actor
+    // in it — so an unmarked controller mesh sitting in front of the user's own
+    // ray would absorb the hit before it ever reached the data.
+    actor.setPickable(false);
+
     // Rotate to align with controller grip
     actor.rotateX(90);
 
@@ -164,6 +170,9 @@ export class VRControllerRenderer {
     actor.getProperty().setColor(...color);
     actor.getProperty().setOpacity(0.6);
     actor.getProperty().setLineWidth(2);
+
+    // The pointer ray must never pick itself — see _createControllerActor.
+    actor.setPickable(false);
 
     // NOTE: VTK actors are frozen (Object.freeze), so the line source is
     // returned alongside the actor rather than attached to it — attaching
@@ -431,6 +440,10 @@ export class VRControllerRenderer {
       const color = this._colors[hand];
       actor.getProperty().setColor(...color);
       actor.getProperty().setOpacity(0.7);
+
+      // Hand joint spheres sit directly between the eye and the data — they
+      // must never absorb a tool raycast (see _createControllerActor).
+      actor.setPickable(false);
 
       this._handActors[hand].push(actor);
       this._renderer.addActor(actor);
