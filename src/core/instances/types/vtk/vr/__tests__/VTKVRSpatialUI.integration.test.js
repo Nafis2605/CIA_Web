@@ -23,6 +23,8 @@ vi.mock("@Utils/logger.js", () => {
 
 import { VRSpatialUI } from "../VTKVRSpatialUI.js";
 import { VR_MENU_BUTTONS } from "@Core/vr/VRSpatialMenuModel.js";
+import { VR_KEYBOARD_KEYS } from "@Core/vr/VRKeyboardModel.js";
+import { createFakeCtx } from "@/test/fakeCanvas.js";
 
 /** Minimal manager stub — same shape as VRSpatialMenuModel.test.js's makeManager(). */
 function makeManager(overrides = {}) {
@@ -82,45 +84,31 @@ function makeManager(overrides = {}) {
     isVoiceConnected: vi.fn(() => false),
     toggleVoiceConnection: vi.fn(() => true),
     getNavigationModeInfo: vi.fn(() => ({ name: "Fly", controls: "Thumbstick to move, trigger to boost" })),
+    getAnnotationDraft: vi.fn(() => ({ active: false, text: "", fallbackText: "Note" })),
+    appendAnnotationDraft: vi.fn((str) => str),
+    backspaceAnnotationDraft: vi.fn(() => ""),
+    confirmAnnotationDraft: vi.fn(() => true),
+    cancelAnnotationDraft: vi.fn(() => true),
     ...overrides,
   };
 }
 
-function makeFakeRenderer() {
-  return { addActor: vi.fn(), removeActor: vi.fn() };
+/** A manager whose draft is open — switches the panel into keyboard mode. */
+function makeDraftManager(overrides = {}) {
+  return makeManager({
+    getAnnotationDraft: vi.fn(() => ({
+      active: true,
+      text: "",
+      fallbackText: "Note",
+      position: { x: 0, y: 0, z: 0 },
+      color: [1, 0.5, 0],
+    })),
+    ...overrides,
+  });
 }
 
-/** Fresh fake 2D context per canvas — mirrors real getContext("2d") semantics closely enough to run the code. */
-function createFakeCtx() {
-  return {
-    font: "",
-    fillStyle: "",
-    strokeStyle: "",
-    lineWidth: 0,
-    textAlign: "",
-    textBaseline: "",
-    measureText: vi.fn((str) => ({ width: Math.max(1, String(str).length * 10) })),
-    fillText: vi.fn(),
-    clearRect: vi.fn(),
-    save: vi.fn(),
-    restore: vi.fn(),
-    translate: vi.fn(),
-    scale: vi.fn(),
-    fill: vi.fn(),
-    // Rounded-card path drawing (see VTKVRSpatialUI._roundRectPath / _drawCard).
-    beginPath: vi.fn(),
-    closePath: vi.fn(),
-    moveTo: vi.fn(),
-    lineTo: vi.fn(),
-    quadraticCurveTo: vi.fn(),
-    stroke: vi.fn(),
-    // Group accent bar: clipped fillRect over the rounded card (_drawCard).
-    clip: vi.fn(),
-    fillRect: vi.fn(),
-    getImageData: vi.fn((_x, _y, w, h) => ({
-      data: new Uint8ClampedArray(Math.max(1, w) * Math.max(1, h) * 4),
-    })),
-  };
+function makeFakeRenderer() {
+  return { addActor: vi.fn(), removeActor: vi.fn() };
 }
 
 function makeInputState({ headY = 1.6, triggerPressed = false } = {}) {
@@ -229,24 +217,37 @@ describe("VRSpatialUI integration — initialize/update/dispose against a fake r
     }
   });
 
-  it("places each card ON its own hit region (card plane must be centered)", () => {
-    // REGRESSION: _createButtonActor used to build its plane with vtkPlaneSource's
-    // DEFAULTS, which span [0,1]² rather than the [-0.5,0.5]² that _layoutButtons
-    // assumes. Every card then rendered half a cell up-and-right of the cell it
-    // was positioned at, so the visible card no longer matched the region
-    // hitTest() resolves — pointing at a card activated its neighbour, and the
-    // centered icon/label billboard landed on the card's corner. The old test
-    // only asserted positions were finite, so it could not catch this.
+  // REGRESSION: _createButtonActor used to build its plane with vtkPlaneSource's
+  // DEFAULTS, which span [0,1]² rather than the [-0.5,0.5]² that _layoutButtons
+  // assumes. Every card then rendered half a cell up-and-right of the cell it
+  // was positioned at, so the visible card no longer matched the region
+  // hitTest() resolves — pointing at a card activated its neighbour, and the
+  // centered icon/label billboard landed on the card's corner. The old test
+  // only asserted positions were finite, so it could not catch this.
+  //
+  // Parameterized over both panel modes: this is the specific guard for the
+  // PANEL_WIDTH -> this._panelWidth conversion (4 read sites — see
+  // _layoutBackingPanel, _layoutButtons x2, _intersectPanel). Missing any one
+  // of them would make _layoutButtons and the hit-region math disagree only
+  // in keyboard mode (a wider panel), which the menu-only version of this
+  // test could never catch.
+  it.each([
+    ["menu", () => makeManager()],
+    ["keyboard", () => makeDraftManager()],
+  ])("places each card ON its own hit region in %s mode (card plane must be centered)", (_label, makeMgr) => {
     const renderer = makeFakeRenderer();
     const ui = new VRSpatialUI();
-    ui.initialize(renderer, makeManager());
+    ui.initialize(renderer, makeMgr());
     ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+
+    const layout = ui.getModel().getButtonLayout();
+    expect(layout.length).toBeGreaterThan(0);
 
     // Checking actor.getPosition() would be VACUOUS here — the actor is placed
     // at the cell centre either way; it's the plane's LOCAL vertex range that
     // was wrong. So assert on the actor's world BOUNDS, whose centre only
     // coincides with its position when the plane is authored centered.
-    for (const region of ui.getModel().getButtonLayout()) {
+    for (const region of layout) {
       const entry = ui._buttonActors.get(region.id);
       if (!entry) continue;
 
@@ -267,6 +268,33 @@ describe("VRSpatialUI integration — initialize/update/dispose against a fake r
       expect(width, `card "${region.id}" should have real width`).toBeGreaterThan(0);
       expect(height, `card "${region.id}" should have real height`).toBeGreaterThan(0);
     }
+  });
+
+  it("opening the keyboard forces a re-anchor and actually moves the panel centre", () => {
+    // The draft is toggled via a mutable object the manager mock reads live,
+    // so the SAME input (identical head position) drives two update() calls —
+    // isolating the mode switch as the only thing that changed.
+    const draft = { active: false, text: "", fallbackText: "Note" };
+    const manager = makeManager({ getAnnotationDraft: vi.fn(() => draft) });
+    const renderer = makeFakeRenderer();
+    const ui = new VRSpatialUI();
+    ui.initialize(renderer, manager);
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+
+    const menuWidth = ui._panelWidth;
+    const menuCenter = ui._panelAnchor.center.slice();
+    expect(ui._lastHeadPos).not.toBeNull();
+
+    draft.active = true; // open the draft -> the model reports keyboard mode
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+
+    // Width actually swapped to the keyboard's own (wider) footprint...
+    expect(ui._panelWidth).not.toBe(menuWidth);
+    // ...and _lastHeadPos was nulled so _updateAnchor recomputed instead of
+    // early-returning on REANCHOR_DISTANCE — with an IDENTICAL head pose, the
+    // only way the centre can differ is the drop/side-offset swap taking
+    // effect immediately rather than after the user walks half a metre.
+    expect(ui._panelAnchor.center).not.toEqual(menuCenter);
   });
 
   it("hides the full panel and shows the reshow tab when manually hidden, and reshowing restores it", () => {
@@ -305,6 +333,40 @@ describe("VRSpatialUI integration — initialize/update/dispose against a fake r
 
     expect(renderer.removeActor.mock.calls.length).toBeGreaterThanOrEqual(VR_MENU_BUTTONS.length);
     expect(ui._buttonActors.size).toBe(0);
+    // No mode switch happened in this test, so nothing should have been
+    // parked — dispose() should find this map already empty.
+    expect(ui._parkedActors.size).toBe(0);
+    expect(addCount).toBeGreaterThan(0);
+  });
+
+  it("dispose() also removes PARKED actors (e.g. retired keyboard cards after the draft closes)", () => {
+    // Parking (see _reconcileButtonActors) exists so a mode switch doesn't
+    // rebuild ~50 canvas+texture actors every open — but that only pays off
+    // if dispose() still cleans them up rather than leaking them in the
+    // renderer for the rest of the session.
+    const draft = { active: true, text: "", fallbackText: "Note" };
+    const manager = makeManager({ getAnnotationDraft: vi.fn(() => draft) });
+    const renderer = makeFakeRenderer();
+    const ui = new VRSpatialUI();
+    ui.initialize(renderer, manager);
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] }); // opens keyboard
+    expect(ui._buttonActors.size).toBe(VR_KEYBOARD_KEYS.length);
+
+    draft.active = false; // close the draft -> back to the menu grid
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+
+    expect(ui._buttonActors.size).toBe(VR_MENU_BUTTONS.length);
+    // The keyboard's cards are retired but kept, not destroyed.
+    expect(ui._parkedActors.size).toBe(VR_KEYBOARD_KEYS.length);
+
+    const addCount = renderer.addActor.mock.calls.length;
+    ui.dispose();
+
+    expect(renderer.removeActor.mock.calls.length).toBeGreaterThanOrEqual(
+      VR_MENU_BUTTONS.length + VR_KEYBOARD_KEYS.length
+    );
+    expect(ui._buttonActors.size).toBe(0);
+    expect(ui._parkedActors.size).toBe(0);
     expect(addCount).toBeGreaterThan(0);
   });
 });

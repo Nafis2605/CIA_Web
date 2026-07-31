@@ -29,6 +29,13 @@
 // reduced to a (u, v) pair, so this module stays free of 3D math.
 
 import { vr as log } from "@Utils/logger.js";
+import {
+  VR_KEYBOARD_KEYS,
+  shiftChar,
+  nextShiftMode,
+  consumeShift,
+  formatDraftLine,
+} from "@Core/vr/VRKeyboardModel.js";
 
 /**
  * Button descriptors, left→right within each row, rows bottom→top. `kind`
@@ -221,6 +228,63 @@ const CELL_PADDING = 0.06;
 const TOOL_SYNC_HOLD_MS = 250;
 
 /**
+ * Pure grid-layout math: group `buttons` by `row`, lay each row out as
+ * equal-width horizontal cells inset by `padding`, and stack rows bottom→top
+ * by ascending row index (row 0 renders at the BOTTOM of the stack; negative
+ * rows — drawers, the contextual row — sort above row 0 and render higher
+ * still). Extracted out of getButtonLayout() so a second button set (the
+ * keyboard, see VR_KEYBOARD_KEYS) can reuse the identical math verbatim
+ * rather than duplicating it — see the class-level VRSpatialMenuModel doc for
+ * why the keyboard is a MODE of this model rather than a second panel.
+ *
+ * @param {ReadonlyArray<object>} buttons - descriptors carrying at least `row`
+ * @param {number} [padding=CELL_PADDING] - inner padding per side, as a
+ *   fraction of the cell's own width/height
+ * @returns {Array<object>} each input button plus {u0,u1,v0,v1,cu,cv}
+ */
+export function computeGridLayout(buttons, padding = CELL_PADDING) {
+  const rows = new Map();
+  for (const btn of buttons) {
+    const rowId = btn.row ?? 0;
+    if (!rows.has(rowId)) rows.set(rowId, []);
+    rows.get(rowId).push(btn);
+  }
+  const rowIds = [...rows.keys()].sort((a, b) => a - b);
+  const rowH = 1 / rowIds.length;
+
+  const layout = [];
+  rowIds.forEach((rowId, rowIndex) => {
+    const rowButtons = rows.get(rowId);
+    const n = rowButtons.length;
+    const cellW = 1 / n;
+    const padU = cellW * padding;
+    const padV = rowH * padding;
+    // v runs along +up, so the LAST row index must sit at v=0 for the FIRST
+    // declared row to render at the TOP. Without this inversion the panel
+    // read bottom-up (tools at the floor, session controls at eye level),
+    // the opposite of the declaration order and of how the groups read.
+    const vBase = (rowIds.length - 1 - rowIndex) * rowH;
+
+    rowButtons.forEach((btn, i) => {
+      const u0 = i * cellW + padU;
+      const u1 = (i + 1) * cellW - padU;
+      const v0 = vBase + padV;
+      const v1 = vBase + rowH - padV;
+      layout.push({
+        ...btn,
+        u0,
+        u1,
+        v0,
+        v1,
+        cu: (u0 + u1) / 2,
+        cv: (v0 + v1) / 2,
+      });
+    });
+  });
+  return layout;
+}
+
+/**
  * VRSpatialMenuModel
  *
  * @param {object} manager - Injected manager surface (VRExplorationManager).
@@ -249,6 +313,22 @@ export class VRSpatialMenuModel {
     // trust the optimistic _activeToolId over the manager's lagging async
     // getActiveTool(). Null when there is no tap to honour.
     this._toolTapAtMs = null;
+    // Keyboard mode — DERIVED every frame from the annotate tool's draft
+    // state in syncFromManager(), never toggled directly. Nobody taps a
+    // "keyboard" button: it opens the instant a draft exists and closes on
+    // confirm/cancel/tool-deactivate/session-end, so the panel and the tool
+    // can never disagree (see the class-level architecture note in the task
+    // this was implemented from — no optimistic-hold window like
+    // _activeToolId's, because confirm/cancel mutate the tool synchronously).
+    this._keyboardOpen = false;
+    // Tri-state shift ('off'|'once'|'lock'), reset to 'off' whenever the
+    // keyboard closes so a stale shift never leaks into the next draft.
+    this._shiftMode = "off";
+    // Mirrors of the current draft, refreshed every syncFromManager() call —
+    // getStatusLine()/getHintLine() read these instead of re-querying the
+    // manager mid-frame.
+    this._draftText = "";
+    this._draftFallback = "";
   }
 
   // ===========================================================================
@@ -273,6 +353,13 @@ export class VRSpatialMenuModel {
    *   cu:number,cv:number}>} cu/cv = cell center (for placing labels/icons)
    */
   getButtonLayout() {
+    // Modal: while an annotation draft is open, the panel IS the keyboard —
+    // no static grid, no contextual row, no drawer. hitTest/activate/
+    // getButtonStates all read getButtonLayout(), so returning the keyboard's
+    // own grid here is the entire mode switch; nothing downstream needs to
+    // know "keyboard" exists as a concept.
+    if (this._keyboardOpen) return computeGridLayout(VR_KEYBOARD_KEYS);
+
     const contextual = VR_MENU_CONTEXTUAL_BUTTONS.filter(
       (b) => b.contextTool === this._activeToolId
     );
@@ -316,45 +403,7 @@ export class VRSpatialMenuModel {
       ];
     }
 
-    const rows = new Map();
-    for (const btn of allButtons) {
-      const rowId = btn.row ?? 0;
-      if (!rows.has(rowId)) rows.set(rowId, []);
-      rows.get(rowId).push(btn);
-    }
-    const rowIds = [...rows.keys()].sort((a, b) => a - b);
-    const rowH = 1 / rowIds.length;
-
-    const layout = [];
-    rowIds.forEach((rowId, rowIndex) => {
-      const buttons = rows.get(rowId);
-      const n = buttons.length;
-      const cellW = 1 / n;
-      const padU = cellW * CELL_PADDING;
-      const padV = rowH * CELL_PADDING;
-      // v runs along +up, so the LAST row index must sit at v=0 for the FIRST
-      // declared row to render at the TOP. Without this inversion the panel
-      // read bottom-up (tools at the floor, session controls at eye level),
-      // the opposite of the declaration order and of how the groups read.
-      const vBase = (rowIds.length - 1 - rowIndex) * rowH;
-
-      buttons.forEach((btn, i) => {
-        const u0 = i * cellW + padU;
-        const u1 = (i + 1) * cellW - padU;
-        const v0 = vBase + padV;
-        const v1 = vBase + rowH - padV;
-        layout.push({
-          ...btn,
-          u0,
-          u1,
-          v0,
-          v1,
-          cu: (u0 + u1) / 2,
-          cv: (v0 + v1) / 2,
-        });
-      });
-    });
-    return layout;
+    return computeGridLayout(allButtons);
   }
 
   // ===========================================================================
@@ -488,9 +537,68 @@ export class VRSpatialMenuModel {
         return this._hideMenu();
       case "exit":
         return this._exit();
+      // --- Spatial keyboard (see VRKeyboardModel / isKeyboardOpen) -----------
+      case "kbd-char":
+        return this._kbdChar(btn.char);
+      case "kbd-shift":
+        return this._kbdShift();
+      case "kbd-backspace":
+        return this._kbdBackspace();
+      case "kbd-preset":
+        return this._kbdPreset(btn.text);
+      case "kbd-confirm":
+        return this._kbdConfirm();
+      case "kbd-cancel":
+        return this._kbdCancel();
       default:
         return { handled: false };
     }
+  }
+
+  /**
+   * Insert one character, shifted per the current tri-state, then consume a
+   * one-shot shift (lock persists). @private
+   */
+  _kbdChar(char) {
+    const text = this._call("appendAnnotationDraft", shiftChar(char, this._shiftMode));
+    this._shiftMode = consumeShift(this._shiftMode);
+    return { handled: true, action: "kbd-char", char, text: text ?? null };
+  }
+
+  /** Advance the shift tri-state (off -> once -> lock -> off). @private */
+  _kbdShift() {
+    this._shiftMode = nextShiftMode(this._shiftMode);
+    return { handled: true, action: "kbd-shift", shiftMode: this._shiftMode };
+  }
+
+  /** Delete the last character of the draft. @private */
+  _kbdBackspace() {
+    const text = this._call("backspaceAnnotationDraft");
+    return { handled: true, action: "kbd-backspace", text: text ?? null };
+  }
+
+  /**
+   * Append a preset phrase (plus a trailing space) to the draft buffer.
+   * APPENDS rather than replaces: replacing would silently destroy anything
+   * already typed with no undo, and append is identical to replace when the
+   * buffer is empty — the common case of a one-tap preset fill.
+   * @private
+   */
+  _kbdPreset(text) {
+    const newText = this._call("appendAnnotationDraft", `${text} `);
+    return { handled: true, action: "kbd-preset", presetText: text, text: newText ?? null };
+  }
+
+  /** Save the draft as a real annotation and close the keyboard. @private */
+  _kbdConfirm() {
+    const confirmed = !!this._call("confirmAnnotationDraft");
+    return { handled: true, action: "kbd-confirm", confirmed };
+  }
+
+  /** Discard the draft and close the keyboard. @private */
+  _kbdCancel() {
+    const cancelled = !!this._call("cancelAnnotationDraft");
+    return { handled: true, action: "kbd-cancel", cancelled };
   }
 
   /**
@@ -932,11 +1040,26 @@ export class VRSpatialMenuModel {
     this._participantCycleIndex = -1;
     this._snapshotCycleIndex = -1;
     this._toolTapAtMs = null;
+    this._keyboardOpen = false;
+    this._shiftMode = "off";
+    this._draftText = "";
+    this._draftFallback = "";
     return this._visible;
   }
 
+  /**
+   * @returns {boolean} whether the panel should be drawn. Forces true while
+   *   an annotation draft is open, regardless of `_visible` — the keyboard
+   *   layout has no `hide-menu` key, so if visibility were somehow false
+   *   while a draft is open, VTKVRSpatialUI.update() would take the
+   *   reshow-tab path and strand the user with an uncancellable draft. Checked
+   *   LIVE via the manager (not the cached `_keyboardOpen`) because
+   *   VTKVRSpatialUI calls this BEFORE syncFromManager() each frame — see its
+   *   update()'s `if (!this._model.isVisible())` guard.
+   */
   isVisible() {
-    return this._visible;
+    if (this._visible) return true;
+    return !!this._call("getAnnotationDraft")?.active;
   }
 
   /**
@@ -987,6 +1110,18 @@ export class VRSpatialMenuModel {
     if (typeof this._manager?.isGridModeEnabled === "function") {
       this._gridEnabled = !!this._manager.isGridModeEnabled();
     }
+
+    // Keyboard mode is entirely DERIVED from the draft's presence — see the
+    // constructor comment. This runs every frame (same cadence as the tool/
+    // isolation sync above), so the panel flips to/from the keyboard the
+    // instant the tool opens or resolves a draft, with no separate signal to
+    // keep in sync.
+    const draft = this._call("getAnnotationDraft");
+    this._keyboardOpen = !!draft?.active;
+    this._draftText = draft?.text ?? "";
+    this._draftFallback = draft?.fallbackText ?? "";
+    if (!this._keyboardOpen) this._shiftMode = "off";
+
     return {
       activeToolId: this._activeToolId,
       isolated: this._isolated,
@@ -1000,6 +1135,11 @@ export class VRSpatialMenuModel {
 
   isIsolated() {
     return this._isolated;
+  }
+
+  /** @returns {boolean} true while an annotation draft is open and the panel is the keyboard. */
+  isKeyboardOpen() {
+    return this._keyboardOpen;
   }
 
   /**
@@ -1065,9 +1205,16 @@ export class VRSpatialMenuModel {
         active = !!this._call("isVoiceConnected") && !!this._call("isVoiceMuted");
       }
       else if (btn.kind === "voice-join") active = !!this._call("isVoiceConnected");
+      // Shift lights for either held state ('once' or 'lock') — the render
+      // layer doesn't need to distinguish them, both read as "the next/every
+      // letter is capitalized".
+      else if (btn.kind === "kbd-shift") {
+        active = this._shiftMode === "once" || this._shiftMode === "lock";
+      }
       // clip-invert/clip-reset/annotation-mode/snapshot-save/snapshot-load/
-      // toggle-visibility and the value-* stepper are momentary actions —
-      // never highlighted.
+      // toggle-visibility, the value-* stepper, and the rest of the keyboard
+      // (char/backspace/preset/confirm/cancel) are momentary actions — never
+      // highlighted.
       return { id: btn.id, active, disabled };
     });
   }
@@ -1083,6 +1230,13 @@ export class VRSpatialMenuModel {
    * @returns {string}
    */
   getStatusLine() {
+    // Keyboard mode replaces the whole status line with the live draft
+    // readout (typed text, or the fallback-preset prompt) — dataset/scale/
+    // nav-mode are meaningless while the user is heads-down typing a note.
+    if (this._keyboardOpen) {
+      return formatDraftLine(this._draftText, { fallback: this._draftFallback });
+    }
+
     const name = this._call("getActiveDatasetName") || "Dataset";
     const navMode = this._call("getNavigationMode");
     const scale = this._call("getVRScale");
@@ -1135,13 +1289,18 @@ export class VRSpatialMenuModel {
    * @returns {string}
    */
   getHintLine() {
+    // Leading branch, same reasoning as getStatusLine(): while typing, the
+    // hint is about the keyboard, not the active tool's normal controls.
+    if (this._keyboardOpen) {
+      return "Type the note · Save places it for everyone · Cancel discards";
+    }
     if (this._activeToolId) {
       const toolHints = {
         clip: "Grip+drag to aim, A to invert, B to reset",
         // No thumbstick reference: it is hardcoded inert for Vision Pro
         // transient pointers, and the mode cycle it drove is gone. Label and
         // Color are on the contextual row, reachable on both headsets.
-        annotate: "Trigger to place · Label/Color on the menu · Undo removes the last",
+        annotate: "Trigger to fix a point, then type the note",
         // Chained: each pick continues the path from the last point. No
         // B-button reference — Vision Pro has no A/B, so Undo/New Path on the
         // menu are the only controls guaranteed on both headsets.

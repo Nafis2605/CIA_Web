@@ -2,6 +2,8 @@
 // Main API server for CIA Web v2.0
 // Server-authoritative architecture with WebSocket broadcast
 
+require("dotenv").config({ path: require("path").resolve(__dirname, "../../.env") });
+
 const express = require("express");
 const http = require("http");
 const cors = require("cors");
@@ -42,7 +44,6 @@ pool.on("connect", () => {
 
 pool.on("error", (err) => {
   db.error("Unexpected error on PostgreSQL client", err);
-  process.exit(-1);
 });
 
 // ============================================================================

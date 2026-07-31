@@ -15,7 +15,9 @@ import {
   VR_MENU_BUTTONS,
   VR_MENU_CONTEXTUAL_BUTTONS,
   VR_MENU_DRAWERS,
+  computeGridLayout,
 } from "../VRSpatialMenuModel.js";
+import { VR_KEYBOARD_KEYS } from "../VRKeyboardModel.js";
 
 /** Minimal manager stub matching the methods the model calls. */
 function makeManager(overrides = {}) {
@@ -75,8 +77,27 @@ function makeManager(overrides = {}) {
     isVoiceConnected: vi.fn(() => false),
     toggleVoiceConnection: vi.fn(() => true),
     getNavigationModeInfo: vi.fn(() => ({ name: "Fly", controls: "Thumbstick to move, trigger to boost" })),
+    getAnnotationDraft: vi.fn(() => ({ active: false, text: "", fallbackText: "Note" })),
+    appendAnnotationDraft: vi.fn((str) => str),
+    backspaceAnnotationDraft: vi.fn(() => ""),
+    confirmAnnotationDraft: vi.fn(() => true),
+    cancelAnnotationDraft: vi.fn(() => true),
     ...overrides,
   };
+}
+
+/** A manager whose draft is open — the precondition for keyboard mode. */
+function makeDraftManager(overrides = {}) {
+  return makeManager({
+    getAnnotationDraft: vi.fn(() => ({
+      active: true,
+      text: "",
+      fallbackText: "Note",
+      position: { x: 0, y: 0, z: 0 },
+      color: [1, 0.5, 0],
+    })),
+    ...overrides,
+  });
 }
 
 describe("VRSpatialMenuModel — layout & hit testing", () => {
@@ -881,5 +902,216 @@ describe("VRSpatialMenuModel — drawers", () => {
     expect(() => bare.getButtonStates()).not.toThrow();
     expect(() => bare.activate("rep-points")).not.toThrow();
     expect(() => bare.activate("value-inc")).not.toThrow();
+  });
+});
+
+describe("VRSpatialMenuModel — keyboard mode", () => {
+  let manager;
+  let model;
+
+  beforeEach(() => {
+    manager = makeDraftManager();
+    model = new VRSpatialMenuModel(manager);
+    model.syncFromManager();
+  });
+
+  it("getButtonLayout returns only keyboard ids while a draft is open — the tool grid is gone", () => {
+    const layout = model.getButtonLayout();
+    const ids = layout.map((b) => b.id).sort();
+    expect(ids).toEqual([...VR_KEYBOARD_KEYS.map((k) => k.id)].sort());
+    expect(ids).not.toContain("annotate");
+    expect(ids).not.toContain("exit");
+  });
+
+  it("isKeyboardOpen() reflects the draft's active flag", () => {
+    expect(model.isKeyboardOpen()).toBe(true);
+  });
+
+  // The same invariants the plain menu grid is held to (see the "layout & hit
+  // testing" describe above), re-run against computeGridLayout() directly for
+  // BOTH button sets. These holding for a 10-column keyboard row is the whole
+  // justification for making the keyboard a MODE of this model rather than a
+  // second panel with its own layout math — see the class-level doc comment.
+  it.each([
+    ["menu grid", () => computeGridLayout(VR_MENU_BUTTONS)],
+    ["keyboard grid", () => computeGridLayout(VR_KEYBOARD_KEYS)],
+  ])("%s: one non-overlapping cell per button, within [0,1] on both axes", (_label, getLayout) => {
+    const layout = getLayout();
+    for (const r of layout) {
+      expect(r.u0).toBeGreaterThanOrEqual(0);
+      expect(r.u1).toBeLessThanOrEqual(1);
+      expect(r.u0).toBeLessThan(r.u1);
+      expect(r.v0).toBeGreaterThanOrEqual(0);
+      expect(r.v1).toBeLessThanOrEqual(1);
+      expect(r.v0).toBeLessThan(r.v1);
+    }
+  });
+
+  it.each([
+    ["menu grid", () => computeGridLayout(VR_MENU_BUTTONS)],
+    ["keyboard grid", () => computeGridLayout(VR_KEYBOARD_KEYS)],
+  ])("%s: within each row, cells are strictly increasing and non-overlapping left→right", (_label, getLayout) => {
+    const byRow = new Map();
+    for (const r of getLayout()) {
+      if (!byRow.has(r.row)) byRow.set(r.row, []);
+      byRow.get(r.row).push(r);
+    }
+    for (const cells of byRow.values()) {
+      for (let i = 1; i < cells.length; i++) {
+        expect(cells[i].u0).toBeGreaterThan(cells[i - 1].u1);
+      }
+    }
+  });
+
+  it.each([
+    ["menu grid", () => computeGridLayout(VR_MENU_BUTTONS)],
+    ["keyboard grid", () => computeGridLayout(VR_KEYBOARD_KEYS)],
+  ])("%s: rows are stacked top-to-bottom without overlapping v-ranges", (_label, getLayout) => {
+    const layout = getLayout();
+    const rowIds = [...new Set(layout.map((r) => r.row))].sort((a, b) => a - b);
+    for (const rowId of rowIds) {
+      const cells = layout.filter((r) => r.row === rowId);
+      const v0 = cells[0].v0;
+      const v1 = cells[0].v1;
+      for (const c of cells) {
+        expect(c.v0).toBe(v0);
+        expect(c.v1).toBe(v1);
+      }
+      const higherRow = layout.find((r) => r.row === rowId + 1);
+      if (higherRow) {
+        expect(higherRow.v1).toBeLessThanOrEqual(v0 + 1e-9);
+      }
+    }
+  });
+
+  it("hitTest maps each keyboard cell centre back to that key", () => {
+    for (const r of model.getButtonLayout()) {
+      expect(model.hitTest(r.cu, r.cv)?.id).toBe(r.id);
+    }
+  });
+
+  it("kbd-char appends the bare character via manager.appendAnnotationDraft when shift is off", () => {
+    const r = model.activate("kbd-q");
+    expect(manager.appendAnnotationDraft).toHaveBeenCalledWith("q");
+    expect(r).toMatchObject({ handled: true, action: "kbd-char", char: "q" });
+  });
+
+  it("shift 'once' capitalizes exactly the next character, then reverts to off", () => {
+    model.activate("kbd-shift"); // off -> once
+    manager.appendAnnotationDraft.mockClear();
+
+    model.activate("kbd-q");
+    expect(manager.appendAnnotationDraft).toHaveBeenCalledWith("Q");
+
+    manager.appendAnnotationDraft.mockClear();
+    model.activate("kbd-w");
+    expect(manager.appendAnnotationDraft).toHaveBeenCalledWith("w"); // shift already consumed
+  });
+
+  it("shift 'lock' capitalizes every character until toggled off again", () => {
+    model.activate("kbd-shift"); // off -> once
+    model.activate("kbd-shift"); // once -> lock
+    manager.appendAnnotationDraft.mockClear();
+
+    model.activate("kbd-q");
+    expect(manager.appendAnnotationDraft).toHaveBeenCalledWith("Q");
+    manager.appendAnnotationDraft.mockClear();
+    model.activate("kbd-w");
+    expect(manager.appendAnnotationDraft).toHaveBeenCalledWith("W");
+  });
+
+  it("getButtonStates lights Shift only while 'once' or 'lock', not 'off'", () => {
+    const stateOf = (id) =>
+      model.getButtonStates().find((s) => s.id === id)?.active;
+    expect(stateOf("kbd-shift")).toBe(false);
+
+    model.activate("kbd-shift"); // once
+    expect(stateOf("kbd-shift")).toBe(true);
+
+    model.activate("kbd-shift"); // lock
+    expect(stateOf("kbd-shift")).toBe(true);
+
+    model.activate("kbd-shift"); // back to off
+    expect(stateOf("kbd-shift")).toBe(false);
+  });
+
+  it("kbd-backspace routes through manager.backspaceAnnotationDraft", () => {
+    const r = model.activate("kbd-backspace");
+    expect(manager.backspaceAnnotationDraft).toHaveBeenCalledTimes(1);
+    expect(r).toMatchObject({ handled: true, action: "kbd-backspace" });
+  });
+
+  it("kbd-confirm routes through manager.confirmAnnotationDraft", () => {
+    const r = model.activate("kbd-confirm");
+    expect(manager.confirmAnnotationDraft).toHaveBeenCalledTimes(1);
+    expect(r).toMatchObject({ handled: true, action: "kbd-confirm", confirmed: true });
+  });
+
+  it("kbd-cancel routes through manager.cancelAnnotationDraft", () => {
+    const r = model.activate("kbd-cancel");
+    expect(manager.cancelAnnotationDraft).toHaveBeenCalledTimes(1);
+    expect(r).toMatchObject({ handled: true, action: "kbd-cancel", cancelled: true });
+  });
+
+  it("kbd-preset appends the preset text plus a trailing space (never replaces)", () => {
+    const r = model.activate("kbd-preset-anomaly");
+    expect(manager.appendAnnotationDraft).toHaveBeenCalledWith("Anomaly ");
+    expect(r).toMatchObject({ handled: true, action: "kbd-preset", presetText: "Anomaly" });
+  });
+
+  it("getStatusLine shows the draft readout instead of dataset/scale/nav-mode", () => {
+    manager.getAnnotationDraft.mockReturnValue({ active: true, text: "hello", fallbackText: "Note" });
+    model.syncFromManager();
+    expect(model.getStatusLine()).toContain("hello");
+    expect(model.getStatusLine()).not.toContain("test.vtp");
+  });
+
+  it("getStatusLine falls back to the preset prompt when nothing has been typed", () => {
+    manager.getAnnotationDraft.mockReturnValue({ active: true, text: "", fallbackText: "Max" });
+    model.syncFromManager();
+    expect(model.getStatusLine()).toContain('"Max"');
+  });
+
+  it("getHintLine switches to the keyboard hint", () => {
+    expect(model.getHintLine()).toBe(
+      "Type the note · Save places it for everyone · Cancel discards"
+    );
+  });
+
+  it("the tool grid is unhittable while the keyboard is open", () => {
+    expect(model.activate("annotate")).toEqual({ handled: false });
+    expect(model.getButtonLayout().some((b) => b.id === "exit")).toBe(false);
+  });
+
+  it("closes automatically when the draft resolves — derived, never toggled", () => {
+    expect(model.isKeyboardOpen()).toBe(true);
+    manager.getAnnotationDraft.mockReturnValue({ active: false, text: "", fallbackText: "Note" });
+    model.syncFromManager();
+    expect(model.isKeyboardOpen()).toBe(false);
+    expect(model.getButtonLayout().some((b) => b.id === "annotate")).toBe(true);
+  });
+
+  it("resets a held shift back to 'off' the moment the keyboard closes", () => {
+    model.activate("kbd-shift"); // once
+    manager.getAnnotationDraft.mockReturnValue({ active: false, text: "", fallbackText: "Note" });
+    model.syncFromManager();
+
+    // Re-open a fresh draft — shift must not have survived the close.
+    manager.getAnnotationDraft.mockReturnValue({ active: true, text: "", fallbackText: "Note" });
+    model.syncFromManager();
+    const stateOf = (id) => model.getButtonStates().find((s) => s.id === id)?.active;
+    expect(stateOf("kbd-shift")).toBe(false);
+  });
+
+  it("forces the panel visible even if manually hidden while a draft is open", () => {
+    model.setVisible(false);
+    expect(model.isVisible()).toBe(true);
+  });
+
+  it("tolerates a manager missing the draft methods entirely", () => {
+    const bare = new VRSpatialMenuModel({});
+    expect(() => bare.syncFromManager()).not.toThrow();
+    expect(bare.isKeyboardOpen()).toBe(false);
+    expect(() => bare.activate("kbd-confirm")).not.toThrow();
   });
 });

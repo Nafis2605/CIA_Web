@@ -58,6 +58,17 @@ import vtkTexture from "@kitware/vtk.js/Rendering/Core/Texture";
 // PANEL_DISTANCE, comfortable for both a Quest controller ray and a Vision Pro
 // gaze pinch.
 const PANEL_WIDTH = 0.78;
+// Keyboard mode's own panel geometry — swapped in over the menu's constants
+// above whenever VRSpatialMenuModel.isKeyboardOpen() is true (see update()'s
+// mode switch). At the menu's 0.78 m width a 10-column row (digits, QWERTY,
+// ASDF...) gives 0.078 m cells, ~3.7° at PANEL_DISTANCE — too small for a
+// Vision Pro gaze pinch to reliably land. Widening (NOT pushing the panel
+// further away — angular size is width/distance, so more distance only makes
+// this worse) gets 0.115 m cells, ~5.5°, comparable to Quest's own on-screen
+// keyboard (~5.7°).
+const KEYBOARD_PANEL_WIDTH = 1.15; // 0.115 m cells ≈ 5.5° at PANEL_DISTANCE — Quest's own keyboard is ~5.7°
+const KEYBOARD_PANEL_DROP = 0.42; // less dropped: you read this panel, not glance at it
+const KEYBOARD_PANEL_SIDE_OFFSET = 0.0; // centred while modal
 const ROW_HEIGHT_M = 0.14; // matches the original single-row height
 // With a drawer open the panel can reach 8 rows (5 static + 2 drawer + 1
 // contextual). At a fixed 0.14 m that would be 1.12 m tall — taller than the
@@ -230,6 +241,19 @@ export class VRSpatialUI {
     // the dataset is zoomed. Mirrors VREnvironment's per-actor transform.
     this._vrScale = 1.0;
     this._vrOrigin = [0, 0, 0];
+    // Per-instance panel geometry, defaulted to the menu's constants and
+    // swapped for the keyboard's own set in update() whenever the model's
+    // mode flips (see _lastPanelMode). Instance fields (not module constants)
+    // because the SAME panel now has two possible footprints.
+    this._panelWidth = PANEL_WIDTH;
+    this._panelDrop = PANEL_DROP;
+    this._panelSideOffset = PANEL_SIDE_OFFSET;
+    this._lastPanelMode = "menu";
+    // Actors for buttons whose id fell out of the current layout (e.g. a
+    // mode switch), moved here instead of destroyed — see
+    // _reconcileButtonActors. Re-adopted if the same id reappears; otherwise
+    // sit invisible until dispose().
+    this._parkedActors = new Map();
   }
 
   /**
@@ -294,45 +318,16 @@ export class VRSpatialUI {
       canvas.height = BACKING_TEX_H;
       const ctx = canvas.getContext("2d");
 
-      const w = canvas.width;
-      const h = canvas.height;
-      ctx.clearRect(0, 0, w, h);
-      // Body
-      this._roundRectPath(ctx, 4, 4, w - 8, h - 8, BACKING_CORNER_RADIUS);
-      ctx.fillStyle = BACKING_STYLE.fill;
-      ctx.fill();
-      ctx.lineWidth = 4;
-      ctx.strokeStyle = BACKING_STYLE.border;
-      ctx.stroke();
-      // Header band across the top (proportional to the texture height).
-      const headerPx = Math.round(h * 0.14);
-      this._roundRectPath(ctx, 4, 4, w - 8, headerPx, BACKING_CORNER_RADIUS);
-      ctx.fillStyle = BACKING_HEADER.fill;
-      ctx.fill();
-
-      // Activity legend: one accent swatch + name per group, in row order.
-      // This lives in the header (drawn once at a fixed resolution) rather than
-      // as per-row labels, because the backing plane is STRETCHED to a panel
-      // height that changes whenever the contextual row appears — row-aligned
-      // text on this texture would drift out of register with the actual rows.
-      const cellW = (w - 16) / VR_MENU_GROUPS.length;
-      const midY = 4 + headerPx / 2;
-      const swatch = Math.round(headerPx * 0.3);
-      ctx.font = `600 ${Math.round(headerPx * 0.32)}px Arial, sans-serif`;
-      ctx.textAlign = "left";
-      ctx.textBaseline = "middle";
-      VR_MENU_GROUPS.forEach((groupName, i) => {
-        const x = 8 + i * cellW;
-        ctx.fillStyle = GROUP_ACCENTS[groupName] || GROUP_ACCENT_FALLBACK;
-        this._roundRectPath(ctx, x, midY - swatch / 2, swatch, swatch, 3);
-        ctx.fill();
-        ctx.fillStyle = COLOR_LABEL;
-        ctx.fillText(groupName, x + swatch + 6, midY + 1);
-      });
-
       const texture = vtkTexture.newInstance();
       texture.setInterpolate(true);
-      this._uploadCanvasTexture(canvas, ctx, texture);
+
+      this._backingCanvas = canvas;
+      this._backingCtx = ctx;
+      this._backingTexture = texture;
+      // Content (menu group legend vs. keyboard title) is drawn separately so
+      // update()'s mode switch can repaint it without rebuilding the actor —
+      // see _drawBackingPanel.
+      this._drawBackingPanel("menu");
 
       // Seeded as a real unit quad, not the degenerate all-zero plane vtk.js
       // warns about ("Bad plane definition"); _layoutBackingPanel resizes it
@@ -353,15 +348,81 @@ export class VRSpatialUI {
       actor.setVisibility(false);
       actor.setPickable(false);
 
-      this._backingCanvas = canvas;
-      this._backingCtx = ctx;
-      this._backingTexture = texture;
       this._backingPlaneSource = planeSource;
       this._backingPanelActor = actor;
       this._renderer.addActor(actor);
     } catch (err) {
       log.warn(`VR menu backing panel failed: ${err?.message}`);
     }
+  }
+
+  /**
+   * Paint the backing panel's HEADER content for the given mode onto the
+   * already-built canvas/ctx/texture, re-uploading the texture — the canvas
+   * itself never changes size (BACKING_TEX_W x BACKING_TEX_H is fixed), only
+   * what's drawn on it, so a plain re-upload is enough; no plane/actor rebuild.
+   *
+   * "menu" draws the VR_MENU_GROUPS activity legend (TOOLS/MOVE/VIEW/SCENE/
+   * SESSION) that makes sense above the static grid. "keyboard" draws a plain
+   * "Annotation" title instead — the group legend would be actively
+   * misleading above a QWERTY layout that has none of those rows.
+   * @param {"menu"|"keyboard"} mode
+   * @private
+   */
+  _drawBackingPanel(mode) {
+    const canvas = this._backingCanvas;
+    const ctx = this._backingCtx;
+    if (!canvas || !ctx) return;
+
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    // Body
+    this._roundRectPath(ctx, 4, 4, w - 8, h - 8, BACKING_CORNER_RADIUS);
+    ctx.fillStyle = BACKING_STYLE.fill;
+    ctx.fill();
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = BACKING_STYLE.border;
+    ctx.stroke();
+    // Header band across the top (proportional to the texture height).
+    const headerPx = Math.round(h * 0.14);
+    this._roundRectPath(ctx, 4, 4, w - 8, headerPx, BACKING_CORNER_RADIUS);
+    ctx.fillStyle = BACKING_HEADER.fill;
+    ctx.fill();
+
+    const midY = 4 + headerPx / 2;
+
+    if (mode === "keyboard") {
+      // A single centred title — no per-group swatches, nothing to legend.
+      ctx.font = `600 ${Math.round(headerPx * 0.4)}px Arial, sans-serif`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = COLOR_LABEL;
+      ctx.fillText("Annotation", w / 2, midY + 1);
+      if (this._backingTexture) this._uploadCanvasTexture(canvas, ctx, this._backingTexture);
+      return;
+    }
+
+    // Activity legend: one accent swatch + name per group, in row order.
+    // This lives in the header (drawn once at a fixed resolution) rather than
+    // as per-row labels, because the backing plane is STRETCHED to a panel
+    // height that changes whenever the contextual row appears — row-aligned
+    // text on this texture would drift out of register with the actual rows.
+    const cellW = (w - 16) / VR_MENU_GROUPS.length;
+    const swatch = Math.round(headerPx * 0.3);
+    ctx.font = `600 ${Math.round(headerPx * 0.32)}px Arial, sans-serif`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    VR_MENU_GROUPS.forEach((groupName, i) => {
+      const x = 8 + i * cellW;
+      ctx.fillStyle = GROUP_ACCENTS[groupName] || GROUP_ACCENT_FALLBACK;
+      this._roundRectPath(ctx, x, midY - swatch / 2, swatch, swatch, 3);
+      ctx.fill();
+      ctx.fillStyle = COLOR_LABEL;
+      ctx.fillText(groupName, x + swatch + 6, midY + 1);
+    });
+
+    if (this._backingTexture) this._uploadCanvasTexture(canvas, ctx, this._backingTexture);
   }
 
   /**
@@ -376,7 +437,7 @@ export class VRSpatialUI {
     const yawDeg = (Math.atan2(normal[0], normal[2]) * 180) / Math.PI;
     const inv = 1 / (this._vrScale || 1.0);
 
-    const width = PANEL_WIDTH + BACKING_PAD_M * 2;
+    const width = this._panelWidth + BACKING_PAD_M * 2;
     const height = this._panelHeight + BACKING_PAD_M * 2 + BACKING_HEADER_M;
     const hw = width / 2;
     const hh = height / 2;
@@ -411,15 +472,38 @@ export class VRSpatialUI {
     const layout = this._model.getButtonLayout();
     const currentIds = new Set(layout.map((r) => r.id));
 
+    // Park (don't destroy) actors whose id fell out of the layout. A mode
+    // switch — menu <-> keyboard, or a tool/drawer toggle — can retire and
+    // later reintroduce the same ids repeatedly (every keyboard open/close is
+    // ~50 cards), and each card is a canvas + texture + up to two actors:
+    // rebuilding that set from scratch on every open would be a visible
+    // hitch at 90 Hz. setVisibility(false) on BOTH actors is required here,
+    // not optional — _layoutButtons only ever positions/shows ids that ARE in
+    // the current layout, so a parked card left visible would linger at its
+    // last position forever.
     for (const [id, entry] of this._buttonActors) {
       if (currentIds.has(id)) continue;
-      this._renderer.removeActor(entry.actor);
-      if (entry.labelActor) this._renderer.removeActor(entry.labelActor);
+      entry.actor.setVisibility(false);
+      if (entry.labelActor) entry.labelActor.setVisibility(false);
+      this._parkedActors.set(id, entry);
       this._buttonActors.delete(id);
     }
 
     for (const region of layout) {
       if (this._buttonActors.has(region.id)) continue;
+
+      // Re-adopt a parked actor for this id before building a new one — this
+      // is what makes reopening the keyboard (or reactivating a tool) cheap:
+      // its cards already exist, just hidden. _layoutButtons/_applyButtonVisuals
+      // run every frame regardless of adopt-vs-build, so position and visual
+      // state (idle/hover/active) both catch up this same frame.
+      const parked = this._parkedActors.get(region.id);
+      if (parked) {
+        this._parkedActors.delete(region.id);
+        this._buttonActors.set(region.id, parked);
+        continue;
+      }
+
       // Per-button isolation: _createButtonContentActor already catches its
       // own errors and degrades to a label-less quad, but _createButtonActor
       // and the addActor calls themselves are not guarded. Without this
@@ -1009,9 +1093,33 @@ export class VRSpatialUI {
     // needs the same actor rebuild the contextual row already triggered.
     const activeToolId = this._model.getActiveToolId();
     const openDrawerId = this._model.getOpenDrawerId?.() ?? null;
+
+    // Menu <-> keyboard mode switch. Swaps the panel's physical footprint
+    // (width/drop/side-offset) wholesale rather than tweening it — a draft
+    // opening/closing is a discrete event, not something that benefits from
+    // animating the panel underneath the user's hands.
+    const mode = this._model.isKeyboardOpen?.() ? "keyboard" : "menu";
+    const modeChanged = mode !== this._lastPanelMode;
+    if (modeChanged) {
+      this._lastPanelMode = mode;
+      this._panelWidth = mode === "keyboard" ? KEYBOARD_PANEL_WIDTH : PANEL_WIDTH;
+      this._panelDrop = mode === "keyboard" ? KEYBOARD_PANEL_DROP : PANEL_DROP;
+      this._panelSideOffset = mode === "keyboard" ? KEYBOARD_PANEL_SIDE_OFFSET : PANEL_SIDE_OFFSET;
+      // _updateAnchor early-returns unless the head has drifted past
+      // REANCHOR_DISTANCE, so without nulling this the new width/drop/offset
+      // would sit unused until the user physically walked half a metre —
+      // the panel would keep rendering at its OLD footprint/position.
+      this._lastHeadPos = null;
+      // Repaint the header in place (same canvas/texture, see
+      // _drawBackingPanel) — the group legend makes no sense above a QWERTY
+      // grid, and vice versa.
+      this._drawBackingPanel(mode);
+    }
+
     if (
       activeToolId !== this._lastActiveToolId ||
-      openDrawerId !== this._lastOpenDrawerId
+      openDrawerId !== this._lastOpenDrawerId ||
+      modeChanged
     ) {
       this._lastActiveToolId = activeToolId;
       this._lastOpenDrawerId = openDrawerId;
@@ -1090,11 +1198,14 @@ export class VRSpatialUI {
 
     // Offset laterally (along `right`) in addition to the downward drop, so
     // the panel sits off the dead-center forward ray instead of directly on
-    // top of it — see the PANEL_DROP/PANEL_SIDE_OFFSET comment above.
+    // top of it — see the PANEL_DROP/PANEL_SIDE_OFFSET comment above. Reads
+    // the INSTANCE fields (not the module constants) so keyboard mode's
+    // centred, less-dropped placement takes effect the moment update() swaps
+    // them in.
     const center = [
-      headPos[0] + fx * PANEL_DISTANCE + right[0] * PANEL_SIDE_OFFSET,
-      headPos[1] - PANEL_DROP,
-      headPos[2] + fz * PANEL_DISTANCE + right[2] * PANEL_SIDE_OFFSET,
+      headPos[0] + fx * PANEL_DISTANCE + right[0] * this._panelSideOffset,
+      headPos[1] - this._panelDrop,
+      headPos[2] + fz * PANEL_DISTANCE + right[2] * this._panelSideOffset,
     ];
 
     this._panelAnchor = { center, right, up, normal };
@@ -1136,7 +1247,7 @@ export class VRSpatialUI {
       const lift = region.id === this._hoverButtonId ? CARD_HOVER_LIFT : 0;
 
       // UV center → offset from panel center, in meters
-      const ou = (region.cu - 0.5) * PANEL_WIDTH;
+      const ou = (region.cu - 0.5) * this._panelWidth;
       const ov = (region.cv - 0.5) * this._panelHeight;
       const cx = center[0] + right[0] * ou + up[0] * ov + a.normal[0] * lift;
       const cy = center[1] + right[1] * ou + up[1] * ov + a.normal[1] * lift;
@@ -1147,7 +1258,7 @@ export class VRSpatialUI {
       // Scale the centred unit plane (spans [-0.5,0.5], see _createButtonActor)
       // to cell size, inset by CARD_FILL for the inter-card gap, then by
       // 1/vrScale so it renders at its authored physical size in data space.
-      const w = (region.u1 - region.u0) * PANEL_WIDTH * CARD_FILL;
+      const w = (region.u1 - region.u0) * this._panelWidth * CARD_FILL;
       const h = (region.v1 - region.v0) * this._panelHeight * CARD_FILL;
       actor.setScale(w * inv, h * inv, inv);
       actor.setVisibility(true);
@@ -1347,7 +1458,7 @@ export class VRSpatialUI {
     // Project onto panel axes → meters from center → [0,1] fraction.
     const mu = this._dot(local, right);
     const mv = this._dot(local, up);
-    const u = mu / PANEL_WIDTH + 0.5;
+    const u = mu / this._panelWidth + 0.5;
     const v = mv / this._panelHeight + 0.5;
     if (u < 0 || u > 1 || v < 0 || v > 1) return null;
     return { u, v, t };
@@ -1483,12 +1594,21 @@ export class VRSpatialUI {
         this._renderer.removeActor(actor);
         if (labelActor) this._renderer.removeActor(labelActor);
       }
+      // Parked actors (see _reconcileButtonActors) are hidden, not in the
+      // renderer's normal live set — but they were still addActor()'d at some
+      // point, so they must be removed here too or a session's worth of
+      // retired keyboard/contextual cards leak in the renderer forever.
+      for (const { actor, labelActor } of this._parkedActors.values()) {
+        this._renderer.removeActor(actor);
+        if (labelActor) this._renderer.removeActor(labelActor);
+      }
       if (this._statusActor) this._renderer.removeActor(this._statusActor);
       if (this._hintActor) this._renderer.removeActor(this._hintActor);
       if (this._reshowTabActor) this._renderer.removeActor(this._reshowTabActor);
       if (this._reshowTabLabelActor) this._renderer.removeActor(this._reshowTabLabelActor);
     }
     this._buttonActors.clear();
+    this._parkedActors.clear();
     this._panelAnchor = null;
     this._lastHeadPos = null;
     this._hoverButtonId = null;
@@ -1496,6 +1616,10 @@ export class VRSpatialUI {
     this._panelHeight = this._computePanelHeight(5);
     this._lastActiveToolId = null;
     this._lastOpenDrawerId = null;
+    this._panelWidth = PANEL_WIDTH;
+    this._panelDrop = PANEL_DROP;
+    this._panelSideOffset = PANEL_SIDE_OFFSET;
+    this._lastPanelMode = "menu";
     this._statusCanvas = null;
     this._statusCtx = null;
     this._statusTexture = null;

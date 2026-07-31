@@ -818,6 +818,74 @@ class VRExplorationManager extends BaseManager {
   }
 
   /**
+   * Current state of the active Annotate tool's in-progress draft (a fixed
+   * point with nothing persisted yet). Read every frame by the spatial
+   * keyboard's status line. Returns null when Annotate isn't the active tool
+   * or no draft is open — the keyboard renderer treats null as "not shown".
+   * @returns {{active:boolean,text:string,fallbackText:string,position:object,color:*}|null}
+   */
+  getAnnotationDraft() {
+    const tool = this._toolManager?.getActiveTool?.();
+    if (tool?.id !== 'annotate' || typeof tool.getDraft !== 'function') return null;
+    return tool.getDraft();
+  }
+
+  /**
+   * Append characters to the active draft's text buffer. No-ops (returns
+   * null) if Annotate isn't active or no draft is open. Invoked per keypress
+   * by the spatial keyboard's kbd-char / kbd-preset keys.
+   * @param {string} str
+   * @returns {string|null} the new draft text, or null if unsupported
+   */
+  appendAnnotationDraft(str) {
+    const tool = this._toolManager?.getActiveTool?.();
+    if (tool?.id !== 'annotate' || typeof tool.appendDraftText !== 'function') return null;
+    return tool.appendDraftText(str);
+  }
+
+  /**
+   * Remove the last character of the active draft's text buffer. Same guard
+   * shape as appendAnnotationDraft. Invoked by the keyboard's Del key.
+   * @returns {string|null} the new draft text, or null if unsupported
+   */
+  backspaceAnnotationDraft() {
+    const tool = this._toolManager?.getActiveTool?.();
+    if (tool?.id !== 'annotate' || typeof tool.backspaceDraft !== 'function') return null;
+    return tool.backspaceDraft();
+  }
+
+  /**
+   * Save the active draft as a real, persisted, broadcast annotation.
+   * Routes the resulting annotation-created action through _handleToolAction
+   * — never call _persistVRAnnotation directly — so persistence and _emit
+   * stay behind the single choke point every other tool action goes through
+   * (see undoLastToolAction, invertClipPlane). Invoked by the keyboard's
+   * Save key.
+   * @returns {boolean} true if a draft was confirmed
+   */
+  confirmAnnotationDraft() {
+    const tool = this._toolManager?.getActiveTool?.();
+    if (tool?.id !== 'annotate') return false;
+    const action = tool.confirmDraft?.();
+    if (action) this._handleToolAction(action);
+    return !!action;
+  }
+
+  /**
+   * Discard the active draft — nothing persisted, nothing broadcast. Same
+   * _handleToolAction routing discipline as confirmAnnotationDraft. Invoked
+   * by the keyboard's Cancel key.
+   * @returns {boolean} true if a draft was cancelled
+   */
+  cancelAnnotationDraft() {
+    const tool = this._toolManager?.getActiveTool?.();
+    if (tool?.id !== 'annotate') return false;
+    const action = tool.cancelDraft?.();
+    if (action) this._handleToolAction(action);
+    return !!action;
+  }
+
+  /**
    * Toggle the active Probe tool's continuous-sampling mode. No-ops (returns
    * false) if Probe isn't the active tool. Invoked by the spatial menu's
    * contextual "Continuous" button.
@@ -2197,9 +2265,20 @@ class VRExplorationManager extends BaseManager {
     log.debug('Tool action:', action);
 
     switch (action.type) {
+      case 'annotation-pending':
+        // Point fixed, keyboard open — nothing persisted or broadcast yet.
+        // Reached only from VRAnnotationTool.handleInput's trigger placement.
+        this._emit('annotationPending', action.data);
+        break;
       case 'annotation-created':
+        // Reached only from confirmAnnotationDraft() now (Save) — the old
+        // instant-place-on-trigger path is gone.
         this._emit('annotationCreated', action.data);
         this._persistVRAnnotation(action.data);
+        break;
+      case 'annotation-cancelled':
+        // Draft discarded — nothing was ever persisted, so nothing to delete.
+        this._emit('annotationCancelled', action.data);
         break;
       case 'annotation-removed':
         this._emit('annotationRemoved', action.data);
@@ -2365,6 +2444,15 @@ class VRExplorationManager extends BaseManager {
           // Map the tool-local id to the server id so undo can delete it
           data.serverId = annotation.id;
           log.debug(`VR annotation persisted as ${annotation.id}`);
+
+          // In-flight-undo hole: the user could Undo (which tombstones with
+          // _deleted, see VRAnnotationTool.undoLast) before this create POST
+          // resolved. _deletePersistedVRAnnotation early-returns without a
+          // serverId, so without this check the row would live on the server
+          // and stay broadcast to every participant forever. The keyboard
+          // flow makes this window realistic — confirm-then-immediately-undo
+          // is exactly a fast double-tap away.
+          if (data._deleted) this._deletePersistedVRAnnotation(data);
         }
       })
       .catch((err) => log.warn('Failed to persist VR annotation:', err.message));

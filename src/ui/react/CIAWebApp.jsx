@@ -54,6 +54,10 @@ import { ServerRenderOverlay } from "@/rendering/ServerRenderOverlay.jsx";
 // Toast
 import { ToastContainer } from "@UI/react/components/molecules/Toast";
 import { toast } from "@UI/react/store/toastStore";
+import { appToasts } from "@UI/react/store/appToasts";
+
+// Load-failure surfacing (ViewLifecycleService has no other way to reach the UI)
+import { eventBus, BUS_EVENTS } from "@Core/events/EventBus.js";
 
 // Config
 import { config } from "@Core/config/clientConfig.js";
@@ -284,17 +288,31 @@ export function CIAWebApp({ username, userId, projectId }) {
       setActiveManipulator(manipulator?.target ? manipulator : null);
     };
 
+    // ViewLifecycleService has no UI of its own — it only emits VIEW_ERROR on
+    // the core event bus when a requested dataset/view fails to load or
+    // place. Without this bridge the failure is console-only and whatever
+    // triggered it (e.g. a sample-dataset "Load" button) is left with a
+    // spinner that clears on its own timeout with no explanation.
+    const onViewError = ({ error } = {}) => {
+      toast.error(appToasts.loadFailed(error).message, {
+        description: appToasts.loadFailed(error).description,
+        duration: appToasts.loadFailed(error).duration,
+      });
+    };
+
     window.addEventListener("cia:open-dataset-selector", onOpenDataset);
     window.addEventListener("cia:delete-view", onDeleteView);
     window.addEventListener("cia:toast", onToast);
     window.addEventListener("cia:switch-room", onSwitchRoom);
     window.addEventListener("cia:manipulator-changed", onManipulatorChanged);
+    const unsubViewError = eventBus.on(BUS_EVENTS.VIEW_ERROR, onViewError);
     return () => {
       window.removeEventListener("cia:open-dataset-selector", onOpenDataset);
       window.removeEventListener("cia:delete-view", onDeleteView);
       window.removeEventListener("cia:toast", onToast);
       window.removeEventListener("cia:switch-room", onSwitchRoom);
       window.removeEventListener("cia:manipulator-changed", onManipulatorChanged);
+      unsubViewError?.();
     };
   }, [switchRoom]);
 

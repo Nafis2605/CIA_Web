@@ -48,7 +48,9 @@ describe("VRAnnotationTool — preset label", () => {
 
   it("placing an annotation carries the currently-selected label, not a hardcoded placeholder", () => {
     tool.cycleLabel(); // -> ANNOTATION_LABEL_PRESETS[1] ("Anomaly")
-    const action = tool.handleInput(makeInputState({ triggerPressed: true }), {});
+    const pending = tool.handleInput(makeInputState({ triggerPressed: true }), {});
+    expect(pending).toMatchObject({ type: "annotation-pending" });
+    const action = tool.confirmDraft();
     expect(action).toMatchObject({ type: "annotation-created" });
     expect(action.data.text).toBe(ANNOTATION_LABEL_PRESETS[1]);
   });
@@ -56,7 +58,8 @@ describe("VRAnnotationTool — preset label", () => {
   it("carries whichever preset label is selected, with no 'Note' placeholder", () => {
     tool.cycleLabel();
     tool.cycleLabel(); // -> ANNOTATION_LABEL_PRESETS[2] ("Check this")
-    const action = tool.handleInput(makeInputState({ triggerPressed: true }), {});
+    tool.handleInput(makeInputState({ triggerPressed: true }), {});
+    const action = tool.confirmDraft();
     expect(action.data.text).toBe(ANNOTATION_LABEL_PRESETS[2]);
     expect(action.data.text).not.toBe("Note");
   });
@@ -65,7 +68,8 @@ describe("VRAnnotationTool — preset label", () => {
     // render() drew the same sphere for every mode, and 'drawing' stored a
     // one-element point list with no stroke accumulation, so cycling mode
     // changed stored metadata and nothing else.
-    const action = tool.handleInput(makeInputState({ triggerPressed: true }), {});
+    tool.handleInput(makeInputState({ triggerPressed: true }), {});
+    const action = tool.confirmDraft();
     expect(action.data.type).toBe("marker");
     expect(tool.setAnnotationMode).toBeUndefined();
     expect(tool.cycleMode).toBeUndefined();
@@ -76,7 +80,8 @@ describe("VRAnnotationTool — preset label", () => {
     const second = tool.cycleColor();
     expect(second).not.toBe(first);
 
-    const action = tool.handleInput(makeInputState({ triggerPressed: true }), {});
+    tool.handleInput(makeInputState({ triggerPressed: true }), {});
+    const action = tool.confirmDraft();
     expect(Array.isArray(action.data.color)).toBe(true);
   });
 
@@ -124,18 +129,28 @@ describe("VRAnnotationTool — marker rendering", () => {
     });
   });
 
+  // Trigger fixes a point (annotation-pending); confirmDraft() is the Save
+  // key's action. Together they replicate the old one-shot "place" behaviour
+  // for tests that don't care about the in-between draft state.
   function place() {
-    return tool.handleInput(
+    const pending = tool.handleInput(
       makeInputState({ triggerPressed: true }),
       {}
     );
+    if (!pending) return pending;
+    return tool.confirmDraft();
   }
 
   it("builds a marker AND a label per placed annotation", () => {
     // The label is the point: an annotation carrying "Anomaly" should SAY so
     // in-headset. Under vtkVectorText it rendered as invisible geometry.
     place();
-    tool._lastTriggerState = false; // re-arm trigger for a second placement
+    // Re-arm for a second placement: confirmDraft() set
+    // _suppressUntilRelease, which (by design) requires an observed trigger
+    // release before the next rising edge is honoured — simulate that
+    // release directly rather than routing a whole extra handleInput frame.
+    tool._lastTriggerState = false;
+    tool._suppressUntilRelease = false;
     place();
 
     tool.render(renderer);
