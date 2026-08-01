@@ -9,6 +9,10 @@ import { VRGrabMode } from "./VRGrabMode.js";
 import { VRObjectMoveMode } from "./VRObjectMoveMode.js";
 import { VRScaleController } from "./VRScaleController.js";
 import { mapXRPointToData } from "@Core/vr/tools/vrPlaneMath.js";
+import { readVRAccessibilitySettings } from "@Core/vr/vrAccessibilityStore.js";
+
+/** Fallback snap-turn step (degrees) used when the configured value is missing or garbage. */
+const DEFAULT_SNAP_TURN_DEGREES = 45;
 
 /**
  * Per-mode display metadata (name/icon/description/controls), keyed by the
@@ -98,9 +102,15 @@ export class VRNavigationController {
     this._activeModeId = null;
     this._enableTeleport = options.enableTeleport || false;
 
-    // Snap-turn state
+    // Snap-turn state. The step is read ONCE at construction (not on every
+    // frame) from the VR accessibility settings persisted by
+    // VRAccessibilityContext (src/ui/react/) — core can't import that context
+    // directly (UI -> Core is the wrong direction), so it goes through the
+    // shared vrAccessibilityStore module instead. 'off' disables snap turn
+    // entirely; anything else is degrees, converted to radians here.
     this._snapTurnArmed = true; // ready to fire on next stick flick
     this._lastRightStickX = 0;
+    this._snapTurnRad = this._resolveSnapTurnRad(readVRAccessibilitySettings());
 
     // Activate the layers that gate their update() on _isActive — VRFlyMode and
     // VRTeleportMode both short-circuit unless activated. World-grab, object-move
@@ -268,18 +278,37 @@ export class VRNavigationController {
   }
 
   /**
+   * Resolve the configured movement.snapTurn value ('off' | 15 | 30 | 45 | 90
+   * degrees) to radians, or null when snap turn is disabled. Falls back to
+   * DEFAULT_SNAP_TURN_DEGREES for a missing/garbage value.
+   * @param {{movement?: {snapTurn?: *}}} settings
+   * @returns {number|null}
+   * @private
+   */
+  _resolveSnapTurnRad(settings) {
+    const raw = settings?.movement?.snapTurn;
+    if (raw === "off") return null;
+    const degrees = typeof raw === "number" && Number.isFinite(raw) ? raw : DEFAULT_SNAP_TURN_DEGREES;
+    return (degrees * Math.PI) / 180;
+  }
+
+  /**
    * Handle snap-turn via right-stick X flick. Debounced: fires once when
-   * |rightStickX| > 0.7, re-arms after it returns < 0.3.
+   * |rightStickX| > 0.7, re-arms after it returns < 0.3. No-ops entirely when
+   * the configured step is 'off' (this._snapTurnRad is null).
    * @private
    */
   _updateSnapTurn(inputState) {
+    if (this._snapTurnRad == null) return;
+
     const rightStick = inputState?.controllers?.right?.thumbstick;
     const rightStickX = rightStick?.x || 0;
 
     if (this._snapTurnArmed && Math.abs(rightStickX) > 0.7) {
       // Fire snap turn: +X = right, -X = left
       const sign = Math.sign(rightStickX);
-      this._vrManager.applySnapTurn(sign);
+      const headPos = inputState?.headPose?.position || null;
+      this._vrManager.applySnapTurn(sign, this._snapTurnRad, headPos);
       this._snapTurnArmed = false;
       this._lastRightStickX = rightStickX;
     } else if (!this._snapTurnArmed && Math.abs(rightStickX) < 0.3) {

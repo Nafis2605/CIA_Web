@@ -10,7 +10,10 @@ export class VRScaleController {
       minScale: 0.01, // Minimum scale (100x zoom in)
       maxScale: 100.0, // Maximum scale (100x zoom out)
       scaleSensitivity: 1.0, // How fast scale changes
-      smoothing: 0.8, // Scale change smoothing
+      // Exponential smoothing time constant (seconds) — dt-correct, unlike a
+      // per-frame smoothing factor (see _handleTwoHandGesture). -(1/72)/
+      // Math.log(0.8) matches the feel of the old smoothing:0.8 at 72 Hz.
+      smoothingTau: 0.0622,
       gripThreshold: 0.7, // Grip value to consider "gripping"
       ...options,
     };
@@ -58,7 +61,11 @@ export class VRScaleController {
     const rightController = inputState.controllers?.right;
 
     if (this._isEngaged(leftController) && this._isEngaged(rightController)) {
-      return this._handleTwoHandGesture(leftController, rightController);
+      return this._handleTwoHandGesture(
+        leftController,
+        rightController,
+        deltaTime
+      );
     } else if (this._isScaling) {
       this._endGesture();
     }
@@ -70,7 +77,7 @@ export class VRScaleController {
    * Handle active two-hand scale + twist gesture.
    * @private
    */
-  _handleTwoHandGesture(leftController, rightController) {
+  _handleTwoHandGesture(leftController, rightController, deltaTime) {
     const leftPos = leftController.pose?.position;
     const rightPos = rightController.pose?.position;
 
@@ -97,13 +104,16 @@ export class VRScaleController {
     }
 
     // --- Scale from distance ratio (pulling apart zooms out) ---
+    // Exponential decay toward targetScale with a fixed time constant (tau),
+    // so the ramp feels the same regardless of frame rate. A per-frame
+    // smoothing factor (the old `smoothing: 0.8` applied every frame,
+    // independent of deltaTime) converges faster at higher Hz.
     const distanceRatio = currentDistance / this._initialGripDistance;
     const targetScale = this._initialScale / distanceRatio;
+    const alpha = 1 - Math.exp(-deltaTime / this._options.smoothingTau);
     const scaledTarget =
       this._scale +
-      (targetScale - this._scale) *
-        this._options.scaleSensitivity *
-        (1 - this._options.smoothing);
+      (targetScale - this._scale) * this._options.scaleSensitivity * alpha;
     this._scale = Math.max(
       this._options.minScale,
       Math.min(this._options.maxScale, scaledTarget)

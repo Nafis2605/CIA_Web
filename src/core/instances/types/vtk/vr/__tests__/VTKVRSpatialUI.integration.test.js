@@ -370,3 +370,171 @@ describe("VRSpatialUI integration — initialize/update/dispose against a fake r
     expect(addCount).toBeGreaterThan(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Status/hint label repaint gate (Phase 5)
+//
+// getStatusLine() embeds the live vrScale, which VRScaleController mutates
+// continuously during a two-hand pinch, so the pre-existing string
+// dirty-check in _layoutStatus/_layoutHint isn't enough by itself to stop a
+// canvas repaint + GPU texture re-upload on nearly every frame. These tests
+// exercise the LABEL_REPAINT_INTERVAL_MS gate added on top of that
+// dirty-check, via the real update() pipeline (not by calling the private
+// _layoutStatus/_layoutHint methods directly) so they also prove the gate
+// doesn't interfere with the position/visibility work that must still run
+// every frame.
+//
+// ctx.fillText (see src/test/fakeCanvas.js) is a vi.fn(), and _statusCtx/
+// _hintCtx are the SAME context object reused across redraws (only the
+// canvas is resized per redraw, see _redrawStatusLabel/_redrawHintLabel), so
+// counting ctx.fillText.mock.calls is a direct, low-level proxy for "how many
+// times did the canvas actually get repainted" — independent of the
+// positioning math that runs unconditionally.
+describe("VRSpatialUI status/hint label repaint gate", () => {
+  let getContextSpy;
+  let nowSpy;
+  let currentTime;
+
+  beforeEach(() => {
+    getContextSpy = vi
+      .spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockImplementation(() => createFakeCtx());
+    vi.stubGlobal(
+      "Path2D",
+      class FakePath2D {
+        constructor(_pathData) {}
+      }
+    );
+    currentTime = 0;
+    nowSpy = vi.spyOn(performance, "now").mockImplementation(() => currentTime);
+  });
+
+  afterEach(() => {
+    getContextSpy.mockRestore();
+    nowSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("paints the status label immediately on first appearance (gate bypassed when previous text was empty)", () => {
+    const renderer = makeFakeRenderer();
+    const ui = new VRSpatialUI();
+    ui.initialize(renderer, makeManager({ getActiveDatasetName: vi.fn(() => "first.vtp") }));
+
+    currentTime = 0;
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+
+    // _lastStatusText starts null (empty) -> the very first non-empty text
+    // must bypass the gate rather than waiting up to LABEL_REPAINT_INTERVAL_MS.
+    expect(ui._statusCtx.fillText).toHaveBeenCalledTimes(1);
+    expect(ui._statusCtx.fillText.mock.calls[0][0]).toContain("first.vtp");
+  });
+
+  it("does not repaint again for a rapid sequence of distinct texts inside one 125ms window", () => {
+    const nameRef = { current: "a.vtp" };
+    const renderer = makeFakeRenderer();
+    const ui = new VRSpatialUI();
+    ui.initialize(renderer, makeManager({ getActiveDatasetName: vi.fn(() => nameRef.current) }));
+
+    currentTime = 0;
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] }); // immediate first paint
+    expect(ui._statusCtx.fillText).toHaveBeenCalledTimes(1);
+
+    // Three more distinct texts, all within 125ms of the last ACTUAL paint —
+    // none of these should trigger a repaint.
+    nameRef.current = "b.vtp";
+    currentTime = 10;
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+    expect(ui._statusCtx.fillText).toHaveBeenCalledTimes(1);
+
+    nameRef.current = "c.vtp";
+    currentTime = 60;
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+    expect(ui._statusCtx.fillText).toHaveBeenCalledTimes(1);
+
+    nameRef.current = "d.vtp";
+    currentTime = 100;
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+    expect(ui._statusCtx.fillText).toHaveBeenCalledTimes(1);
+
+    // Still visible with the LAST actually-painted text ("a.vtp") until the
+    // gate opens — the label doesn't flicker or blank out while gated.
+    expect(ui._statusActor.getVisibility()).toBe(true);
+  });
+
+  it("paints the last pending text once the interval elapses — nothing is silently dropped", () => {
+    const nameRef = { current: "a.vtp" };
+    const renderer = makeFakeRenderer();
+    const ui = new VRSpatialUI();
+    ui.initialize(renderer, makeManager({ getActiveDatasetName: vi.fn(() => nameRef.current) }));
+
+    currentTime = 0;
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] }); // immediate first paint
+    expect(ui._statusCtx.fillText).toHaveBeenCalledTimes(1);
+
+    // Two gated changes in quick succession — neither repaints.
+    nameRef.current = "b.vtp";
+    currentTime = 20;
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+    nameRef.current = "c.vtp";
+    currentTime = 40;
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+    expect(ui._statusCtx.fillText).toHaveBeenCalledTimes(1);
+
+    // Text settles on "c.vtp" and stays there while time advances past the
+    // gate — no further text changes, just the interval elapsing.
+    currentTime = 130;
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+
+    // The gate opening must paint "c.vtp" — the last text that was ever
+    // requested — not silently skip it because it wasn't "new" at the moment
+    // the gate opened.
+    expect(ui._statusCtx.fillText).toHaveBeenCalledTimes(2);
+    expect(ui._statusCtx.fillText.mock.calls[1][0]).toContain("c.vtp");
+  });
+
+  it("gates the status and hint labels independently — neither shares or resets the other's timer", () => {
+    const nameRef = { current: "a.vtp" };
+    const hintRef = { current: "controls A" };
+    const renderer = makeFakeRenderer();
+    const ui = new VRSpatialUI();
+    ui.initialize(
+      renderer,
+      makeManager({
+        getActiveDatasetName: vi.fn(() => nameRef.current),
+        getNavigationModeInfo: vi.fn(() => ({ name: "Fly", controls: hintRef.current })),
+      })
+    );
+
+    currentTime = 0;
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] }); // both immediate
+    expect(ui._statusCtx.fillText).toHaveBeenCalledTimes(1);
+    expect(ui._hintCtx.fillText).toHaveBeenCalledTimes(1);
+
+    // Status changes and gets gated at t=10 (elapsed 10ms since its own last
+    // paint at t=0); hint text is untouched so it does nothing either way.
+    nameRef.current = "b.vtp";
+    currentTime = 10;
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+    expect(ui._statusCtx.fillText).toHaveBeenCalledTimes(1);
+    expect(ui._hintCtx.fillText).toHaveBeenCalledTimes(1);
+
+    // Status's gate opens and it repaints at t=130 (130ms since ITS last
+    // paint at t=0) — this must NOT reset or otherwise affect the hint's gate.
+    currentTime = 130;
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+    expect(ui._statusCtx.fillText).toHaveBeenCalledTimes(2);
+    expect(ui._hintCtx.fillText).toHaveBeenCalledTimes(1);
+
+    // Hint changes at t=200 — 200ms since ITS OWN last paint at t=0, so its
+    // own independent gate is open and it repaints right away. If the two
+    // labels shared one gate, status's repaint at t=130 would have reset a
+    // shared timer and this change (only 70ms later) would still be gated.
+    hintRef.current = "controls B";
+    currentTime = 200;
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+    expect(ui._hintCtx.fillText).toHaveBeenCalledTimes(2);
+    expect(ui._hintCtx.fillText.mock.calls[1][0]).toContain("controls B");
+    // Status text hasn't changed since its t=130 repaint, so it stays put.
+    expect(ui._statusCtx.fillText).toHaveBeenCalledTimes(2);
+  });
+});

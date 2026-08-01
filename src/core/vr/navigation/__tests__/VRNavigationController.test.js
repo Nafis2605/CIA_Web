@@ -19,8 +19,16 @@ vi.mock("@VTK/vtkInstanceTools.js", () => ({
   instanceTools: { getPosition: vi.fn(() => [0, 0, 0]), setPosition: vi.fn() },
 }));
 
+// Snap-turn step is read once at construction from the shared accessibility
+// store (localStorage-backed in real code). Default (mocked) to 45 degrees
+// unless a test overrides the mock return value for that call.
+vi.mock("@Core/vr/vrAccessibilityStore.js", () => ({
+  readVRAccessibilitySettings: vi.fn(() => ({ movement: { snapTurn: 45 } })),
+}));
+
 import { VRNavigationController } from "../VRNavigationController.js";
 import { EXPLORATION_MODES } from "@Core/data/models/VRExplorationSession.js";
+import { readVRAccessibilitySettings } from "@Core/vr/vrAccessibilityStore.js";
 
 function makeController(overrides = {}) {
   const session = { defaultExplorationMode: EXPLORATION_MODES.FLY };
@@ -42,6 +50,11 @@ function leftStick({ x = 0, y = 0, a = false } = {}) {
 }
 
 describe("VRNavigationController — layered always-on model", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    readVRAccessibilitySettings.mockReturnValue({ movement: { snapTurn: 45 } });
+  });
+
   it("activates the fly layer at construction so locomotion runs", () => {
     const { controller } = makeController();
     expect(controller._flyMode._isActive).toBe(true);
@@ -95,11 +108,48 @@ describe("VRNavigationController — layered always-on model", () => {
     controller.update(flick, {}, 0.016);
     controller.update(flick, {}, 0.016); // held — must NOT re-fire
     expect(vrManager.applySnapTurn).toHaveBeenCalledTimes(1);
-    expect(vrManager.applySnapTurn).toHaveBeenCalledWith(1);
+    // Configured step (45deg -> radians) and head position (none in this
+    // fixture, so null) are passed through alongside the +1/-1 sign.
+    expect(vrManager.applySnapTurn).toHaveBeenCalledWith(1, Math.PI / 4, null);
 
     controller.update(center, {}, 0.016); // re-arm
     controller.update(flick, {}, 0.016); // second flick fires again
     expect(vrManager.applySnapTurn).toHaveBeenCalledTimes(2);
+  });
+
+  it("reads the configured snap-turn step ONCE at construction, in radians", () => {
+    readVRAccessibilitySettings.mockReturnValue({ movement: { snapTurn: 90 } });
+    const { controller } = makeController();
+    expect(controller._snapTurnRad).toBeCloseTo(Math.PI / 2, 10);
+  });
+
+  it("falls back to the 45-degree default for a missing/garbage snapTurn value", () => {
+    readVRAccessibilitySettings.mockReturnValue({ movement: { snapTurn: "not-a-number" } });
+    const { controller } = makeController();
+    expect(controller._snapTurnRad).toBeCloseTo(Math.PI / 4, 10);
+  });
+
+  it("does not snap-turn at all when the configured step is 'off'", () => {
+    readVRAccessibilitySettings.mockReturnValue({ movement: { snapTurn: "off" } });
+    const { controller, vrManager } = makeController();
+    expect(controller._snapTurnRad).toBeNull();
+
+    const flick = {
+      headPose: { orientation: { x: 0, y: 0, z: 0, w: 1 } },
+      controllers: { left: null, right: { pose: { position: { x: 0, y: 1.5, z: 0 } }, thumbstick: { x: 0.9, y: 0 } } },
+    };
+    controller.update(flick, {}, 0.016);
+    expect(vrManager.applySnapTurn).not.toHaveBeenCalled();
+  });
+
+  it("passes the live head position through to applySnapTurn when present", () => {
+    const { controller, vrManager } = makeController();
+    const flickWithHead = {
+      headPose: { position: { x: 1, y: 1.6, z: 2 }, orientation: { x: 0, y: 0, z: 0, w: 1 } },
+      controllers: { left: null, right: { pose: { position: { x: 0, y: 1.5, z: 0 } }, thumbstick: { x: -0.9, y: 0 } } },
+    };
+    controller.update(flickWithHead, {}, 0.016);
+    expect(vrManager.applySnapTurn).toHaveBeenCalledWith(-1, Math.PI / 4, { x: 1, y: 1.6, z: 2 });
   });
 
   // The selected mode decides what the TRIGGER does. Object-move used to run on

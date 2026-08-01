@@ -63,7 +63,8 @@ export function rotateVectorByQuaternion(vec, q) {
  * turntable: the data actor is yawed about its own centre (see
  * VTKInstanceHandler._applyVRDataRotation), and probe lookups undo that yaw to
  * query the un-rotated polydata (VTKInstanceHandler.probeDataVR). Right-handed:
- * a positive theta rotates +X toward +Z.
+ * a positive theta rotates +X toward -Z (e.g. yawRotateVector([1,0,0], PI/2)
+ * = [0,0,-1]).
  *
  * @param {number[]} vec - [x, y, z]
  * @param {number} theta - radians

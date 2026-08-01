@@ -2,6 +2,7 @@
 // Free-flying navigation mode for VR exploration
 
 import { vr as log } from "@Utils/logger.js";
+import { yawRotateVector } from "@Core/vr/tools/vrPlaneMath.js";
 
 export class VRFlyMode {
   constructor(vrContext, options = {}) {
@@ -10,7 +11,10 @@ export class VRFlyMode {
       baseSpeed: 2.0, // meters per second at scale 1.0
       boostMultiplier: 3.0,
       deadzone: 0.15, // Thumbstick deadzone
-      smoothing: 0.9, // Velocity smoothing factor
+      // Exponential smoothing time constant (seconds) — dt-correct, unlike a
+      // per-frame smoothing factor (see update()). -(1/72)/Math.log(0.9)
+      // matches the feel of the old smoothing:0.9 at 72 Hz.
+      smoothingTau: 0.1318,
       groundLocked: false, // If true, Y movement is locked (walk mode)
       ...options,
     };
@@ -90,12 +94,17 @@ export class VRFlyMode {
       z: moveInput.z * speed,
     };
 
-    // Smooth velocity
-    const smoothing = this._options.smoothing;
+    // Smooth velocity — exponential decay toward targetVelocity with a fixed
+    // time constant (tau), so the ramp feels the same regardless of frame
+    // rate (72 vs 90 vs 120 Hz). A per-frame smoothing factor (the old
+    // `smoothing: 0.9` applied every frame) is frame-rate dependent: the same
+    // factor converges faster at higher Hz.
+    const tau = this._options.smoothingTau;
+    const alpha = 1 - Math.exp(-deltaTime / tau);
     this._velocity = {
-      x: this._velocity.x * smoothing + targetVelocity.x * (1 - smoothing),
-      y: this._velocity.y * smoothing + targetVelocity.y * (1 - smoothing),
-      z: this._velocity.z * smoothing + targetVelocity.z * (1 - smoothing),
+      x: this._velocity.x + (targetVelocity.x - this._velocity.x) * alpha,
+      y: this._velocity.y + (targetVelocity.y - this._velocity.y) * alpha,
+      z: this._velocity.z + (targetVelocity.z - this._velocity.z) * alpha,
     };
 
     // Calculate position delta (data space, see scaledSpeed comment above)
@@ -142,23 +151,41 @@ export class VRFlyMode {
     const { x, y } = controller.thumbstick;
     const deadzone = this._options.deadzone;
 
-    // Apply deadzone
-    const adjustedX = Math.abs(x) > deadzone ? x : 0;
-    const adjustedY = Math.abs(y) > deadzone ? y : 0;
+    // Radial deadzone with rescale. A per-axis deadzone (Math.abs(x) >
+    // deadzone ? x : 0) rejects a diagonal push whose axes are each below the
+    // threshold even though its magnitude is well past it (e.g. (0.14, 0.14)
+    // with deadzone 0.15 has hypot ~0.198 > 0.15, but both axes individually
+    // fail), and snaps discontinuously to full value the instant either axis
+    // crosses the threshold. Radial deadzone treats the stick as a disc and
+    // rescales the surviving magnitude back into [0, 1] so speed ramps
+    // continuously from zero at the deadzone boundary.
+    const mag = Math.min(1, Math.hypot(x, y));
+    let adjustedX = 0;
+    let adjustedY = 0;
+    if (mag > deadzone) {
+      const k = ((mag - deadzone) / (1 - deadzone)) / mag;
+      adjustedX = x * k;
+      adjustedY = y * k;
+    }
 
     // Map thumbstick to movement
     // X = strafe left/right
-    // Y = forward/back (inverted so push forward moves forward)
-    // Vertical movement from A/B buttons or squeeze
+    // Y = forward/back. WebXR axes[3] is already negative when the stick is
+    // pushed forward, and WebXR "forward" is -Z, so the raw (deadzoned) value
+    // passes through unnegated — see VRExplorationManager thumbstick.y
+    // capture (gamepad.axes[3]) and _transformByOrientation below.
+    // Vertical movement from A/B buttons only. Squeeze/grip is reserved for
+    // world-grab (VRExplorationManager.js ~224-231, engages above 0.7); a
+    // squeezeValue > 0.5 branch here used to overlap that 0.5-0.7 band, so
+    // every world-grab start also produced an unintended upward lurch.
     let verticalInput = 0;
     if (controller.buttons?.a) verticalInput = 1;
     if (controller.buttons?.b) verticalInput = -1;
-    if (controller.squeezeValue > 0.5) verticalInput = controller.squeezeValue;
 
     return {
       x: adjustedX, // Strafe
       y: verticalInput, // Up/down
-      z: -adjustedY, // Forward/back
+      z: adjustedY, // Forward/back
     };
   }
 
@@ -177,15 +204,18 @@ export class VRFlyMode {
     const cosy_cosp = 1 - 2 * (qx * qx + qy * qy);
     const yaw = Math.atan2(siny_cosp, cosy_cosp);
 
-    // Rotate movement vector around Y axis
-    const cos = Math.cos(yaw);
-    const sin = Math.sin(yaw);
-
-    return {
-      x: movement.x * cos - movement.z * sin,
-      y: movement.y, // Keep vertical component
-      z: movement.x * sin + movement.z * cos,
-    };
+    // Rotate the horizontal movement vector by yaw using the repo's shared
+    // Ry(+theta) helper (see vrPlaneMath.js). This previously hand-rolled
+    // Ry(-yaw) (x*cos - z*sin / x*sin + z*cos), which is the rotation in the
+    // OPPOSITE direction. Combined with the un-negated `-adjustedY` that used
+    // to feed into z above, the two sign errors composed to negate the
+    // world-space Z of every movement delta — forward/back was inverted
+    // whenever facing +/-Z, and strafe was inverted whenever facing +/-X.
+    const [x, y, z] = yawRotateVector(
+      [movement.x, movement.y, movement.z],
+      yaw
+    );
+    return { x, y, z };
   }
 }
 

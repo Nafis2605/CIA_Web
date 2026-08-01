@@ -48,13 +48,18 @@ describe("VRScaleController — two-hand pinch gesture", () => {
       0.016
     );
     // Frame 2: hands 0.8 m apart (ratio 2) → targetScale = initial / 2 = 0.5.
-    // With default smoothing 0.8, one step moves 20% of the way: 1 + (0.5-1)*0.2.
+    // Smoothing is dt-correct exponential (alpha = 1 - e^(-dt/tau)), not a
+    // per-frame factor, so the step size is derived from dt rather than
+    // hard-coded — that's the whole point of the tau form, and hard-coding
+    // the result here would just re-freeze the frame-rate dependence.
+    const alpha = 1 - Math.exp(-0.016 / 0.0622);
+    const expected = 1 + (0.5 - 1) * alpha;
     const res = c.update(
       input(pinchHand({ x: -0.4, y: 0, z: 0 }), pinchHand({ x: 0.4, y: 0, z: 0 })),
       0.016
     );
-    expect(res.newScale).toBeCloseTo(0.9, 5);
-    expect(ctx.vrScale).toBeCloseTo(0.9, 5);
+    expect(res.newScale).toBeCloseTo(expected, 5);
+    expect(ctx.vrScale).toBeCloseTo(expected, 5);
   });
 
   it("twisting the handlebar accumulates yaw onto vrRotation", () => {

@@ -171,6 +171,26 @@ const STATUS_MARGIN = 0.03;
 const HINT_WORLD_HEIGHT = 0.026;
 const HINT_MARGIN = 0.03;
 
+// Status/hint canvas repaint gate: _layoutStatus/_layoutHint already
+// dirty-check the text before doing any work, but VRSpatialMenuModel's
+// status string embeds the live vrScale, which VRScaleController mutates
+// continuously during a two-hand pinch — so even with _formatScale coarsened
+// (see VRSpatialMenuModel._formatScale), the string can still change often
+// enough to repaint the canvas + re-upload its GPU texture almost every
+// frame. This caps the repaint rate independently of the dirty-check, which
+// still governs WHETHER a repaint is needed at all — this only governs how
+// SOON a pending change is allowed to actually paint. ~8 Hz is well above
+// what's perceptible for a text label but far below 72-90 Hz frame rate.
+const LABEL_REPAINT_INTERVAL_MS = 125;
+
+/** Monotonic clock for the repaint gate above — mirrors the defensive
+ * fallback VRExplorationManager already uses elsewhere in the VR stack.
+ * @private
+ */
+function now() {
+  return typeof performance !== "undefined" ? performance.now() : Date.now();
+}
+
 // Reshow tab: the tiny always-on quad shown in place of the full panel while
 // it's manually hidden (VR_MENU_BUTTONS "Hide" button). Anchored at the same
 // point the full panel would occupy, just small — so a user instinctively
@@ -215,6 +235,10 @@ export class VRSpatialUI {
     this._statusActor = null;
     this._statusWorldWidth = 0;
     this._lastStatusText = null;
+    // Timestamp (performance.now()) of the last ACTUAL status canvas repaint —
+    // separate from _lastHintPaintTime below so the two labels gate
+    // independently (see LABEL_REPAINT_INTERVAL_MS / _layoutStatus).
+    this._lastStatusPaintTime = 0;
     // Hint line ("how do I use this") — same pattern as the status line, kept
     // as a fully separate actor/canvas so the two lines never collide.
     this._hintCanvas = null;
@@ -224,6 +248,9 @@ export class VRSpatialUI {
     this._hintActor = null;
     this._hintWorldWidth = 0;
     this._lastHintText = null;
+    // Timestamp of the last actual hint canvas repaint — see
+    // _lastStatusPaintTime above.
+    this._lastHintPaintTime = 0;
     // Reshow tab — shown instead of the full panel while manually hidden.
     this._reshowTabActor = null;
     this._reshowTabLabelActor = null;
@@ -1288,6 +1315,20 @@ export class VRSpatialUI {
    * top edge. Text is only redrawn (canvas repaint + texture re-upload) when
    * it actually changes (dirty-checked) — doing that every frame would be
    * wasteful for a value that's usually static between input events.
+   *
+   * On top of the dirty-check, actual repaints are additionally rate-limited
+   * to LABEL_REPAINT_INTERVAL_MS: VRSpatialMenuModel's status string embeds
+   * the live vrScale, which changes continuously during a two-hand pinch, so
+   * the dirty-check alone doesn't stop a canvas repaint + GPU texture
+   * re-upload on nearly every frame (see VTKVRSpatialUI header comment / the
+   * Phase 5 fix notes). The gate is bypassed when the label is appearing from
+   * empty (immediate first paint — e.g. the "Working…" pending-work label
+   * must show up right away) or disappearing to empty (instant hide, which
+   * needs no repaint anyway). When a repaint is skipped by the gate,
+   * `_lastStatusText` is deliberately left UNCHANGED so the dirty-check keeps
+   * retrying on later frames — reading the model's CURRENT text fresh each
+   * time — until the gate opens and the latest text finally paints. Nothing
+   * is ever silently dropped, just delayed by at most one interval.
    * @private
    */
   _layoutStatus() {
@@ -1296,8 +1337,22 @@ export class VRSpatialUI {
 
     const text = this._model.getStatusLine();
     if (text !== this._lastStatusText) {
-      this._lastStatusText = text;
-      if (text) this._redrawStatusLabel(text);
+      const previousTextWasEmpty = !this._lastStatusText;
+      const gateOpen =
+        !text || previousTextWasEmpty || now() - this._lastStatusPaintTime >= LABEL_REPAINT_INTERVAL_MS;
+      if (gateOpen) {
+        this._lastStatusText = text;
+        if (text) {
+          this._redrawStatusLabel(text);
+          this._lastStatusPaintTime = now();
+        }
+      }
+      // else: gated. Leave _lastStatusText as-is (still the last text that
+      // was actually painted) so this `if` keeps re-entering on future
+      // frames — re-reading the model's current text each time — until the
+      // gate opens and whatever the latest text is at that point gets
+      // painted. The rejected text is never stored anywhere; it's simply
+      // recomputed from the model, which is always the freshest source.
     }
     if (!text) {
       this._statusActor.setVisibility(false);
@@ -1332,6 +1387,11 @@ export class VRSpatialUI {
    * edge (mirrors _layoutStatus, which sits above the top edge) — kept
    * separate so it never gets concatenated with the status line's session
    * state into one unreadable string.
+   *
+   * Same LABEL_REPAINT_INTERVAL_MS gate as _layoutStatus, on its own
+   * `_lastHintPaintTime` field so the two labels never share (or contend
+   * over) one gate — see the longer comment there for the full rationale and
+   * the pending-text handling.
    * @private
    */
   _layoutHint() {
@@ -1340,8 +1400,18 @@ export class VRSpatialUI {
 
     const text = this._model.getHintLine();
     if (text !== this._lastHintText) {
-      this._lastHintText = text;
-      if (text) this._redrawHintLabel(text);
+      const previousTextWasEmpty = !this._lastHintText;
+      const gateOpen =
+        !text || previousTextWasEmpty || now() - this._lastHintPaintTime >= LABEL_REPAINT_INTERVAL_MS;
+      if (gateOpen) {
+        this._lastHintText = text;
+        if (text) {
+          this._redrawHintLabel(text);
+          this._lastHintPaintTime = now();
+        }
+      }
+      // else: gated — see _layoutStatus for why _lastHintText is deliberately
+      // left unchanged here.
     }
     if (!text) {
       this._hintActor.setVisibility(false);
@@ -1627,6 +1697,7 @@ export class VRSpatialUI {
     this._statusActor = null;
     this._statusWorldWidth = 0;
     this._lastStatusText = null;
+    this._lastStatusPaintTime = 0;
     this._hintCanvas = null;
     this._hintCtx = null;
     this._hintTexture = null;
@@ -1634,6 +1705,7 @@ export class VRSpatialUI {
     this._hintActor = null;
     this._hintWorldWidth = 0;
     this._lastHintText = null;
+    this._lastHintPaintTime = 0;
     this._reshowTabActor = null;
     this._reshowTabLabelActor = null;
     this._reshowTabCard = null;

@@ -85,6 +85,14 @@ class VRExplorationManager extends BaseManager {
     // that reports a controller (see the input-profile check there).
     this._inputProfileDetected = false;
 
+    // Deferred work queue: heavy per-toggle operations (glyph rebuild,
+    // isosurface extraction, ...) triggered from inside the menu's
+    // synchronous activate() call. Draining happens at the END of the XR
+    // frame, AFTER the eyes are drawn (see _onFrame/_drainDeferredWork), so
+    // the stall lands between frames instead of inside one — see _deferHeavy.
+    this._deferredWork = [];
+    this._pendingWorkLabel = null;
+
     // Bind methods
     this._onFrame = this._onFrame.bind(this);
     this._onSessionEnd = this._onSessionEnd.bind(this);
@@ -538,6 +546,11 @@ class VRExplorationManager extends BaseManager {
       this._lastIsolationButtonState = false;
       this._followTargetUserId = null;
       this._inputProfileDetected = false;
+      // Drop any queued heavy work so it cannot run after exit (see
+      // _deferHeavy/_drainDeferredWork) — the toggle's manager/feature state
+      // it would have mutated may itself be torn down by the steps above.
+      this._deferredWork = [];
+      this._pendingWorkLabel = null;
       this._participantSync = null;
       this._toolManager = null;
       this._snapshotManager = null;
@@ -1024,8 +1037,13 @@ class VRExplorationManager extends BaseManager {
     const current = instanceTools.getRepresentation?.(instanceId) || 'surface';
     const next = order[(order.indexOf(current) + 1) % order.length];
 
-    instanceTools.setRepresentation?.(instanceId, next);
-    this._pushVisualizationPatch({ representation: next });
+    // Deferred like the other menu-triggered visualization changes (see
+    // _deferHeavy / toggleGlyphs) — the mapper rebuild + sync patch run one
+    // frame later; the optimistic `next` is returned immediately.
+    this._deferHeavy('Applying appearance…', () => {
+      instanceTools.setRepresentation?.(instanceId, next);
+      this._pushVisualizationPatch({ representation: next });
+    });
     this._emit('representationChanged', { representation: next });
     return next;
   }
@@ -1046,8 +1064,11 @@ class VRExplorationManager extends BaseManager {
       return null;
     }
 
-    instanceTools.setRepresentation?.(instanceId, mode);
-    this._pushVisualizationPatch({ representation: mode });
+    // Deferred — see cycleRepresentation.
+    this._deferHeavy('Applying appearance…', () => {
+      instanceTools.setRepresentation?.(instanceId, mode);
+      this._pushVisualizationPatch({ representation: mode });
+    });
     this._emit('representationChanged', { representation: mode });
     return mode;
   }
@@ -1195,16 +1216,23 @@ class VRExplorationManager extends BaseManager {
   toggleThresholdFilter() {
     const id = this._instanceId();
     if (!id || !this.isThresholdAvailable()) return false;
-    try {
-      vtkThresholdFeature.toggleThreshold(id);
-    } catch (err) {
-      log.warn(`VR threshold toggle failed: ${err?.message}`);
-      return false;
-    }
-    this._syncThreshold(id);
-    const enabled = this.isThresholdEnabled();
-    this._emit('thresholdToggled', { enabled });
-    return enabled;
+    const wasEnabled = this.isThresholdEnabled();
+
+    // Availability + current-state reads above stay synchronous; the actual
+    // filter (re)application is the expensive part — deferred, same
+    // reasoning as toggleGlyphs (see _deferHeavy).
+    this._deferHeavy(wasEnabled ? 'Removing threshold…' : 'Applying threshold…', () => {
+      try {
+        vtkThresholdFeature.toggleThreshold(id);
+      } catch (err) {
+        log.warn(`VR threshold toggle failed: ${err?.message}`);
+        return;
+      }
+      this._syncThreshold(id);
+      this._emit('thresholdToggled', { enabled: this.isThresholdEnabled() });
+    });
+
+    return !wasEnabled;
   }
 
   /** Cycle threshold mode: between -> above -> below. @returns {string|null} */
@@ -1299,21 +1327,34 @@ class VRExplorationManager extends BaseManager {
     const id = this._instanceId();
     if (!id || !this.isIsosurfaceAvailable()) return false;
     const enabled = this.isIsosurfaceEnabled();
-    try {
-      if (enabled) {
-        vtkIsosurfaceFeature.disableIsosurface(id);
-      } else {
-        const imageData = this._activeContext?.instance?.instanceData?.imageData;
-        const r = vtkIsosurfaceFeature.enableIsosurface?.(id, imageData);
-        // Fire-and-forget: must never block or break the XR frame loop.
-        if (r && typeof r.catch === 'function') {
-          r.catch((err) => log.warn(`VR isosurface enable failed: ${err?.message}`));
+
+    // Availability + current-state reads above stay synchronous so the
+    // button can still report "unavailable" immediately. The actual marching
+    // cubes enable/disable is the expensive part — deferred, same reasoning
+    // as toggleGlyphs (see _deferHeavy).
+    if (enabled) {
+      this._deferHeavy('Removing isosurface…', () => {
+        try {
+          vtkIsosurfaceFeature.disableIsosurface(id);
+        } catch (err) {
+          log.warn(`VR isosurface toggle failed: ${err?.message}`);
         }
-      }
-    } catch (err) {
-      log.warn(`VR isosurface toggle failed: ${err?.message}`);
-      return enabled;
+      });
+    } else {
+      const imageData = this._activeContext?.instance?.instanceData?.imageData;
+      this._deferHeavy('Building isosurface…', () => {
+        try {
+          const r = vtkIsosurfaceFeature.enableIsosurface?.(id, imageData);
+          // Fire-and-forget: must never block or break the XR frame loop.
+          if (r && typeof r.catch === 'function') {
+            r.catch((err) => log.warn(`VR isosurface enable failed: ${err?.message}`));
+          }
+        } catch (err) {
+          log.warn(`VR isosurface toggle failed: ${err?.message}`);
+        }
+      });
     }
+
     this._emit('isosurfaceToggled', { enabled: !enabled });
     return !enabled;
   }
@@ -1461,12 +1502,19 @@ class VRExplorationManager extends BaseManager {
     if (!state) return false;
 
     if (state.enabled) {
-      vtkGlyphFeature.disableGlyphs(instanceId);
-      this._pushVisualizationPatch({ glyph: vtkGlyphFeature.getConfigForSync(instanceId) });
+      // Disabling is cheap, but deferred anyway for symmetry with enable —
+      // see _deferHeavy — and so the two can never race out of FIFO order if
+      // the user taps twice before a frame drains.
+      this._deferHeavy('Removing glyphs…', () => {
+        vtkGlyphFeature.disableGlyphs(instanceId);
+        this._pushVisualizationPatch({ glyph: vtkGlyphFeature.getConfigForSync(instanceId) });
+      });
       this._emit('glyphsToggled', { enabled: false });
       return false;
     }
 
+    // Cheap guards stay synchronous so the button can still report "can't do
+    // that" immediately, without ever touching the deferred queue.
     const { vectorArrays = [], scalarArrays = [] } = state;
     if (!isGlyphFeatureAvailable(vectorArrays, scalarArrays)) {
       log.warn('VR glyph toggle: no usable vector/scalar point-data arrays on this dataset');
@@ -1479,10 +1527,16 @@ class VRExplorationManager extends BaseManager {
       return false;
     }
 
-    vtkGlyphFeature.enableGlyphs(instanceId, polydata, {
-      orientationArray: vectorArrays?.[0]?.name,
+    // The expensive part — vtkGlyphFeature.enableGlyphs runs
+    // _buildSubsampledPolydata, an O(N) copy of every point + point-data
+    // array — is the actual cause of the mid-frame shake this fixes. Only
+    // this call and its sync patch are deferred; everything above already
+    // ran synchronously so we can return the optimistic `true` right now.
+    const orientationArray = vectorArrays?.[0]?.name;
+    this._deferHeavy('Building glyphs…', () => {
+      vtkGlyphFeature.enableGlyphs(instanceId, polydata, { orientationArray });
+      this._pushVisualizationPatch({ glyph: vtkGlyphFeature.getConfigForSync(instanceId) });
     });
-    this._pushVisualizationPatch({ glyph: vtkGlyphFeature.getConfigForSync(instanceId) });
     this._emit('glyphsToggled', { enabled: true });
     return true;
   }
@@ -1828,13 +1882,77 @@ class VRExplorationManager extends BaseManager {
   // session, owned by VRManager.
 
   /**
+   * Queue heavy work to run at the END of the next XR frame instead of
+   * inside the current one. Menu activations run SYNCHRONOUSLY inside the
+   * XR rAF callback (VTKVRSpatialUI.update -> VRSpatialMenuModel.activate),
+   * so any multi-hundred-millisecond operation there (e.g. glyph rebuild's
+   * O(N) subsampled-polydata copy) drops frames — the headset's reprojection
+   * shows that up as the world shaking. Draining after this frame's eyes are
+   * drawn (see _drainDeferredWork, called from _onFrame) puts the stall
+   * between frames instead of inside one.
+   *
+   * Callers keep all cheap guard/availability logic synchronous and defer
+   * only the expensive call plus its sync patch — see toggleGlyphs() for the
+   * pattern.
+   *
+   * @param {string} label - short user-facing status text shown while this
+   *   (or an earlier queued) task is pending — see getPendingWorkLabel() and
+   *   VRSpatialMenuModel.getStatusLine().
+   * @param {Function} fn - the deferred work; invoked with no arguments and
+   *   individually try/caught by _drainDeferredWork so a failure here can
+   *   never strand the queue or the frame loop.
+   * @private
+   */
+  _deferHeavy(label, fn) {
+    this._deferredWork.push({ label, fn });
+    this._pendingWorkLabel = label;
+  }
+
+  /**
+   * Drain ONE queued task per call — never more, so a burst of taps spreads
+   * its cost over several frames instead of front-loading it onto the very
+   * next one. Called once per XR frame, at the end, after the eyes are drawn
+   * (see _onFrame). Each task is individually try/caught: one throwing task
+   * must not prevent the tasks queued behind it from ever draining, and must
+   * not strand _pendingWorkLabel on a task that will never run again.
+   * @private
+   */
+  _drainDeferredWork() {
+    const task = this._deferredWork.shift();
+    if (task) {
+      try {
+        task.fn();
+      } catch (e) {
+        log.error(`VR deferred work "${task.label}" failed — ${e?.message}`, e?.stack || e);
+      }
+    }
+    this._pendingWorkLabel = this._deferredWork[0]?.label ?? null;
+  }
+
+  /**
+   * @returns {string|null} the label of the currently queued/in-flight
+   *   deferred task (see _deferHeavy), or null when nothing is pending. Read
+   *   by VRSpatialMenuModel.getStatusLine() so the panel shows "Building
+   *   glyphs…" (etc.) instead of silently freezing while the work runs.
+   */
+  getPendingWorkLabel() {
+    return this._pendingWorkLabel;
+  }
+
+  /**
    * @param {{time:number, deltaTime:number, frame:XRFrame, viewerPose:XRViewerPose}} frameData
    */
   _onFrame({ time, deltaTime: deltaTimeMs, frame, viewerPose }) {
     if (!this._activeContext) return;
 
     const { handler, vrContext } = this._activeContext;
-    const deltaTime = (deltaTimeMs || 16.67) / 1000;
+    // Clamp: the upper bound stops a tracking hitch or tab throttle from
+    // producing one huge position delta that teleports the user; the lower
+    // bound guards against a duplicated timestamp giving dt=0.
+    const deltaTime = Math.min(
+      0.1,
+      Math.max(1e-4, (deltaTimeMs || 16.67) / 1000)
+    );
 
     try {
       if (this._needsPoseCorrection && viewerPose) {
@@ -1995,6 +2113,14 @@ class VRExplorationManager extends BaseManager {
       // VTKInstanceHandler.updateVRExploration). Gets the tool-gated clone so a
       // menu pinch doesn't leak into the handler's own interaction handling.
       handler.updateVRExploration?.(vrContext, frame, toolInput, viewerPose);
+
+      // Drain one deferred heavy task (if any), now that both eyes for THIS
+      // frame have been drawn — see _deferHeavy for why this runs here and
+      // not at the top of the frame (VTKVRSpatialUI._layoutStatus reads
+      // getPendingWorkLabel() before activate() enqueues, so a label queued
+      // this frame is only visible to the user starting next frame; draining
+      // at the end of that next frame means it renders before the stall).
+      this._drainDeferredWork();
 
       // Emit frame event for UI
       this._emit('frame', { time, inputState, deltaTime });

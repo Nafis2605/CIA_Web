@@ -281,9 +281,15 @@ class VRManager extends BaseManager {
     // Create XR layer
     this._xrLayer = new XRWebGLLayer(this._xrSession, glContext);
 
-    // Update session render state
+    // Update session render state. Set ONCE here, never per-frame: now that
+    // the camera converts data units to metres via physicalScale
+    // (VTKInstanceHandler._updateCameraFromVRPose), these depthNear/depthFar
+    // values are true metres and are correct at every vrScale. 0.05 m (vs the
+    // 0.1 default) allows closer inspection.
     this._xrSession.updateRenderState({
       baseLayer: this._xrLayer,
+      depthNear: 0.05,
+      depthFar: 1000,
     });
 
     log.debug("WebGL layer configured for XR");
@@ -837,26 +843,74 @@ class VRManager extends BaseManager {
   }
 
   /**
-   * Snap-turn the user by a fixed step. This is the standard WebXR way to turn
-   * in place without touching camera/tool math: it replaces _referenceSpace
-   * with a yaw-rotated offset of _baseReferenceSpace, so the NEXT frame's
-   * getViewerPose (head) AND every getPose (controllers) come back already
-   * rotated — head, hands, floor and dataset all turn together, consistently.
-   * The dataset placement (vrOrigin/vrScale) is untouched.
+   * Snap-turn the user by a fixed step, pivoting about their HEAD rather than
+   * the world origin. This is the standard WebXR way to turn in place without
+   * touching camera/tool math: it chains an offset onto _referenceSpace, so
+   * the NEXT frame's getViewerPose (head) AND every getPose (controllers)
+   * come back already rotated — head, hands, floor and dataset all turn
+   * together, consistently. The dataset placement (vrOrigin/vrScale) is
+   * untouched.
+   *
+   * Pivoting about the world origin (the old behavior, still used by setYaw)
+   * also TRANSLATES a user who is standing away from the origin — it reads as
+   * lurching sideways rather than turning in place. Pivoting about the head
+   * fixes that: build the rotation as P = T(h) . Ry(-step) . T(-h), i.e.
+   * translate the head to the origin, rotate, translate back.
    *
    * WebXR's getOffsetReferenceSpace applies the transform as the new space's
    * origin expressed in the old space, which moves the world OPPOSITE the
-   * intended head turn — so to turn the user by +θ we rotate the space by −θ.
-   * Pivot is the world origin (seated/standing exploration); a head-pivot
-   * refinement can come later if it feels off in-headset.
+   * intended head turn — so to turn the user by +step we rotate the space by
+   * -step (same sign convention as setYaw).
+   *
+   * Head-pivot turns MUST compound (each turn has a different pivot, since
+   * the head moves), so this chains off the CURRENT _referenceSpace rather
+   * than rebuilding from _baseReferenceSpace: per the WebXR spec,
+   * getOffsetReferenceSpace composes into a single originOffset rather than
+   * building a linked list, so repeated calls correctly accumulate.
+   *
+   * Sanity check for the translation term: a physically fixed point p
+   * transforms under the space offset as q' = T(h).Ry(+step).T(-h).q (the
+   * inverse of the -step space rotation). At p = h this gives q' = h, i.e.
+   * the head itself does not move — only the world spins around it. Since
+   * camera position = xrPos/vrScale + vrOrigin, an unmoved head means no
+   * lurch. When headPos is null/omitted, hx = hz = 0 and t degenerates to
+   * {0,0,0} — i.e. the old world-origin pivot.
    *
    * @param {number} sign - +1 or -1 (right/left); magnitude ignored
-   * @param {number} [stepRad=Math.PI/6] - turn step in radians (default 30°)
+   * @param {number|null} [stepRad=null] - turn step in radians; null falls
+   *   back to the default 30° step (Math.PI / 6)
+   * @param {{x:number,y:number,z:number}|null} [headPos=null] - head position
+   *   in the current reference space (e.g. inputState.headPose.position);
+   *   null pivots about the world origin (old behavior)
    * @returns {number} the new accumulated yaw offset (radians)
    */
-  applySnapTurn(sign, stepRad = Math.PI / 6) {
+  applySnapTurn(sign, stepRad = null, headPos = null) {
     if (!sign) return this._yawOffset;
-    return this.setYaw(this._yawOffset + Math.sign(sign) * stepRad);
+    const step = Math.sign(sign) * (stepRad != null ? stepRad : Math.PI / 6);
+    this._yawOffset += step;
+
+    if (
+      !this._referenceSpace ||
+      typeof this._referenceSpace.getOffsetReferenceSpace !== "function" ||
+      typeof XRRigidTransform !== "function"
+    ) {
+      return this._yawOffset;
+    }
+    try {
+      const c = Math.cos(-step);
+      const s = Math.sin(-step);
+      const hx = headPos?.x || 0;
+      const hz = headPos?.z || 0;
+      const t = { x: hx - (hx * c + hz * s), y: 0, z: hz - (-hx * s + hz * c) };
+      const half = -step / 2;
+      const q = { x: 0, y: Math.sin(half), z: 0, w: Math.cos(half) };
+      this._referenceSpace = this._referenceSpace.getOffsetReferenceSpace(
+        new XRRigidTransform(t, q)
+      );
+    } catch (e) {
+      log.warn(`Snap turn failed: ${e?.message}`);
+    }
+    return this._yawOffset;
   }
 
   /**

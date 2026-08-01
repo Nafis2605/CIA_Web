@@ -579,7 +579,22 @@ describe("VRSpatialMenuModel — status line", () => {
   it("formats sub-1.0 scale as a ratio", () => {
     const manager = makeManager({ getVRScale: vi.fn(() => 0.1), getNavigationMode: vi.fn(() => "fly") });
     const model = new VRSpatialMenuModel(manager);
-    expect(model.getStatusLine()).toContain("1:10.0");
+    // Quantized to the nearest whole ratio now (see _formatScale) — 1/0.1 = 10
+    // exactly, so this stays "1:10" rather than the old one-decimal "1:10.0".
+    expect(model.getStatusLine()).toContain("1:10");
+  });
+
+  it("_formatScale produces the same string for nearby scale values that previously diverged", () => {
+    const model = new VRSpatialMenuModel(makeManager());
+    // Old toFixed(1) formatting: "2.1x" vs "2.2x" (distinct every frame during
+    // a slow pinch). New nearest-half quantization collapses both into "2x".
+    expect(model._formatScale(2.1)).toBe(model._formatScale(2.2));
+    expect(model._formatScale(2.1)).toBe("2x");
+
+    // Zoomed-out branch: 1/19.3 and 1/19.4 are two nearby scale values whose
+    // ratios both round to the same whole number.
+    expect(model._formatScale(1 / 19.3)).toBe(model._formatScale(1 / 19.4));
+    expect(model._formatScale(1 / 19.3)).toBe("1:19");
   });
 
   it("appends who's being followed", () => {

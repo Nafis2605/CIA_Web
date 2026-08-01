@@ -93,6 +93,12 @@ describe("VRExplorationManager — VR visualization sync (clip/representation/gl
     vi.mocked(instanceTools.setRepresentation).mockClear();
     vi.mocked(vtkGlyphFeature.enableGlyphs).mockClear();
     mockGlyphState.enabled = false;
+    // cycleRepresentation/toggleGlyphs now defer their expensive call to the
+    // end of the next XR frame (see VRExplorationManager._deferHeavy) —
+    // start each test with an empty queue so one test's leftover deferred
+    // task can never bleed into the next.
+    vrExplorationManager._deferredWork = [];
+    vrExplorationManager._pendingWorkLabel = null;
     vrExplorationManager._activeContext = {
       instance: {
         viewConfigId: "view-1",
@@ -119,16 +125,29 @@ describe("VRExplorationManager — VR visualization sync (clip/representation/gl
     expect(mockPush).not.toHaveBeenCalled();
   });
 
-  it("cycleRepresentation renders via instanceTools AND pushes the representation patch", () => {
+  it("cycleRepresentation returns the optimistic mode immediately, then renders + pushes once the frame drains", () => {
     const next = vrExplorationManager.cycleRepresentation();
     expect(next).toBe("wireframe"); // surface → wireframe
+
+    // Deferred (see VRExplorationManager._deferHeavy) — nothing has run yet.
+    expect(instanceTools.setRepresentation).not.toHaveBeenCalled();
+    expect(mockPush).not.toHaveBeenCalled();
+
+    vrExplorationManager._drainDeferredWork();
+
     expect(instanceTools.setRepresentation).toHaveBeenCalledWith("inst-1", "wireframe");
     expect(mockPush).toHaveBeenCalledWith("view-1", { representation: "wireframe" });
   });
 
-  it("toggleGlyphs enables via vtkGlyphFeature AND pushes the glyph patch", () => {
+  it("toggleGlyphs returns the optimistic enabled state immediately, then enables + pushes once the frame drains", () => {
     const enabled = vrExplorationManager.toggleGlyphs();
     expect(enabled).toBe(true);
+
+    expect(vtkGlyphFeature.enableGlyphs).not.toHaveBeenCalled();
+    expect(mockPush).not.toHaveBeenCalled();
+
+    vrExplorationManager._drainDeferredWork();
+
     expect(vtkGlyphFeature.enableGlyphs).toHaveBeenCalledWith(
       "inst-1",
       { fake: true },
@@ -137,10 +156,15 @@ describe("VRExplorationManager — VR visualization sync (clip/representation/gl
     expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig });
   });
 
-  it("toggleGlyphs disables when already enabled and still pushes the patch", () => {
+  it("toggleGlyphs disables when already enabled and still pushes the patch once drained", () => {
     mockGlyphState.enabled = true;
     const enabled = vrExplorationManager.toggleGlyphs();
     expect(enabled).toBe(false);
+
+    expect(vtkGlyphFeature.disableGlyphs).not.toHaveBeenCalled();
+
+    vrExplorationManager._drainDeferredWork();
+
     expect(vtkGlyphFeature.disableGlyphs).toHaveBeenCalledWith("inst-1");
     expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig });
   });
@@ -156,6 +180,8 @@ describe("VRExplorationManager — VR visualization sync (clip/representation/gl
     expect(vrExplorationManager.cycleRepresentation()).toBeNull();
     expect(vrExplorationManager.toggleGlyphs()).toBe(false);
     expect(mockPush).not.toHaveBeenCalled();
+    // Neither no-op path should have queued anything.
+    expect(vrExplorationManager._deferredWork).toHaveLength(0);
   });
 
   it("probe actions stay local (no sync)", () => {

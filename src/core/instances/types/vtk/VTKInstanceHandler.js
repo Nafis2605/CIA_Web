@@ -4829,6 +4829,21 @@ console.log('Tools:', tools);
     // Initialize VR controllers visualization
     await this._initVRExplorationControllers(vrContext);
 
+    // Suppress all stray renderWindow.render() calls for the duration of the
+    // session. ~162 call sites (every VTK*Feature, vtkInstanceTools, the Y.js
+    // collaboration observers in VTKRemoteVRRays/VTKInstanceCursors, and
+    // _requestRender) can fire mid-XR-frame; each is a full extra scene
+    // traversal into the bound XR framebuffer and shows up as judder.
+    // RenderWindow.render() delegates to interactor.render(), which no-ops
+    // while isAnimating() (RenderWindowInteractor.js:805-809, :451). The XR
+    // loop draws via openGLRenderWindow.traverseAllPasses() instead. This is
+    // the same mechanism vtk.js's own WebXR RenderWindowHelper uses.
+    try {
+      sceneObjects.interactor?.switchToXRAnimation?.();
+    } catch (e) {
+      log.warn(`Could not switch interactor to XR animation: ${e?.message}`);
+    }
+
     log.info(`VR exploration started for instance ${instanceId}`);
 
     return vrContext;
@@ -4842,7 +4857,7 @@ console.log('Tools:', tools);
   updateVRExploration(vrContext, frame, inputState, viewerPose) {
     const { sceneObjects, xrLayer, gl, vrScale, vrOrigin, referenceSpace } =
       vrContext;
-    const { renderer, renderWindow, openGLRenderWindow, camera } = sceneObjects;
+    const { renderer, openGLRenderWindow, camera } = sceneObjects;
 
     if (!frame) return;
 
@@ -4906,8 +4921,12 @@ console.log('Tools:', tools);
       gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
       gl.disable(gl.SCISSOR_TEST);
 
-      // THE fix: render via the render *window* (vtkRenderer has no render()).
-      renderWindow.render();
+      // renderWindow.render() would now no-op — the interactor is in XR
+      // animation mode for the whole session (see enterVRExploration), which
+      // makes RenderWindowInteractor.render() a no-op (RenderWindowInteractor.js
+      // :805-809, :451). Draw directly via the OpenGL render window instead,
+      // matching vtk.js's own WebXR RenderWindowHelper.js:172.
+      openGLRenderWindow.traverseAllPasses();
     }
 
     // Defensively disable the scissor test after the loop in case a render
@@ -4929,6 +4948,26 @@ console.log('Tools:', tools);
     const { instanceId, sceneObjects, originalCameraState } = vrContext;
     const { camera, renderer, renderWindow, openGLRenderWindow } = sceneObjects;
 
+    // FIRST, before anything that can throw: restore normal rendering. This
+    // function is wrapped in _safeCleanupStep (VRExplorationManager.js:506),
+    // so if an exception got here first the desktop renderer would stay frozen
+    // forever — every render() would silently no-op with no visible error.
+    try {
+      sceneObjects.interactor?.returnFromXRAnimation?.();
+    } catch (e) {
+      log.warn(`Could not return interactor from XR animation: ${e?.message}`);
+    }
+
+    // Clear a stranded pending-render flag. _requestRender (line ~217) sets
+    // instanceData._pendingRender = true then schedules a
+    // window.requestAnimationFrame that Quest suspends during an immersive
+    // session, so it can strand and cause one subsequent _requestRender call
+    // to early-return as "already scheduled".
+    const instanceData = this.instances.get(instanceId);
+    if (instanceData) {
+      instanceData._pendingRender = false;
+    }
+
     log.info(`Exiting VR exploration for instance ${instanceId}`);
 
     // Restore original camera
@@ -4940,6 +4979,9 @@ console.log('Tools:', tools);
       camera.setClippingRange(...originalCameraState.clippingRange);
       camera.setViewAngle(originalCameraState.viewAngle);
       camera.setProjectionMatrix(null);
+      // Undo the VR data-units -> metres conversion applied every frame by
+      // _updateCameraFromVRPose (see Phase 2a there).
+      camera.setPhysicalScale(1);
     }
 
     // Restore the data actor's UserMatrix, undoing any two-hand twist yaw
@@ -5330,6 +5372,21 @@ console.log('Tools:', tools);
 
     // Set projection matrix from XR
     camera.setProjectionMatrix(xrView.projectionMatrix);
+
+    // View-space here is in DATA units (see the /vrScale mapping above), but the
+    // XR projection matrix's near/far planes are in METRES. vtk.js scales view
+    // coordinates by 1/physicalScale before applying a set projection matrix
+    // (Camera.js:444-453), so this converts data units -> metres and makes
+    // depthNear/depthFar physically correct at every zoom level. Without it the
+    // effective near clip is depthNear * vrScale, so at the menu's "Detail"
+    // preset (vrScale 10) everything within 1 m — including the menu panel —
+    // gets clipped away.
+    //
+    // It also re-asserts every frame, which structurally immunizes VR against
+    // every stray renderer.resetCamera() in the codebase: resetCamera writes
+    // physicalScale = visible-prop bounding radius (Renderer.js:398), which
+    // would otherwise permanently rescale the whole stereo view.
+    camera.setPhysicalScale(1 / (vrScale || 1.0));
   }
 
   /**

@@ -329,6 +329,18 @@ export class VRSpatialMenuModel {
     // manager mid-frame.
     this._draftText = "";
     this._draftFallback = "";
+    // Optimistic-hold bookkeeping for buttons whose manager call now runs on
+    // a DEFERRED VR frame (VRExplorationManager._deferHeavy — glyph rebuild,
+    // isosurface extraction, threshold reapply, representation change all
+    // moved off the synchronous activate() path to stop the mid-frame
+    // shaking, see VRExplorationManager.toggleGlyphs). Same problem
+    // TOOL_SYNC_HOLD_MS solves for tool activation above: the manager's
+    // getX()/getState() reads keep reporting the OLD value until the queued
+    // task actually drains, so without a hold the button would flash back to
+    // its old highlight for however many frames that takes. Keyed by a short
+    // domain id so one small map serves every deferred toggle instead of a
+    // field pair per button — see _holdDeferred/_readDeferredHold.
+    this._deferredHolds = new Map(); // id -> { value, atMs }
   }
 
   // ===========================================================================
@@ -686,6 +698,7 @@ export class VRSpatialMenuModel {
    */
   _cycleRepresentation() {
     const mode = this._call("cycleRepresentation");
+    if (mode != null) this._holdDeferred("representation", mode);
     return { handled: true, action: "representation-changed", mode: mode ?? null };
   }
 
@@ -699,10 +712,12 @@ export class VRSpatialMenuModel {
    */
   _setRepresentation(mode) {
     const applied = this._call("setRepresentation", mode);
+    const resolved = applied === undefined ? mode : applied ?? null;
+    if (resolved != null) this._holdDeferred("representation", resolved);
     return {
       handled: true,
       action: "representation-changed",
-      mode: applied === undefined ? mode : applied ?? null,
+      mode: resolved,
     };
   }
 
@@ -739,8 +754,9 @@ export class VRSpatialMenuModel {
     if (this._call("isThresholdAvailable") === false) {
       return { handled: false, action: "threshold-toggled", available: false };
     }
-    const enabled = this._call("toggleThresholdFilter");
-    return { handled: true, action: "threshold-toggled", enabled: !!enabled, available: true };
+    const enabled = !!this._call("toggleThresholdFilter");
+    this._holdDeferred("threshold", enabled);
+    return { handled: true, action: "threshold-toggled", enabled, available: true };
   }
 
   /** Cycle threshold mode (between -> above -> below). @private */
@@ -764,8 +780,9 @@ export class VRSpatialMenuModel {
     if (this._call("isIsosurfaceAvailable") === false) {
       return { handled: false, action: "isosurface-toggled", available: false };
     }
-    const enabled = this._call("toggleIsosurface");
-    return { handled: true, action: "isosurface-toggled", enabled: !!enabled, available: true };
+    const enabled = !!this._call("toggleIsosurface");
+    this._holdDeferred("isosurface", enabled);
+    return { handled: true, action: "isosurface-toggled", enabled, available: true };
   }
 
   /** Retarget the shared stepper to the next editable value. @private */
@@ -805,6 +822,7 @@ export class VRSpatialMenuModel {
   /** Toggles glyphs via the same desktop VTKGlyphFeature (VRExplorationManager.toggleGlyphs). */
   _toggleGlyphs() {
     const enabled = !!this._call("toggleGlyphs");
+    this._holdDeferred("glyphs", enabled);
     return { handled: true, action: "glyphs-toggled", enabled };
   }
 
@@ -1007,6 +1025,33 @@ export class VRSpatialMenuModel {
     return { handled: true, action: "exit" };
   }
 
+  /**
+   * Stamp an optimistic value for a deferred toggle so getButtonStates() can
+   * trust it over the manager's (still-stale) live read for TOOL_SYNC_HOLD_MS
+   * — see the constructor note on _deferredHolds.
+   * @param {string} id - domain key, e.g. "glyphs" / "isosurface" /
+   *   "threshold" / "representation"
+   * @private
+   */
+  _holdDeferred(id, value) {
+    this._deferredHolds.set(id, { value, atMs: Date.now() });
+  }
+
+  /**
+   * Read a deferred toggle's display value: the optimistic tap value while
+   * its hold window is still open, otherwise `liveValue` (already read from
+   * the manager by the caller).
+   * @private
+   */
+  _readDeferredHold(id, liveValue) {
+    const hold = this._deferredHolds.get(id);
+    if (hold && Date.now() - hold.atMs < TOOL_SYNC_HOLD_MS) {
+      return hold.value;
+    }
+    if (hold) this._deferredHolds.delete(id);
+    return liveValue;
+  }
+
   _call(method, ...args) {
     const fn = this._manager?.[method];
     if (typeof fn === "function") {
@@ -1044,6 +1089,7 @@ export class VRSpatialMenuModel {
     this._shiftMode = "off";
     this._draftText = "";
     this._draftFallback = "";
+    this._deferredHolds.clear();
     return this._visible;
   }
 
@@ -1173,29 +1219,31 @@ export class VRSpatialMenuModel {
       else if (btn.kind === "nav-mode-set") active = this._call("getNavigationMode") === btn.mode;
       else if (btn.id === "follow-participant") active = !!this._call("isFollowingParticipant");
       else if (btn.kind === "representation") {
-        const mode = this._call("getRepresentation");
+        const mode = this._readDeferredHold("representation", this._call("getRepresentation"));
         active = !!mode && mode !== "surface";
       }
       // Exact match, unlike the legacy cycling button above: each of
       // Surface/Wire/Points lights only for its own mode, so the panel finally
       // shows WHICH representation is live.
       else if (btn.kind === "representation-set") {
-        active = this._call("getRepresentation") === btn.mode;
+        active = this._readDeferredHold("representation", this._call("getRepresentation")) === btn.mode;
       }
       else if (btn.kind === "scene-grid") active = !!this._call("isReferenceGridVisible");
       else if (btn.kind === "scene-axes") active = !!this._call("areDataAxesVisible");
       else if (btn.kind === "threshold-toggle") {
-        active = !!this._call("isThresholdEnabled");
+        active = this._readDeferredHold("threshold", !!this._call("isThresholdEnabled"));
         disabled = this._call("isThresholdAvailable") === false;
       } else if (btn.kind === "iso-toggle") {
-        active = !!this._call("isIsosurfaceEnabled");
+        active = this._readDeferredHold("isosurface", !!this._call("isIsosurfaceEnabled"));
         disabled = this._call("isIsosurfaceAvailable") === false;
       }
       // Threshold sub-controls are meaningless while threshold is off.
       else if (btn.kind === "threshold-mode" || btn.kind === "threshold-array") {
         disabled = !this._call("isThresholdEnabled");
       }
-      else if (btn.kind === "glyph-toggle") active = !!this._call("isGlyphsEnabled");
+      else if (btn.kind === "glyph-toggle") {
+        active = this._readDeferredHold("glyphs", !!this._call("isGlyphsEnabled"));
+      }
       else if (btn.kind === "probe-continuous") active = !!this._call("isProbeContinuous");
       // Only meaningful once connected: voiceRoomService.isMuted initialises to
       // TRUE before any room is joined, which lit the Mute button from the
@@ -1237,6 +1285,16 @@ export class VRSpatialMenuModel {
       return formatDraftLine(this._draftText, { fallback: this._draftFallback });
     }
 
+    // A deferred toggle (glyph rebuild, isosurface, threshold, representation
+    // — see VRExplorationManager._deferHeavy) is queued or actively running.
+    // Replacing the whole line, same as the keyboard-mode branch above, keeps
+    // this readable — the dataset/scale/mode parts aren't useful information
+    // while the user is staring at a stall they just caused.
+    const pendingWork = this._call("getPendingWorkLabel");
+    if (typeof pendingWork === "string" && pendingWork.length) {
+      return pendingWork;
+    }
+
     const name = this._call("getActiveDatasetName") || "Dataset";
     const navMode = this._call("getNavigationMode");
     const scale = this._call("getVRScale");
@@ -1264,12 +1322,29 @@ export class VRSpatialMenuModel {
     return parts.join("  •  ");
   }
 
-  /** @private */
+  /**
+   * Quantized to ~2 significant figures so the string stays STABLE across the
+   * small, continuous scale changes VRScaleController applies during a
+   * two-hand pinch — VTKVRSpatialUI._layoutStatus dirty-checks this string to
+   * decide whether to repaint the status canvas + re-upload its GPU texture,
+   * so a value that changes on almost every frame (the old toFixed(1)/
+   * toFixed(1) behavior) defeated that check entirely. Fewer distinct values
+   * is the goal here, not a different label shape.
+   * @private
+   */
   _formatScale(scale) {
     if (scale >= 1) {
-      return `${scale % 1 === 0 ? scale.toFixed(0) : scale.toFixed(1)}x`;
+      // Below 10x, snap to the nearest half (0.5) instead of the nearest
+      // tenth — coarser than a straight 2-sig-fig round would give, which is
+      // what actually cuts the repaint rate during a slow pinch-zoom. At/above
+      // 10x, a whole number already reads as ~2 sig figs at that magnitude.
+      const rounded = scale < 10 ? Math.round(scale * 2) / 2 : Math.round(scale);
+      return `${rounded % 1 === 0 ? rounded.toFixed(0) : rounded.toFixed(1)}x`;
     }
-    return `1:${(1 / scale).toFixed(1)}`;
+    // Zoomed out: "1:37.4" doesn't read as meaningfully different from
+    // "1:37", so round to the nearest whole ratio — cuts the distinct-string
+    // count ~10x relative to the previous one-decimal formatting.
+    return `1:${Math.round(1 / scale)}`;
   }
 
   // ===========================================================================
