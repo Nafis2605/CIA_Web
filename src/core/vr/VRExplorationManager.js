@@ -38,6 +38,30 @@ import { mapXRPointToData, controllerForward } from '@Core/vr/tools/vrPlaneMath.
 import { vrEnvironment } from '@Core/vr/environment/VREnvironment.js';
 import { voiceRoomService, getVoiceRoomName } from '@Services/voice/voiceRoomService.js';
 
+// ---------------------------------------------------------------------------
+// Entry-placement geometry. These four are derived TOGETHER and must stay in
+// sync with VTKVRSpatialUI's PANEL_DISTANCE — the whole point is that the
+// dataset and the spatial menu do not occupy the same solid angle.
+//
+// The old fit (2.5 m diagonal at 2.0 m) made the dataset subtend ~77 deg while
+// the panel subtends ~40 deg, so no lateral offset could separate them: the
+// menu would have to sit ~67 deg off-axis, outside any usable gaze cone. The
+// fix is to fit the dataset to a smaller angular radius so both fit in front.
+//
+// Solve for the centre distance D such that the near face of the bounding
+// sphere clears the panel plane:
+//     D = PANEL_PLANE_M + PANEL_CLEARANCE_M + R,  where R = D * sin(halfAngle)
+//  => D * (1 - sin(halfAngle)) = PANEL_PLANE_M + PANEL_CLEARANCE_M
+// With 15 deg / 1.6 m / 0.35 m this gives D ~= 2.63 m, R ~= 0.68 m, so the
+// dataset spans ~1.36 physical metres. Deliberately smaller than before — the
+// user grows it with the two-hand gesture, which now stays grounded.
+const FIT_HALF_ANGLE_RAD = (15 * Math.PI) / 180;
+const PANEL_PLANE_M = 1.6;
+const PANEL_CLEARANCE_M = 0.35;
+const FIT_DISTANCE_M =
+  (PANEL_PLANE_M + PANEL_CLEARANCE_M) / (1 - Math.sin(FIT_HALF_ANGLE_RAD));
+const FIT_DIAGONAL_M = 2 * FIT_DISTANCE_M * Math.sin(FIT_HALF_ANGLE_RAD);
+
 class VRExplorationManager extends BaseManager {
   constructor() {
     super();
@@ -92,6 +116,10 @@ class VRExplorationManager extends BaseManager {
     // the stall lands between frames instead of inside one — see _deferHeavy.
     this._deferredWork = [];
     this._pendingWorkLabel = null;
+
+    // Floor point under the head in XR metres, refreshed each frame. Used as
+    // the pivot for scale changes that originate outside the frame loop.
+    this._lastHeadFloorXR = null;
 
     // Bind methods
     this._onFrame = this._onFrame.bind(this);
@@ -240,6 +268,11 @@ class VRExplorationManager extends BaseManager {
     const GRIP_RELEASE = 0.4;
     const gripPredicate = (hand, engaged = false) => {
       if (!hand) return false;
+      // Grip + trigger together is the "carry the dataset" chord
+      // (VRNavigationController._isObjectMoveChord). Excluding it here is what
+      // keeps the two from firing at once — grip alone pulls the world, grip
+      // with trigger moves the data.
+      if (hand.triggerPressed === true && !hand.isTransientPointer) return false;
       // Vision Pro's transient-pointer is gripless (squeezeValue always 0) and
       // its pinch is digital — no hysteresis needed or possible.
       if (hand.isTransientPointer) return hand.triggerPressed === true;
@@ -640,9 +673,12 @@ class VRExplorationManager extends BaseManager {
     if (!targetPos) return false;
 
     const vrScale = ctx.vrScale || 1.0;
+    // Y stays on the ground plane rather than tracking the target's altitude:
+    // you walk over to stand near them, you don't get teleported to their eye
+    // height. Keeps the grounding invariant intact (see _groundY).
     ctx.vrOrigin = [
       targetPos[0],
-      targetPos[1] - 1.4 / vrScale,
+      this._groundY(ctx),
       targetPos[2] + 1.5 / vrScale,
     ];
     this._emit('wentToParticipant', { userId });
@@ -1018,7 +1054,12 @@ class VRExplorationManager extends BaseManager {
 
   setVRScale(scale) {
     if (!this._navigationController) return;
-    this._navigationController.setScale(scale);
+    // Pivot the preset about the floor under the user, so Overview/Normal/
+    // Detail resize the dataset in place instead of hurling it toward or away
+    // from them. Unpivoted, a preset tap is a homothety about the XR origin —
+    // the same defect the two-hand gesture had, and a 10x preset jump makes it
+    // far more violent. See VRScaleController.setScale.
+    this._navigationController.setScale(scale, this._lastHeadFloorXR);
     this._emit('vrScaleChanged', { scale });
   }
 
@@ -1600,15 +1641,107 @@ class VRExplorationManager extends BaseManager {
     const diagonal = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
     const center = [(b[0] + b[1]) / 2, (b[2] + b[3]) / 2, (b[4] + b[5]) / 2];
 
-    // Auto-fit: the dataset's bounding diagonal should appear ~2.5 physical
-    // metres across, placed 2.0 m in front and dropped 1.4 m to eye level.
-    const vrScale = 2.5 / diagonal;
+    // Auto-fit: the bounding diagonal spans FIT_DIAGONAL_M physical metres,
+    // centred FIT_DISTANCE_M in front (see the derivation at the top of this
+    // file — the distance is what keeps the dataset clear of the menu panel).
+    const vrScale = FIT_DIAGONAL_M / diagonal;
+
+    // GROUNDING INVARIANT. The dataset's base sits on the floor iff its
+    // data-space Y-minimum maps to physical y=0, and since
+    //     xr.y(P) = (P - vrOrigin[1]) * vrScale
+    // that is exactly `vrOrigin[1] = dataBounds[2]`, independent of vrScale.
+    //
+    // This one line is what fixes "the data keeps getting larger and rises
+    // over the user". Changing vrScale with vrOrigin fixed is a homothety
+    // about the XR origin, which in local-floor space is the floor point under
+    // the user — so every coordinate INCLUDING HEIGHT multiplies by s/s0. It
+    // used to start at xr.y ~= +0.6 m and double with every doubling of scale.
+    // A point sitting exactly ON the origin plane is a fixed point of that
+    // homothety, so grounding removes the rise with no per-frame clamp.
+    const groundY = b[2];
     const vrOrigin = [
       center[0],
-      center[1] - 1.4 / vrScale,
-      center[2] + 2.0 / vrScale,
+      groundY,
+      center[2] + FIT_DISTANCE_M / vrScale,
     ];
-    return { vrScale, vrOrigin, diagonal, center };
+    return {
+      vrScale,
+      vrOrigin,
+      diagonal,
+      center,
+      groundY,
+      radiusM: FIT_DIAGONAL_M / 2,
+    };
+  }
+
+  /**
+   * Data-space Y of the plane the dataset rests on — the value vrOrigin[1]
+   * must hold for the dataset to sit on the floor (see the grounding
+   * invariant in _computeAutoPlacement). Every writer of vrOrigin[1] has to
+   * go through this, or the first one that doesn't silently un-grounds the
+   * dataset and the ballooning returns.
+   * @private
+   */
+  _groundY(vrContext) {
+    const b = vrContext?.dataBounds;
+    if (Array.isArray(b) && b.length === 6 && Number.isFinite(b[2])) {
+      return b[2];
+    }
+    return vrContext?.vrOrigin?.[1] ?? 0;
+  }
+
+  /**
+   * Re-read the data actor's bounds. `vrContext.dataBounds` is captured once
+   * at VR entry, but Threshold/Isosurface/Glyphs SUBSTITUTE a derived actor
+   * with different bounds — leaving it stale would put the grounding plane
+   * (and the menu's angular clearance) on the wrong geometry.
+   * @param {Object} [vrContext] defaults to the active context
+   * @returns {number[]|null} the refreshed bounds, or the previous value
+   */
+  /**
+   * Pin the world-locked environment pieces to the dataset's frame: the floor
+   * lattice phase-anchors to the data centre, and the four cardinal posts sit
+   * at fixed data-space points framing the dataset. Constant apparent size at
+   * a world-fixed position is the strongest translation-parallax cue there is.
+   * @private
+   */
+  _applyEnvironmentAnchor(vrContext, placement) {
+    try {
+      const p = placement || this._computeAutoPlacement(vrContext?.dataBounds);
+      const c = p.center;
+      const b = vrContext?.dataBounds;
+      // Frame the dataset: posts just outside its horizontal footprint, or a
+      // sane default when bounds are degenerate.
+      const spanX = Array.isArray(b) ? Math.abs(b[1] - b[0]) : 0;
+      const spanZ = Array.isArray(b) ? Math.abs(b[5] - b[4]) : 0;
+      const r = 0.9 * Math.max(spanX, spanZ, 1e-6) || 1;
+      vrEnvironment.setWorldAnchor({
+        refPoint: [c[0], p.groundY, c[2]],
+        markerAnchors: [
+          [c[0] + r, p.groundY, c[2]],
+          [c[0] - r, p.groundY, c[2]],
+          [c[0], p.groundY, c[2] + r],
+          [c[0], p.groundY, c[2] - r],
+        ],
+      });
+    } catch (e) {
+      log.warn(`VR environment anchor failed — ${e?.message}`);
+    }
+  }
+
+  refreshDataBounds(vrContext) {
+    const ctx = vrContext || this._activeContext?.vrContext;
+    if (!ctx) return null;
+    const actor = ctx.sceneObjects?.actor;
+    const b = typeof actor?.getBounds === 'function' ? actor.getBounds() : null;
+    const valid =
+      Array.isArray(b) &&
+      b.length === 6 &&
+      b.every((v) => Number.isFinite(v)) &&
+      (b[1] - b[0] > 1e-6 || b[3] - b[2] > 1e-6 || b[5] - b[4] > 1e-6);
+    if (!valid) return ctx.dataBounds ?? null;
+    ctx.dataBounds = [...b];
+    return ctx.dataBounds;
   }
 
   /**
@@ -1655,13 +1788,25 @@ class VRExplorationManager extends BaseManager {
    */
   _applyPoseRelativePlacement(vrContext, viewerPose) {
     const { position, orientation } = viewerPose.transform;
+
+    // GROUND-PROJECT the gaze ray. controllerForward is the full 3D forward,
+    // so the old code's `forward[1] * distance` threw the dataset up to +/-2 m
+    // vertically if the user happened to be looking up or down on the first
+    // frame. The dataset belongs on the floor in front of them regardless of
+    // head pitch, so only the heading matters.
     const forward = controllerForward(orientation);
-    const distance = 2.0;
-    const target = [
-      position.x + forward[0] * distance,
-      position.y + forward[1] * distance - 0.3,
-      position.z + forward[2] * distance,
-    ];
+    let fx = forward[0];
+    let fz = forward[2];
+    const flen = Math.hypot(fx, fz);
+    if (flen < 1e-6) {
+      // Looking straight up or down — no meaningful heading; fall back to the
+      // reference space's forward.
+      fx = 0;
+      fz = -1;
+    } else {
+      fx /= flen;
+      fz /= flen;
+    }
 
     const placement = this._computeAutoPlacement(vrContext.dataBounds);
     // Always auto-fit (see _applyInitialPlacement) — the pose-relative pass
@@ -1669,13 +1814,27 @@ class VRExplorationManager extends BaseManager {
     // user is actually looking on the first real frame.
     const vrScale = placement.vrScale;
 
+    // Horizontal target only. The vertical placement comes entirely from the
+    // grounding invariant below: with vrOrigin[1] = groundY, the centre lands
+    // at (center[1] - groundY) * vrScale above the floor — i.e. exactly its
+    // own half-height, resting on the ground. No eye-height term needed.
+    const targetX = position.x + fx * FIT_DISTANCE_M;
+    const targetZ = position.z + fz * FIT_DISTANCE_M;
+
     vrContext.vrScale = vrScale;
     vrContext.vrRotation = 0;
     vrContext.vrOrigin = [
-      placement.center[0] - target[0] / vrScale,
-      placement.center[1] - target[1] / vrScale,
-      placement.center[2] - target[2] / vrScale,
+      placement.center[0] - targetX / vrScale,
+      placement.groundY,
+      placement.center[2] - targetZ / vrScale,
     ];
+
+    // Anchor the world-locked environment to the dataset's frame now that its
+    // real placement is known. The floor's grid lines phase-lock to this point
+    // and the cardinal posts pin to fixed data-space positions, so travelling
+    // produces genuine motion parallax — the cue that makes the stick read as
+    // moving the user rather than sliding the dataset.
+    this._applyEnvironmentAnchor(vrContext, placement);
 
     log.info('Applied pose-relative VR placement', {
       vrScale: vrContext.vrScale,
@@ -1729,7 +1888,10 @@ class VRExplorationManager extends BaseManager {
     } else {
       ctx.vrScale = vrScale;
     }
-    ctx.vrOrigin = [...vrOrigin];
+    // Re-ground on restore: dataBounds may have changed while isolated (a
+    // filter swapping the actor), which would make the backed-up Y stale and
+    // leave the dataset floating or sunk.
+    ctx.vrOrigin = [vrOrigin[0], this._groundY(ctx), vrOrigin[2]];
 
     vrManager.exitIsolationMode();
     this._emit('isolationChanged', { isolated: false });
@@ -1934,6 +2096,18 @@ class VRExplorationManager extends BaseManager {
       } catch (e) {
         log.error(`VR deferred work "${task.label}" failed — ${e?.message}`, e?.stack || e);
       }
+      // Every deferred task is a visualization change (representation,
+      // threshold, isosurface, glyphs), and Threshold/Isosurface/Glyphs
+      // SUBSTITUTE a derived actor with different bounds. Refreshing here
+      // rather than at each of the seven _deferHeavy call sites means a new
+      // one can't forget to — and stale bounds would silently put the
+      // grounding plane and the menu's angular clearance on dead geometry.
+      // Runs even if the task threw: it may have partially applied.
+      try {
+        this.refreshDataBounds();
+      } catch (e) {
+        log.warn(`VR dataBounds refresh failed — ${e?.message}`);
+      }
     }
     this._pendingWorkLabel = this._deferredWork[0]?.label ?? null;
   }
@@ -1971,6 +2145,14 @@ class VRExplorationManager extends BaseManager {
 
       // Get input state
       const inputState = this._gatherInputState(frame);
+
+      // Cache the floor point under the head. Menu actions (scale presets) run
+      // outside the frame loop and have no inputState of their own, but they
+      // need a pivot to resize about — see setVRScale.
+      const headXR = inputState.headPose?.position;
+      if (headXR) {
+        this._lastHeadFloorXR = [headXR.x, 0, headXR.z];
+      }
 
       // INPUT ARBITRATION (R2). The floating spatial menu must be interactable
       // without its pinches also firing tools/teleport. So the menu hit-tests
@@ -2142,7 +2324,13 @@ class VRExplorationManager extends BaseManager {
       // try/catch for the same reason as hitTest() — a menu-only placement
       // failure must not stall the handler's draw.
       try {
-        vrSpatialUI.layout({ vrScale: vrContext.vrScale, vrOrigin: vrContext.vrOrigin });
+        vrSpatialUI.layout({
+          vrScale: vrContext.vrScale,
+          vrOrigin: vrContext.vrOrigin,
+          // Consumed by the panel's adaptive side-offset, which needs the
+          // dataset's angular size to know how far to sit beside it.
+          dataBounds: vrContext.dataBounds,
+        });
       } catch (e) {
         log.error(`VR frame: vrSpatialUI.layout failed — ${e?.message}`, e?.stack || e);
       }
@@ -2249,19 +2437,18 @@ class VRExplorationManager extends BaseManager {
     }
 
     const vrScale = vrContext.vrScale || 1.0;
-    const desired = [
-      targetPos[0],
-      targetPos[1] - 1.4 / vrScale,
-      targetPos[2] + 1.5 / vrScale,
-    ];
+    const desired = [targetPos[0], targetPos[2] + 1.5 / vrScale];
 
-    // ~0.5s settle time regardless of frame rate.
+    // ~0.5s settle time regardless of frame rate. Only X/Z are lerped — Y is
+    // pinned to the ground plane so following someone walks you across the
+    // floor rather than drifting you up to their altitude, and so follow can
+    // never un-ground the dataset (see _groundY).
     const alpha = Math.min(1, deltaTime * 2);
     const origin = vrContext.vrOrigin || [0, 0, 0];
     vrContext.vrOrigin = [
       origin[0] + (desired[0] - origin[0]) * alpha,
-      origin[1] + (desired[1] - origin[1]) * alpha,
-      origin[2] + (desired[2] - origin[2]) * alpha,
+      this._groundY(vrContext),
+      origin[2] + (desired[1] - origin[2]) * alpha,
     ];
   }
 

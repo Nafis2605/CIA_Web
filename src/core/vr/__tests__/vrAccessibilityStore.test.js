@@ -60,7 +60,20 @@ describe("vrAccessibilityStore", () => {
 
   it("merges a stored partial movement setting over the defaults", () => {
     localStorage.setItem(VR_A11Y_STORAGE_KEY, JSON.stringify({ movement: { snapTurn: "off" } }));
-    expect(readVRAccessibilitySettings()).toEqual({ movement: { snapTurn: "off" } });
+    const result = readVRAccessibilitySettings();
+    expect(result.movement).toEqual({ snapTurn: "off" });
+    // Sections the stored blob omits still come back fully defaulted.
+    expect(result.input).toEqual(DEFAULT_VR_A11Y_SETTINGS.input);
+  });
+
+  it("merges a stored dominantHand over the defaults", () => {
+    localStorage.setItem(
+      VR_A11Y_STORAGE_KEY,
+      JSON.stringify({ input: { dominantHand: "left" } })
+    );
+    const result = readVRAccessibilitySettings();
+    expect(result.input.dominantHand).toBe("left");
+    expect(result.movement).toEqual(DEFAULT_VR_A11Y_SETTINGS.movement);
   });
 
   it("ignores a stored value with no usable movement section", () => {

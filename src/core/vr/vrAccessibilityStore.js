@@ -18,12 +18,16 @@ export const VR_A11Y_STORAGE_KEY = "cia-vr-accessibility-settings";
 
 /**
  * Defaults mirrored from VRAccessibilityContext's DEFAULT_VR_ACCESSIBILITY,
- * limited to the slice core VR code actually reads (movement.snapTurn).
- * @type {{movement: {snapTurn: ('off'|15|30|45|90)}}}
+ * limited to the slice core VR code actually reads.
+ * @type {{movement: {snapTurn: ('off'|15|30|45|90)}, input: {dominantHand: ('left'|'right')}}}
  */
 export const DEFAULT_VR_A11Y_SETTINGS = {
   movement: {
     snapTurn: 45, // 'off' | 15 | 30 | 45 | 90
+  },
+  input: {
+    // Which side the spatial menu prefers when both are equally clear.
+    dominantHand: "right", // 'left' | 'right'
   },
 };
 
@@ -43,16 +47,19 @@ export function readVRAccessibilitySettings() {
       return DEFAULT_VR_A11Y_SETTINGS;
     }
     const parsed = JSON.parse(stored);
-    const parsedMovement =
-      parsed && typeof parsed === "object" && parsed.movement && typeof parsed.movement === "object"
-        ? parsed.movement
-        : undefined;
+    const isObj = (v) => v && typeof v === "object";
+    const parsedMovement = isObj(parsed) && isObj(parsed.movement) ? parsed.movement : undefined;
+    const parsedInput = isObj(parsed) && isObj(parsed.input) ? parsed.input : undefined;
     return {
       ...DEFAULT_VR_A11Y_SETTINGS,
-      ...(parsed && typeof parsed === "object" ? parsed : undefined),
+      ...(isObj(parsed) ? parsed : undefined),
       movement: {
         ...DEFAULT_VR_A11Y_SETTINGS.movement,
         ...parsedMovement,
+      },
+      input: {
+        ...DEFAULT_VR_A11Y_SETTINGS.input,
+        ...parsedInput,
       },
     };
   } catch (e) {

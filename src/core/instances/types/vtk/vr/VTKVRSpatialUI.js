@@ -34,6 +34,7 @@
 
 import { vr as log } from "@Utils/logger.js";
 import { VRSpatialMenuModel, VR_MENU_GROUPS } from "@Core/vr/VRSpatialMenuModel.js";
+import { readVRAccessibilitySettings } from "@Core/vr/vrAccessibilityStore.js";
 // Canvas->texture and rounded-rect tracing now live in the shared VR text
 // primitive (src/core/vr/ui/VRTextBillboard.js) so the menu, avatar labels and
 // every tool label use one implementation. The private methods below are kept
@@ -78,17 +79,26 @@ const ROW_HEIGHT_M = 0.14; // matches the original single-row height
 // automatically — there is no second place to keep in sync.
 const MAX_PANEL_HEIGHT_M = 0.86;
 const ROW_HEIGHT_MIN_M = 0.1;
-// Distance in front of head. PANEL_DROP is deliberately generous (well below
-// PANEL_DISTANCE would put a straight-ahead dataset) and PANEL_SIDE_OFFSET
-// nudges the panel off the dead-center forward ray — together they keep the
-// panel from angularly overlapping an auto-fit dataset placed straight ahead
-// (that dataset centers ~2.0m out / ~1.4m below eye-line, per
-// VRExplorationManager._computeAutoPlacement — both panel and dataset used to
-// sit on the same ray, with the closer, less-dropped panel visually blocking
-// the object). Reads as a chest-level/peripheral HUD instead.
-const PANEL_DISTANCE = 1.2;
+// Panel placement. These are paired with VRExplorationManager's entry-fit
+// geometry (PANEL_PLANE_M / FIT_HALF_ANGLE_RAD there) and must move together:
+// the dataset is auto-fitted to a ~15 deg angular radius specifically so that
+// it and this panel can both sit in front of the user without overlapping.
+//
+// The previous values (1.2 m out, a fixed 0.28 m side offset) could not work
+// at any setting: 0.28 m is smaller than the panel's own 0.435 m half-width,
+// so the panel did not clear the forward axis, and against a dataset
+// subtending ~77 deg the required offset was ~67 deg of azimuth — outside any
+// usable gaze cone. Shrinking the entry fit is what made this solvable.
+const PANEL_DISTANCE = 1.6;
 const PANEL_DROP = 0.55; // how far below eye-line the panel center sits
-const PANEL_SIDE_OFFSET = 0.28; // lateral offset (toward +right), meters
+const PANEL_SIDE_OFFSET = 0.28; // minimum lateral offset, metres
+// Clearance budget for _adaptiveSideOffset: how far past the dataset's edge to
+// place the panel, and how far off-axis it may ever be pushed.
+const SIDE_MARGIN_RAD = (8 * Math.PI) / 180;
+const MAX_PANEL_AZIMUTH_RAD = (38 * Math.PI) / 180;
+const MAX_PANEL_SIDE_OFFSET_M = 1.6;
+// Keep the panel's bottom edge above the floor for seated/crouching users.
+const FLOOR_CLEARANCE_M = 0.15;
 // Lazy re-anchor: only chase the head after it drifts this far (meters).
 const REANCHOR_DISTANCE = 0.5;
 
@@ -272,6 +282,9 @@ export class VRSpatialUI {
     // the dataset is zoomed. Mirrors VREnvironment's per-actor transform.
     this._vrScale = 1.0;
     this._vrOrigin = [0, 0, 0];
+    // Latched from layout()'s payload. Used to size the panel's lateral offset
+    // so it sits BESIDE the dataset rather than inside it.
+    this._dataBounds = null;
     // Per-instance panel geometry, defaulted to the menu's constants and
     // swapped for the keyboard's own set in update() whenever the model's
     // mode flips (see _lastPanelMode). Instance fields (not module constants)
@@ -279,6 +292,12 @@ export class VRSpatialUI {
     this._panelWidth = PANEL_WIDTH;
     this._panelDrop = PANEL_DROP;
     this._panelSideOffset = PANEL_SIDE_OFFSET;
+    this._panelDistance = PANEL_DISTANCE;
+    // Which side the panel prefers when the dataset is dead ahead and both
+    // sides are equally clear. +1 = the user's right. Resolved from the
+    // accessibility settings at initialize().
+    this._panelSideSign = 1;
+    this._lastAnchorScale = null;
     this._lastPanelMode = "menu";
     // Actors for buttons whose id fell out of the current layout (e.g. a
     // mode switch), moved here instead of destroyed — see
@@ -311,6 +330,15 @@ export class VRSpatialUI {
     // instead of stacking a duplicate set of "blue rectangles" on top.
     if (this._renderer) this.dispose();
     this._renderer = renderer;
+    // Which side the panel prefers. Read once here, matching how the snap-turn
+    // step is read once at VRNavigationController construction — there is no
+    // live-update path for accessibility settings mid-session.
+    try {
+      const hand = readVRAccessibilitySettings()?.input?.dominantHand;
+      this._panelSideSign = hand === "left" ? -1 : 1;
+    } catch {
+      this._panelSideSign = 1;
+    }
     this._model = new VRSpatialMenuModel(manager);
     this._model.onSessionStart();
     this._buildActors();
@@ -1175,7 +1203,7 @@ export class VRSpatialUI {
    * flipped it, and this must take the correspondingly correct path this
    * same frame, not one frame later.
    *
-   * @param {{vrScale?:number, vrOrigin?:number[]}} [transform]
+   * @param {{vrScale?:number, vrOrigin?:number[], dataBounds?:number[]}} [transform]
    */
   layout(transform) {
     if (!this._model) return;
@@ -1185,6 +1213,9 @@ export class VRSpatialUI {
     if (transform) {
       this._vrScale = transform.vrScale || 1.0;
       this._vrOrigin = transform.vrOrigin || [0, 0, 0];
+      // Keep the last known bounds when a frame omits them, so the panel's
+      // placement doesn't snap around on a transient null.
+      this._dataBounds = transform.dataBounds ?? this._dataBounds;
     }
 
     if (!this._model.isVisible()) {
@@ -1268,7 +1299,16 @@ export class VRSpatialUI {
     const p = headPose.position;
     const headPos = [p.x, p.y, p.z];
 
-    if (this._panelAnchor && this._lastHeadPos) {
+    // Re-anchor on head translation, but ALSO on a significant zoom: the
+    // lateral clearance the panel needs is a function of the dataset's angular
+    // size, which vrScale changes directly. Without this the panel would stay
+    // put while the data grew straight through it.
+    const scaleChanged =
+      this._lastAnchorScale &&
+      Math.abs(Math.log((this._vrScale || 1) / this._lastAnchorScale)) >
+        Math.log(1.25);
+
+    if (this._panelAnchor && this._lastHeadPos && !scaleChanged) {
       const dx = headPos[0] - this._lastHeadPos[0];
       const dy = headPos[1] - this._lastHeadPos[1];
       const dz = headPos[2] - this._lastHeadPos[2];
@@ -1286,25 +1326,101 @@ export class VRSpatialUI {
     fx /= flen;
     fz /= flen;
 
-    // Panel basis: right = fwd × worldUp, up = worldUp (kept upright for reading)
-    const right = [fz, 0, -fx]; // horizontal, perpendicular to forward
+    // Panel basis: right = fwd × worldUp, up = worldUp (kept upright for
+    // reading). This USED to be [fz, 0, -fx], which is the NEGATION of
+    // fwd × up — so the button grid rendered horizontally mirrored (the plane's
+    // texture-u runs along the actor's local +X, which the yaw maps to
+    // [-fz, 0, fx]) and PANEL_SIDE_OFFSET pushed the panel to the user's LEFT
+    // despite its "toward +right" comment. Hit-testing used the same wrong
+    // basis so it stayed self-consistent, which is why it went unnoticed.
+    const right = [-fz, 0, fx];
     const up = [0, 1, 0];
     const normal = [-fx, 0, -fz]; // faces back toward the head
 
-    // Offset laterally (along `right`) in addition to the downward drop, so
-    // the panel sits off the dead-center forward ray instead of directly on
-    // top of it — see the PANEL_DROP/PANEL_SIDE_OFFSET comment above. Reads
-    // the INSTANCE fields (not the module constants) so keyboard mode's
-    // centred, less-dropped placement takes effect the moment update() swaps
-    // them in.
+    // How far to the side the panel must sit to clear the dataset. A fixed
+    // offset cannot work: the auto-fit dataset subtends ~30-77 deg depending
+    // on zoom while the panel subtends ~30 deg, so the required clearance is a
+    // function of both. See _adaptiveSideOffset.
+    const side = this._adaptiveSideOffset(headPos, [fx, 0, fz], right);
+
     const center = [
-      headPos[0] + fx * PANEL_DISTANCE + right[0] * this._panelSideOffset,
+      headPos[0] + fx * this._panelDistance + right[0] * side,
       headPos[1] - this._panelDrop,
-      headPos[2] + fz * PANEL_DISTANCE + right[2] * this._panelSideOffset,
+      headPos[2] + fz * this._panelDistance + right[2] * side,
     ];
+
+    // Never let the panel sink through the floor. A seated or crouching user
+    // (head at ~1.0 m) minus a 0.55 m drop minus the panel's own half-height
+    // puts its bottom edge underground; this was previously unguarded.
+    const halfHeight = (this._panelHeight || 0) / 2 + BACKING_PAD_M;
+    center[1] = Math.max(center[1], FLOOR_CLEARANCE_M + halfHeight);
 
     this._panelAnchor = { center, right, up, normal };
     this._lastHeadPos = headPos;
+    this._lastAnchorScale = this._vrScale || 1;
+  }
+
+  /**
+   * Lateral offset (metres along `right`) that puts the panel BESIDE the
+   * dataset rather than inside it.
+   *
+   * The panel used to sit 1.2 m out with a fixed 0.28 m offset — smaller than
+   * its own 0.435 m half-width, so it did not even clear the forward axis. With
+   * the dataset auto-fitted to a 1.25 m bounding radius at 2 m, the panel plane
+   * fell INSIDE the dataset's bounding sphere and ~100% of its silhouette was
+   * swallowed: near geometry occluded the buttons, far geometry was painted
+   * over by them, and the analytic hit test happily reported hits on buttons
+   * the user could not see.
+   *
+   * Required azimuth = (bearing to the data) + (its angular radius) + margin +
+   * (the panel's own half-angle), clamped so the panel never ends up somewhere
+   * the user has to crane to reach.
+   * @private
+   */
+  _adaptiveSideOffset(headPos, fwd, right) {
+    const base = this._panelSideOffset;
+    const b = this._dataBounds;
+    if (!Array.isArray(b) || b.length !== 6) return base;
+
+    const s = this._vrScale || 1;
+    const o = this._vrOrigin || [0, 0, 0];
+    // Dataset centre and bounding radius, in physical metres.
+    const cx = ((b[0] + b[1]) / 2 - o[0]) * s;
+    const cy = ((b[2] + b[3]) / 2 - o[1]) * s;
+    const cz = ((b[4] + b[5]) / 2 - o[2]) * s;
+    const radius = 0.5 * Math.hypot(b[1] - b[0], b[3] - b[2], b[5] - b[4]) * s;
+
+    const vx = cx - headPos[0];
+    const vy = cy - headPos[1];
+    const vz = cz - headPos[2];
+    const dist = Math.hypot(vx, vy, vz);
+    if (!Number.isFinite(dist) || dist <= radius * 1.02) {
+      // Head is inside the dataset — no lateral offset can clear it, so park
+      // the panel at the maximum and let the user hide it if it's in the way.
+      return MAX_PANEL_SIDE_OFFSET_M;
+    }
+
+    const alpha = Math.asin(Math.min(1, radius / dist)); // angular radius
+    // Signed bearing of the data from straight ahead, in the panel's plane.
+    const beta = Math.atan2(
+      vx * right[0] + vz * right[2],
+      vx * fwd[0] + vz * fwd[2]
+    );
+    const panelHalf = Math.atan2(
+      this._panelWidth / 2 + BACKING_PAD_M,
+      this._panelDistance
+    );
+
+    const azimuth = Math.min(
+      Math.abs(beta) + alpha + SIDE_MARGIN_RAD + panelHalf,
+      MAX_PANEL_AZIMUTH_RAD
+    );
+    const offset = Math.tan(azimuth) * this._panelDistance;
+    // Put the panel on the side AWAY from the data when it is off-centre, and
+    // otherwise on the user's dominant-hand side.
+    const sign = Math.abs(beta) > 1e-3 ? -Math.sign(beta) : this._panelSideSign;
+
+    return sign * Math.min(Math.max(offset, base), MAX_PANEL_SIDE_OFFSET_M);
   }
 
   /**
@@ -1810,6 +1926,9 @@ export class VRSpatialUI {
     this._backingCtx = null;
     this._backingTexture = null;
     this._backingPlaneSource = null;
+    // Bounds belong to this session's dataset — carrying them into the next
+    // session would place the panel against the wrong geometry.
+    this._dataBounds = null;
     this._renderer = null;
     this._model = null;
     log.debug("VR spatial UI disposed");

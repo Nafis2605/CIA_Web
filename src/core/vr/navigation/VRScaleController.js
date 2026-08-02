@@ -125,7 +125,7 @@ export class VRScaleController {
     );
 
     if (!this._isScaling) {
-      this._startGesture(currentDistance, currentAngle);
+      this._startGesture(currentDistance, currentAngle, leftPos, rightPos);
       return {
         scaling: true,
         newScale: this._scale,
@@ -176,6 +176,44 @@ export class VRScaleController {
       newScale: this._scale,
       rotating: true,
       newRotation,
+      position: this._pivotedOrigin(),
+    };
+  }
+
+  /**
+   * The vrOrigin that keeps the gesture's pivot point pinned in physical space
+   * while the scale changes.
+   *
+   * Without this, scaling with vrOrigin fixed is a homothety about the XR
+   * ORIGIN — the floor point under the user at session start — so the dataset
+   * doesn't just grow, it flies away from that point in every axis. Combined
+   * with the fact that a fresh grip re-anchors `_initialScale`, repeated
+   * gestures compounded it right out of the room (the user's report).
+   *
+   * Requiring the data point currently under the pivot Q to stay at Q:
+   *     Q = (P - O0)*s0  =>  P = Q/s0 + O0
+   *     Q = (P - O1)*s   =>  O1 = P - Q/s = O0 + Q*(1/s0 - 1/s)
+   *
+   * Q is the point on the FLOOR beneath the hand midpoint (y forced to 0), so
+   * the Y term vanishes and vrOrigin[1] is left untouched — which is exactly
+   * what preserves the grounding invariant (see VRExplorationManager
+   * _computeAutoPlacement). The dataset grows in place, still resting on the
+   * floor, centred under the user's hands.
+   *
+   * The pivot is captured at gesture START, not read live: a live midpoint
+   * would fold hand drift into what the user intends as a pure scale, and
+   * makes the frame-to-frame form recursive.
+   * @private
+   */
+  _pivotedOrigin() {
+    if (!this._pivotXR || !this._initialOrigin || !this._initialScale) {
+      return null;
+    }
+    const k = 1 / this._initialScale - 1 / this._scale;
+    return {
+      x: this._initialOrigin[0] + this._pivotXR[0] * k,
+      y: this._initialOrigin[1],
+      z: this._initialOrigin[2] + this._pivotXR[2] * k,
     };
   }
 
@@ -194,7 +232,7 @@ export class VRScaleController {
    * Start the two-hand gesture — anchor both the scale and rotation baselines.
    * @private
    */
-  _startGesture(initialDistance, initialAngle) {
+  _startGesture(initialDistance, initialAngle, leftPos, rightPos) {
     this._isScaling = true;
     this._initialGripDistance = Math.max(initialDistance, MIN_GRIP_SEPARATION_M);
     this._initialScale = this._scale;
@@ -202,6 +240,16 @@ export class VRScaleController {
     this._initialRotation = this._vrContext.vrRotation || 0;
     this._lastAngle = initialAngle;
     this._rotationAccum = 0;
+    // Scale pivot: the floor point beneath the hand midpoint. Y is forced to 0
+    // so the pivot lies on the XR floor plane, which leaves vrOrigin[1]
+    // untouched and keeps the dataset grounded through the gesture. See
+    // _pivotedOrigin for the derivation.
+    this._pivotXR =
+      leftPos && rightPos
+        ? [(leftPos.x + rightPos.x) / 2, 0, (leftPos.z + rightPos.z) / 2]
+        : null;
+    const o = this._vrContext.vrOrigin || [0, 0, 0];
+    this._initialOrigin = [o[0], o[1], o[2]];
     log.debug("Two-hand gesture started", {
       initialDistance,
       initialScale: this._scale,
@@ -221,6 +269,8 @@ export class VRScaleController {
     this._initialRotation = null;
     this._lastAngle = null;
     this._rotationAccum = 0;
+    this._pivotXR = null;
+    this._initialOrigin = null;
     log.debug("Two-hand gesture ended", {
       finalScale: this._scale,
       finalRotation: this._vrContext.vrRotation,
@@ -246,14 +296,34 @@ export class VRScaleController {
   }
 
   /**
-   * Set scale directly
+   * Set scale directly (menu presets, isolation restore).
+   *
+   * @param {number} scale
+   * @param {number[]|null} [pivotXR] - optional XR-space pivot point; pass the
+   *   floor point under the user's head so the dataset grows/shrinks in place
+   *   instead of rushing toward or away from them. Without it, a preset tap is
+   *   a homothety about the XR origin and can throw the dataset across the
+   *   room — the same defect the two-hand gesture had (see _pivotedOrigin).
+   *   Y is ignored: the pivot is always taken on the floor plane so the
+   *   grounding invariant survives.
    */
-  setScale(scale) {
+  setScale(scale, pivotXR = null) {
+    const previous = this._scale;
     this._scale = Math.max(
       this._options.minScale,
       Math.min(this._options.maxScale, scale)
     );
     this._vrContext.vrScale = this._scale;
+
+    if (pivotXR && previous > 0 && this._scale > 0) {
+      const k = 1 / previous - 1 / this._scale;
+      const o = this._vrContext.vrOrigin || [0, 0, 0];
+      this._vrContext.vrOrigin = [
+        o[0] + (pivotXR[0] || 0) * k,
+        o[1],
+        o[2] + (pivotXR[2] || 0) * k,
+      ];
+    }
   }
 
   /**

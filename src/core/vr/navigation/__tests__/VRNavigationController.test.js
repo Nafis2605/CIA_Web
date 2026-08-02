@@ -49,6 +49,22 @@ function leftStick({ x = 0, y = 0, a = false } = {}) {
   };
 }
 
+/** Input with a right thumbstick — the ground-locked walk instance. */
+function rightStick({ x = 0, y = 0 } = {}) {
+  return {
+    headPose: { orientation: { x: 0, y: 0, z: 0, w: 1 } },
+    controllers: {
+      left: null,
+      right: {
+        pose: { position: { x: 0, y: 1.5, z: 0 } },
+        thumbstick: { x, y },
+        buttons: { a: false, b: false },
+        squeezeValue: 0,
+      },
+    },
+  };
+}
+
 describe("VRNavigationController — layered always-on model", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -83,22 +99,40 @@ describe("VRNavigationController — layered always-on model", () => {
     expect(result.position).toBeNull();
   });
 
-  it("WALK mode locks vertical movement; FLY allows it", () => {
-    // Vertical input comes from the A button (see VRFlyMode._getMovementInput).
-    // Combine with forward stick so overall velocity isn't exactly zero (the
-    // A8 idle deadband would otherwise null out `position` entirely and there
-    // would be no y to compare) — this isolates WALK's ground-lock from A8.
+  it("left stick flies (A gains altitude); right stick walks and never leaves the ground", () => {
+    // Walk and fly are no longer modes — both sticks are live every frame. The
+    // LEFT stick is the fly instance (A/B change altitude); the RIGHT stick is
+    // the ground-locked walk instance.
     const flyC = makeController().controller;
     let flyResult;
     for (let i = 0; i < 10; i++) flyResult = flyC.update(leftStick({ a: true, y: -1 }), {}, 0.016);
-    expect(Math.abs(flyResult.position.y)).toBeGreaterThan(0);
+    expect(flyResult.position.y).toBeGreaterThan(0);
 
     const walkC = makeController().controller;
-    walkC.setMode(EXPLORATION_MODES.WALK);
     let walkResult;
-    for (let i = 0; i < 10; i++) walkResult = walkC.update(leftStick({ a: true, y: -1 }), {}, 0.016);
+    for (let i = 0; i < 10; i++) walkResult = walkC.update(rightStick({ y: -1 }), {}, 0.016);
     expect(walkResult.position).not.toBeNull();
-    expect(walkResult.position.y).toBeCloseTo(0, 6);
+    expect(walkResult.position.y).toBe(0);
+  });
+
+  it("both sticks at once compose additively", () => {
+    const both = {
+      headPose: { orientation: { x: 0, y: 0, z: 0, w: 1 } },
+      controllers: {
+        left: leftStick({ y: -1 }).controllers.left,
+        right: rightStick({ y: -1 }).controllers.right,
+      },
+    };
+    const c = makeController().controller;
+    let res;
+    for (let i = 0; i < 10; i++) res = c.update(both, {}, 0.016);
+
+    const flyOnly = makeController().controller;
+    let f;
+    for (let i = 0; i < 10; i++) f = flyOnly.update(leftStick({ y: -1 }), {}, 0.016);
+
+    // Neither stick wins — the combined travel exceeds either alone.
+    expect(Math.abs(res.position.z)).toBeGreaterThan(Math.abs(f.position.z));
   });
 
   it("snap-turns once per flick and re-arms after the stick returns to center", () => {
@@ -159,9 +193,22 @@ describe("VRNavigationController — layered always-on model", () => {
     expect(vrManager.applySnapTurn).toHaveBeenCalledWith(-1, Math.PI / 4, { x: 1, y: 1.6, z: 2 });
   });
 
-  // The selected mode decides what the TRIGGER does. Object-move used to run on
-  // ANY free trigger regardless of mode, so the dataset could be dragged by
-  // accident at any time and the Move/Move Obj buttons changed nothing.
+  // Carrying the dataset is the GRIP+TRIGGER chord, available from any state —
+  // no mode switch needed. A bare trigger stays free for tools and the menu;
+  // a bare grip pulls the world.
+  function gripAndTriggerHeld() {
+    const s = triggerHeld();
+    s.controllers.right.squeezeValue = 1;
+    return s;
+  }
+
+  function gripOnlyHeld() {
+    const s = triggerHeld();
+    s.controllers.right.squeezeValue = 1;
+    s.controllers.right.triggerPressed = false;
+    return s;
+  }
+
   function triggerHeld() {
     return {
       headPose: { orientation: { x: 0, y: 0, z: 0, w: 1 } },
@@ -178,63 +225,41 @@ describe("VRNavigationController — layered always-on model", () => {
     };
   }
 
-  it("trigger drives object-move ONLY in MOVE_OBJECT mode", () => {
+  it("grip+trigger carries the dataset; a bare trigger leaves it for tools", () => {
     const { controller } = makeController();
-    // Mirror production: VRExplorationManager binds world-grab to GRIP, so the
-    // trigger is free to drive the mode layer. With the default (trigger)
-    // predicate the trigger would engage world-grab and suppress it.
-    controller.setWorldGrabEngagement((h) => (h?.squeezeValue || 0) > 0.7);
     const spy = vi.spyOn(controller._objectMove, "update");
 
-    controller.setMode(EXPLORATION_MODES.FLY);
     controller.update(triggerHeld(), {}, 0.016);
-    expect(spy, "FLY must leave the trigger free for tools/menu").not.toHaveBeenCalled();
+    expect(spy, "a bare trigger must stay free for tools/menu").not.toHaveBeenCalled();
 
-    controller.setMode(EXPLORATION_MODES.MOVE_OBJECT);
-    controller.update(triggerHeld(), {}, 0.016);
+    controller.update(gripAndTriggerHeld(), {}, 0.016);
     expect(spy).toHaveBeenCalled();
   });
 
-  it("trigger drives teleport ONLY in TELEPORT mode, and arms _enableTeleport", () => {
+  it("grip alone pulls the world and never carries the dataset", () => {
     const { controller } = makeController();
-    // Mirror production: VRExplorationManager binds world-grab to GRIP, so the
-    // trigger is free to drive the mode layer. With the default (trigger)
-    // predicate the trigger would engage world-grab and suppress it.
-    controller.setWorldGrabEngagement((h) => (h?.squeezeValue || 0) > 0.7);
-    const spy = vi.spyOn(controller._teleportMode, "update");
-
-    controller.setMode(EXPLORATION_MODES.WALK);
-    expect(controller._enableTeleport).toBe(false);
-    controller.update(triggerHeld(), {}, 0.016);
-    expect(spy).not.toHaveBeenCalled();
-
-    // Previously _enableTeleport came only from a constructor option the
-    // manager never passed, so teleport could never run at all.
-    controller.setMode(EXPLORATION_MODES.TELEPORT);
-    expect(controller._enableTeleport).toBe(true);
-    controller.update(triggerHeld(), {}, 0.016);
-    expect(spy).toHaveBeenCalled();
-  });
-
-  it("suppresses object-move while world-grabbing (grip owns the frame)", () => {
-    const { controller } = makeController();
-    // World-grab engages on grip (squeeze); object-move on trigger.
-    controller.setWorldGrabEngagement((h) => (h?.squeezeValue || 0) > 0.7);
+    // Mirror production's predicate: grip engages world-grab, but NOT when the
+    // trigger is also held — that combination is the carry chord instead, so
+    // the two can never run on the same frame.
+    controller.setWorldGrabEngagement(
+      (h) => (h?.squeezeValue || 0) > 0.7 && h?.triggerPressed !== true
+    );
     const objSpy = vi.spyOn(controller._objectMove, "update");
-    const skipSpy = vi.spyOn(controller._objectMove, "onFrameSkipped");
 
-    const gripAndTrigger = {
-      headPose: { orientation: { x: 0, y: 0, z: 0, w: 1 } },
-      controllers: {
-        left: null,
-        right: { pose: { position: { x: 0, y: 1.5, z: 0 } }, squeezeValue: 1, triggerPressed: true, thumbstick: { x: 0, y: 0 } },
-      },
-    };
-    controller.update(gripAndTrigger, {}, 0.016); // rising edge — starts grab
-    controller.update(gripAndTrigger, {}, 0.016); // grabbing
+    controller.update(gripOnlyHeld(), {}, 0.016); // rising edge — starts grab
+    controller.update(gripOnlyHeld(), {}, 0.016); // grabbing
 
     expect(controller._worldGrab.isGrabbing()).toBe(true);
     expect(objSpy).not.toHaveBeenCalled();
-    expect(skipSpy).toHaveBeenCalled();
+  });
+
+  it("the carry chord does not also start a world grab", () => {
+    const { controller } = makeController();
+    controller.setWorldGrabEngagement(
+      (h) => (h?.squeezeValue || 0) > 0.7 && h?.triggerPressed !== true
+    );
+    controller.update(gripAndTriggerHeld(), {}, 0.016);
+    controller.update(gripAndTriggerHeld(), {}, 0.016);
+    expect(controller._worldGrab.isGrabbing()).toBe(false);
   });
 });

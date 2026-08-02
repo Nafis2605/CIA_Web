@@ -1,10 +1,9 @@
 // src/core/vr/navigation/VRNavigationController.js
-// Orchestrates VR navigation modes (fly, teleport, walk, scale)
+// Orchestrates VR navigation layers (scale/twist, world-grab, walk+fly, object-move)
 
 import { vr as log } from "@Utils/logger.js";
 import { EXPLORATION_MODES } from "@Core/data/models/VRExplorationSession.js";
 import { VRFlyMode } from "./VRFlyMode.js";
-import { VRTeleportMode } from "./VRTeleportMode.js";
 import { VRGrabMode } from "./VRGrabMode.js";
 import { VRObjectMoveMode } from "./VRObjectMoveMode.js";
 import { VRScaleController } from "./VRScaleController.js";
@@ -21,36 +20,44 @@ const DEFAULT_SNAP_TURN_DEGREES = 45;
  * this before a VR session (and its VRNavigationController) exists.
  * @type {Readonly<Record<string, {name:string, icon:string, description:string, controls:string}>>}
  */
+// Walk and fly are no longer modes — both sticks are live at all times — so
+// every entry describes the SAME control set. The keys are kept because
+// persisted session rows still carry these values (see setMode).
+const UNIVERSAL_CONTROLS =
+  "Right stick: walk where you point | Left stick: fly along your aim | " +
+  "Right stick L/R: snap turn | Grip: pull world | Grip+trigger: carry data | " +
+  "Two-hand: scale/twist";
+
 export const NAVIGATION_MODE_INFO = Object.freeze({
   [EXPLORATION_MODES.FLY]: {
-    name: "Fly",
+    name: "Explore",
     icon: "fly",
-    description: "Free movement in all directions; trigger free for tools",
-    controls: "Left stick: fly | Right stick: snap turn | Grip: pull world | Two-hand: scale/twist",
+    description: "Walk on the right stick, fly on the left; trigger free for tools",
+    controls: UNIVERSAL_CONTROLS,
   },
   [EXPLORATION_MODES.TELEPORT]: {
-    name: "Teleport",
-    icon: "teleport",
-    description: "Point and jump to a spot on the data",
-    controls: "Trigger: aim arc, release to jump | Left stick: fly | Grip: pull world | Two-hand: scale/twist",
+    name: "Explore",
+    icon: "fly",
+    description: "Walk on the right stick, fly on the left; trigger free for tools",
+    controls: UNIVERSAL_CONTROLS,
   },
   [EXPLORATION_MODES.WALK]: {
-    name: "Walk",
+    name: "Explore",
     icon: "footprints",
-    description: "Ground-locked movement; trigger free for tools",
-    controls: "Left stick: walk (stays level) | Right stick: snap turn | Grip: pull world | Two-hand: scale/twist",
+    description: "Walk on the right stick, fly on the left; trigger free for tools",
+    controls: UNIVERSAL_CONTROLS,
   },
   [EXPLORATION_MODES.GRAB]: {
-    name: "Move",
+    name: "Explore",
     icon: "move",
-    description: "Pull the world to you; trigger free for tools",
-    controls: "Grip: pull world | Left stick: fly | Right stick: snap turn | Two-hand: scale/twist",
+    description: "Walk on the right stick, fly on the left; trigger free for tools",
+    controls: UNIVERSAL_CONTROLS,
   },
   [EXPLORATION_MODES.MOVE_OBJECT]: {
     name: "Move Object",
     icon: "move",
     description: "Reposition the dataset for all collaborators",
-    controls: "Trigger: drag the dataset | Left stick: fly | Grip: pull world | Two-hand: scale/twist",
+    controls: UNIVERSAL_CONTROLS,
   },
 });
 
@@ -80,10 +87,22 @@ export class VRNavigationController {
     this._vrContext = vrContext;
     this._vrManager = options.vrManager;
 
-    // Layered navigation modes
-    const raycastToScene = this._raycastToScene.bind(this);
-    this._flyMode = new VRFlyMode(vrContext); // used by FLY + WALK
-    this._teleportMode = new VRTeleportMode(vrContext, { raycastToScene });
+    // Locomotion: two always-live instances of the same class, so there is no
+    // walk-vs-fly mode to switch between and their deltas simply add.
+    //   FLY  — left stick, full 3D along the LEFT controller's ray, strafe on X.
+    //   WALK — right stick, ground-locked along the RIGHT controller's ray
+    //          projected to the floor. No strafe: right X is snap turn, so you
+    //          steer by pointing.
+    this._flyMode = new VRFlyMode(vrContext, {
+      hand: "left",
+      planar: false,
+      strafe: true,
+    });
+    this._walkMode = new VRFlyMode(vrContext, {
+      hand: "right",
+      planar: true,
+      strafe: false,
+    });
 
     // World-grab uses grip engagement (injected by VRExplorationManager)
     // Constructor will pass { isEngaged: gripPredicate }; see setWorldGrabEngagement.
@@ -100,7 +119,6 @@ export class VRNavigationController {
     // Navigation mode state
     this._activeMode = null;
     this._activeModeId = null;
-    this._enableTeleport = options.enableTeleport || false;
 
     // Snap-turn state. The step is read ONCE at construction (not on every
     // frame) from the VR accessibility settings persisted by
@@ -112,15 +130,11 @@ export class VRNavigationController {
     this._lastRightStickX = 0;
     this._snapTurnRad = this._resolveSnapTurnRad(readVRAccessibilitySettings());
 
-    // Activate the layers that gate their update() on _isActive — VRFlyMode and
-    // VRTeleportMode both short-circuit unless activated. World-grab, object-move
-    // and scale don't gate on activation. Teleport is only *invoked* when the
-    // teleport toggle is on (see update()), so activating it here is harmless.
+    // Both locomotion instances gate their update() on _isActive.
     this._flyMode.activate();
-    this._teleportMode.activate();
+    this._walkMode.activate();
 
-    // Set default mode (affects FLY vs WALK ground-lock; locomotion is always-on)
-    this.setMode(session.defaultExplorationMode || EXPLORATION_MODES.FLY);
+    this.setMode(session.defaultExplorationMode || EXPLORATION_MODES.GRAB);
   }
 
   /**
@@ -135,22 +149,24 @@ export class VRNavigationController {
   }
 
   /**
-   * In layered always-on mode, the "active mode" now controls only the
-   * locomotion character (FLY or WALK ground-locking), not the exclusive grab.
+   * Retained for API/persistence compatibility only.
+   *
+   * Locomotion no longer has modes: fly (left stick) and walk (right stick)
+   * are both live every frame, and carrying the dataset is the grip+trigger
+   * chord rather than a mode. The FLY/WALK/TELEPORT enum values still arrive
+   * here from persisted session rows (`default_exploration_mode`), so they are
+   * accepted and normalised rather than rejected.
    *
    * @param {string} modeId - One of EXPLORATION_MODES
    */
   setMode(modeId) {
-    if (this._activeModeId === modeId) return;
-    this._activeModeId = modeId;
-    // WALK ground-locks the always-on locomotion; every other mode frees Y.
-    this._flyMode.setGroundLocked(modeId === EXPLORATION_MODES.WALK);
-    // Teleport is driven by the SELECTED MODE, not a constructor flag. It used
-    // to read only from options.enableTeleport, which VRExplorationManager never
-    // passed — so teleport could never run even while the status line claimed
-    // it was active. Now picking the Teleport mode genuinely arms it.
-    this._enableTeleport = modeId === EXPLORATION_MODES.TELEPORT;
-    log.debug(`Navigation mode changed to: ${modeId}`);
+    const normalized =
+      modeId === EXPLORATION_MODES.MOVE_OBJECT
+        ? EXPLORATION_MODES.MOVE_OBJECT
+        : EXPLORATION_MODES.GRAB;
+    if (this._activeModeId === normalized) return;
+    this._activeModeId = normalized;
+    log.debug(`Navigation mode changed to: ${normalized} (requested: ${modeId})`);
   }
 
   /**
@@ -205,6 +221,13 @@ export class VRNavigationController {
       if (scaleResult.newRotation != null) {
         result.vrRotation = scaleResult.newRotation;
       }
+      // The scale gesture also moves vrOrigin, so the dataset grows about the
+      // point between the user's hands instead of about the XR origin (which
+      // sent it flying off across the room and overhead). Nothing else writes
+      // position on this frame — the layers below are all suppressed.
+      if (scaleResult.position) {
+        result.position = scaleResult.position;
+      }
       // Signal all other layers they're suppressed so re-anchor on resume
       this._worldGrab.onFrameSkipped?.();
       this._flyMode.onFrameSkipped?.();
@@ -229,52 +252,76 @@ export class VRNavigationController {
 
     if (grabOwnsFrame) {
       // While pulling the world, don't also stick-locomote (would fight the
-      // grab for vrOrigin). Bleed fly velocity so it doesn't lurch on release.
+      // grab for vrOrigin). Bleed velocity so it doesn't lurch on release.
       this._flyMode.onFrameSkipped?.();
+      this._walkMode.onFrameSkipped?.();
     } else {
-      // --- Layer 3: Locomotion (left stick) + snap-turn (right stick) ---
+      // --- Layer 3: Locomotion (both sticks) + snap-turn (right stick X) ---
+      //
+      // Fly and walk are BOTH live, so they return deltas rather than absolute
+      // positions — two absolute positions would overwrite each other and one
+      // stick would silently win. Summing lets the user fly forward while
+      // walking sideways, and keeps each instance's smoothing independent.
       const flyResult = this._flyMode.update(inputState, frame, deltaTime);
-      if (flyResult?.position) {
-        result.position = flyResult.position;
+      const walkResult = this._walkMode.update(inputState, frame, deltaTime);
+      const fly = flyResult?.delta;
+      const walk = walkResult?.delta;
+
+      if (fly || walk) {
+        const o = this._vrContext.vrOrigin || [0, 0, 0];
+        result.position = {
+          x: o[0] + (fly?.x || 0) + (walk?.x || 0),
+          y: o[1] + (fly?.y || 0) + (walk?.y || 0),
+          z: o[2] + (fly?.z || 0) + (walk?.z || 0),
+        };
       }
 
-      // Snap-turn on right-stick X flick (always-on).
+      // Snap-turn on right-stick X flick (always-on). Walk deliberately does
+      // not strafe, so the right stick's X axis is free for this.
       if (this._vrManager) {
         this._updateSnapTurn(inputState);
       }
     }
 
-    // --- Layer 4: the TRIGGER action, decided by the SELECTED MODE ---
+    // --- Layer 4: object-move on GRIP + TRIGGER, always available ---
     //
-    //   MOVE_OBJECT → trigger drags the shared dataset transform
-    //   TELEPORT    → trigger aims the arc and commits on release
-    //   FLY/WALK/GRAB → trigger does NOTHING here, staying free for tools and
-    //                   the spatial menu
+    // Grip alone pulls the world (layer 2); grip AND trigger on the same hand
+    // picks up the dataset itself. Making it a chord rather than a mode means
+    // the user can carry the data without a trip to the menu — which is what
+    // they reached for two grips to do — while a bare trigger stays free for
+    // tools and the spatial menu.
     //
-    // Previously object-move ran on ANY free trigger regardless of mode, so the
-    // dataset could be dragged by accident at any time and the Move/Move Obj
-    // buttons changed nothing observable. Gating on _activeModeId is what makes
-    // those mode buttons actually do their job.
-    //
-    // The manager strips the trigger from this input when a tool is active or a
-    // menu is hovered, so this only ever sees a "free" trigger. Both actions are
-    // suppressed while world-grabbing so a simultaneous grip+trigger can't drive
-    // two grabs at once.
-    if (grabOwnsFrame) {
-      this._objectMove.onFrameSkipped?.();
-    } else if (this._activeModeId === EXPLORATION_MODES.MOVE_OBJECT) {
+    // The manager strips the trigger from this input when a tool is active or
+    // a menu is hovered, so this only ever sees a "free" trigger. The grip
+    // predicate excludes trigger-held hands (see setWorldGrabEngagement), so
+    // the chord routes here instead of driving a world grab — the two can
+    // never run at once.
+    if (this._isObjectMoveChord(inputState)) {
       this._objectMove.update(inputState);
-    } else if (this._enableTeleport && this._teleportMode) {
-      const teleResult = this._teleportMode.update(inputState, frame, deltaTime);
-      if (teleResult?.position) result.position = teleResult.position;
-      if (teleResult?.teleporting) result.teleporting = true;
     } else {
-      // Trigger is free this frame — keep the object-move mode's internal
-      // edge state from going stale so re-entering MOVE_OBJECT re-anchors.
+      // Keep the object-move mode's internal edge state from going stale so
+      // the next chord re-anchors instead of jumping.
       this._objectMove.onFrameSkipped?.();
     }
 
     return result;
+  }
+
+  /**
+   * True when either hand holds grip AND trigger together — the "carry the
+   * dataset" chord. Deliberately checks the raw pair rather than a mode flag
+   * so it works from any navigation state.
+   * @private
+   */
+  _isObjectMoveChord(inputState) {
+    const held = (c) =>
+      !!c &&
+      c.triggerPressed === true &&
+      (c.isTransientPointer ? true : (c.squeezeValue || 0) > 0.4);
+    return (
+      held(inputState?.controllers?.left) ||
+      held(inputState?.controllers?.right)
+    );
   }
 
   /**
@@ -320,49 +367,6 @@ export class VRNavigationController {
   }
 
   /**
-   * Raycast an XR-space origin/direction against the dataset, returning the
-   * hit back in XR space so VRTeleportMode can compare it against its
-   * (XR-space) parabolic arc points. Direction is rotation-only (unaffected
-   * by the vrScale/vrOrigin translation+scale offset), matching
-   * vrPlaneMath.js's convention for controller-forward vectors.
-   *
-   * @param {{x:number,y:number,z:number}} originXR
-   * @param {{x:number,y:number,z:number}} directionXR - unit vector
-   * @returns {{position:{x,y,z}, valid:boolean, distance:number}|null}
-   * @private
-   */
-  _raycastToScene(originXR, directionXR) {
-    const handler = this._vrContext.handler;
-    if (!handler?.raycastVR) return null;
-
-    const vrScale = this._vrContext.vrScale || 1.0;
-    const vrOrigin = this._vrContext.vrOrigin || [0, 0, 0];
-    const [ox, oy, oz] = mapXRPointToData(originXR, vrScale, vrOrigin);
-
-    const hit = handler.raycastVR(this._vrContext, {
-      origin: { x: ox, y: oy, z: oz },
-      direction: directionXR,
-    });
-    if (!hit?.hit) return null;
-
-    // Convert the data-space hit back to XR space: xrPos = (dataPos - vrOrigin) * vrScale
-    const position = {
-      x: (hit.position.x - vrOrigin[0]) * vrScale,
-      y: (hit.position.y - vrOrigin[1]) * vrScale,
-      z: (hit.position.z - vrOrigin[2]) * vrScale,
-    };
-    const dx = position.x - originXR.x;
-    const dy = position.y - originXR.y;
-    const dz = position.z - originXR.z;
-
-    return {
-      position,
-      valid: true,
-      distance: Math.sqrt(dx * dx + dy * dy + dz * dz),
-    };
-  }
-
-  /**
    * Get current VR scale
    */
   getScale() {
@@ -374,8 +378,8 @@ export class VRNavigationController {
    *
    * @param {number} scale - New scale value
    */
-  setScale(scale) {
-    this._scaleController.setScale(scale);
+  setScale(scale, pivotXR = null) {
+    this._scaleController.setScale(scale, pivotXR);
   }
 
   /**
@@ -403,7 +407,7 @@ export class VRNavigationController {
    */
   cleanup() {
     this._flyMode?.cleanup?.();
-    this._teleportMode?.cleanup?.();
+    this._walkMode?.cleanup?.();
     this._worldGrab?.cleanup?.();
     this._objectMove?.cleanup?.();
     this._scaleController?.cleanup?.();

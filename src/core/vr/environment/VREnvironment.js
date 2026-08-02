@@ -75,6 +75,12 @@ export class VREnvironment {
     this._floorSolidActor = null;
     this._wallActor = null;
     this._markerActors = [];
+    // World-anchor state (see setWorldAnchor). _refPoint is the data-space
+    // point the floor lattice is phase-anchored to; _markerAnchors are fixed
+    // data-space positions for the cardinal posts.
+    this._refPoint = null;
+    this._markerAnchors = null;
+    this._lastSnap = null;
     this._savedBackground = null;
     this._lastVrScale = null;
     this._lastVrOrigin = null;
@@ -130,8 +136,15 @@ export class VREnvironment {
     const scale = vrScale || 1.0;
     const origin = vrOrigin || [0, 0, 0];
 
+    // The floor's PHASE is world-locked, so the dirty-check has to run against
+    // the snapped value, not the raw origin — see below.
+    const snapped = this._snapToLattice(origin, scale);
+
     if (
       this._lastVrScale === scale &&
+      this._lastSnap &&
+      this._lastSnap[0] === snapped[0] &&
+      this._lastSnap[2] === snapped[2] &&
       this._lastVrOrigin &&
       this._lastVrOrigin[0] === origin[0] &&
       this._lastVrOrigin[1] === origin[1] &&
@@ -141,13 +154,90 @@ export class VREnvironment {
     }
     this._lastVrScale = scale;
     this._lastVrOrigin = [origin[0], origin[1], origin[2]];
+    this._lastSnap = snapped;
 
     const invScale = 1 / scale;
-    const actors = this._allActors();
-    for (const actor of actors) {
-      actor.setPosition(origin[0], origin[1], origin[2]);
+
+    // --- Floor: world-locked PHASE, user-locked extent ---------------------
+    //
+    // This is what makes stick locomotion read as "I moved" rather than "the
+    // data slid past me". Previously every environment actor was placed at
+    // vrOrigin and scaled by 1/vrScale, which EXACTLY cancels the camera map
+    // (a vertex at local metre L lands at physical xr = L identically) — the
+    // grid was welded to the user's own space, so travelling produced zero
+    // motion parallax and the brain attributed the relative motion to the
+    // dataset instead.
+    //
+    // Fully world-locking the floor is worse: its cell size would then scale
+    // with the zoom, so at high zoom you get a featureless plane with no
+    // near-field detail at all. Instead keep the slab's physical size and 1 m
+    // cell size constant, and world-lock only its phase. Because setScale(1/s)
+    // makes one local unit exactly one physical metre at any zoom, snapping
+    // the slab's data-space position to the 1-physical-metre lattice pins
+    // every grid LINE to a fixed data point while the slab itself stays within
+    // half a cell of the user. Lines stream past correctly; cells stay 1 m.
+    for (const actor of [this._floorSolidActor, this._floorGridActor]) {
+      if (!actor) continue;
+      actor.setPosition(snapped[0], origin[1], snapped[2]);
       actor.setScale(invScale, invScale, invScale);
     }
+
+    // --- Cardinal markers: fully world-locked ------------------------------
+    // These are visibly distinct posts, not background, so leaving them
+    // user-locked would directly contradict the floor's parallax. Pinned to
+    // fixed data-space points, scaled for constant apparent size.
+    for (let i = 0; i < this._markerActors.length; i++) {
+      const actor = this._markerActors[i];
+      const anchor = this._markerAnchors?.[i];
+      if (!actor) continue;
+      if (anchor) {
+        actor.setPosition(anchor[0], origin[1], anchor[2]);
+      } else {
+        actor.setPosition(origin[0], origin[1], origin[2]);
+      }
+      actor.setScale(invScale, invScale, invScale);
+    }
+
+    // --- Walls: deliberately user-locked -----------------------------------
+    // An unlit, untextured, single-colour cylinder — visually indistinguishable
+    // from the background. A static surround REDUCES vection, so keeping it
+    // pinned to the user is a comfort benefit rather than a conflicting cue.
+    if (this._wallActor) {
+      this._wallActor.setPosition(origin[0], origin[1], origin[2]);
+      this._wallActor.setScale(invScale, invScale, invScale);
+    }
+  }
+
+  /**
+   * Snap a data-space origin to the 1-physical-metre lattice, anchored at the
+   * session's reference point. Returns [x, y, z] with y passed through.
+   * @private
+   */
+  _snapToLattice(origin, scale) {
+    const rx = this._refPoint ? this._refPoint[0] : 0;
+    const rz = this._refPoint ? this._refPoint[2] : 0;
+    return [
+      rx + Math.round((origin[0] - rx) * scale) / scale,
+      origin[1],
+      rz + Math.round((origin[2] - rz) * scale) / scale,
+    ];
+  }
+
+  /**
+   * Anchor the world-locked environment pieces to the dataset's frame.
+   * Called once the dataset's real placement is known (VRExplorationManager's
+   * pose-relative pass) and again whenever the data bounds change.
+   *
+   * @param {{refPoint?: number[], markerAnchors?: number[][]}} anchor
+   */
+  setWorldAnchor(anchor = {}) {
+    if (Array.isArray(anchor.refPoint)) this._refPoint = [...anchor.refPoint];
+    if (Array.isArray(anchor.markerAnchors)) {
+      this._markerAnchors = anchor.markerAnchors.map((p) => [...p]);
+    }
+    // Force the next updateTransform to reposition rather than dirty-check out.
+    this._lastSnap = null;
+    this._lastVrOrigin = null;
   }
 
   dispose() {

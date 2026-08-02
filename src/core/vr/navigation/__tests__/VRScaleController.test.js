@@ -258,3 +258,87 @@ describe("VRScaleController — A2c incremental twist + separation guards", () =
     expect(ctx.vrRotation).toBe(0);
   });
 });
+
+describe("VRScaleController — scale pivots under the hands (grounded)", () => {
+  // The dataset must grow ABOUT THE USER'S HANDS and stay on the floor.
+  //
+  // Physical position of a data point is xr(P) = (P - vrOrigin) * vrScale.
+  // Scaling with vrOrigin fixed is a homothety about the XR origin, so the
+  // dataset rushes away from the floor point under the user AND rises. The
+  // controller now also returns a vrOrigin that keeps the gesture's pivot
+  // pinned, with the pivot taken on the floor plane so vrOrigin[1] — and thus
+  // the grounding invariant — is untouched.
+  function xr(dataPoint, ctx) {
+    return [
+      (dataPoint[0] - ctx.vrOrigin[0]) * ctx.vrScale,
+      (dataPoint[1] - ctx.vrOrigin[1]) * ctx.vrScale,
+      (dataPoint[2] - ctx.vrOrigin[2]) * ctx.vrScale,
+    ];
+  }
+
+  function runGesture(ctx, startSep, endSep) {
+    const c = new VRScaleController(ctx);
+    const h = (x) => trackedHand({ x, y: 1.1, z: -0.4 }, { squeezeValue: 0.8 });
+    // Frame 1 anchors the gesture.
+    c.update(input(h(-startSep / 2), h(startSep / 2)), 0.016);
+    // Drive to the target separation over enough frames to settle the smoothing.
+    let res;
+    for (let i = 0; i < 400; i++) {
+      res = c.update(input(h(-endSep / 2), h(endSep / 2)), 0.016);
+      if (res.position) {
+        ctx.vrOrigin = [res.position.x, res.position.y, res.position.z];
+      }
+    }
+    return res;
+  }
+
+  it("keeps the point under the hands fixed in physical space while scaling", () => {
+    const ctx = { vrScale: 1, vrRotation: 0, vrOrigin: [0, 0, 0] };
+    // Pivot is the floor point under the hand midpoint: hands are centred on
+    // x = 0, z = -0.4, so the pivot is XR (0, 0, -0.4).
+    const pivotXR = [0, 0, -0.4];
+    const pivotData = [
+      pivotXR[0] / ctx.vrScale + ctx.vrOrigin[0],
+      pivotXR[1] / ctx.vrScale + ctx.vrOrigin[1],
+      pivotXR[2] / ctx.vrScale + ctx.vrOrigin[2],
+    ];
+
+    runGesture(ctx, 0.3, 0.9);
+
+    expect(ctx.vrScale).not.toBeCloseTo(1, 3); // the scale really did change
+    const after = xr(pivotData, ctx);
+    expect(after[0]).toBeCloseTo(pivotXR[0], 6);
+    expect(after[2]).toBeCloseTo(pivotXR[2], 6);
+  });
+
+  it("never changes vrOrigin[1], so a grounded dataset stays on the floor", () => {
+    // dataBounds[2] = 0 grounded at vrOrigin[1] = 0.
+    const ctx = { vrScale: 1, vrRotation: 0, vrOrigin: [0, 0, 0] };
+    runGesture(ctx, 0.9, 0.2); // squeeze together == zoom in hard
+    expect(ctx.vrOrigin[1]).toBe(0);
+    expect((0 - ctx.vrOrigin[1]) * ctx.vrScale).toBeCloseTo(0, 10);
+  });
+
+  it("setScale with a pivot resizes in place instead of hurling the data away", () => {
+    const ctx = { vrScale: 1, vrRotation: 0, vrOrigin: [0, 0, 0] };
+    const c = new VRScaleController(ctx);
+    const pivotXR = [0.5, 0, -2];
+    const pivotData = [0.5, 0, -2]; // vrScale 1, vrOrigin 0 => same numbers
+
+    c.setScale(4, pivotXR);
+
+    expect(ctx.vrScale).toBe(4);
+    const after = xr(pivotData, ctx);
+    expect(after[0]).toBeCloseTo(pivotXR[0], 8);
+    expect(after[2]).toBeCloseTo(pivotXR[2], 8);
+    expect(ctx.vrOrigin[1]).toBe(0); // still grounded
+  });
+
+  it("setScale without a pivot leaves vrOrigin alone (back-compat)", () => {
+    const ctx = { vrScale: 1, vrRotation: 0, vrOrigin: [1, 2, 3] };
+    const c = new VRScaleController(ctx);
+    c.setScale(2);
+    expect(ctx.vrScale).toBe(2);
+    expect(ctx.vrOrigin).toEqual([1, 2, 3]);
+  });
+});
