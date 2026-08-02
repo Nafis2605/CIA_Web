@@ -192,6 +192,62 @@ describe("VRSpatialMenuModel — layout & hit testing", () => {
   });
 });
 
+// A6: getButtonLayout() is called up to 4x/frame from VTKVRSpatialUI
+// (_currentRowCount, _layoutButtons, hitTest, getButtonStates) and rebuilds a
+// Map + fresh objects per button each time — memoised on the only three
+// fields the result depends on (_keyboardOpen, _activeToolId, _openDrawerId).
+describe("VRSpatialMenuModel — getButtonLayout() memoisation (A6)", () => {
+  let model;
+  beforeEach(() => {
+    model = new VRSpatialMenuModel(makeManager());
+  });
+
+  it("returns the identical array reference on repeated calls with unchanged state", () => {
+    const first = model.getButtonLayout();
+    const second = model.getButtonLayout();
+    expect(second).toBe(first);
+  });
+
+  it("returns a DIFFERENT reference after _activeToolId changes", () => {
+    const before = model.getButtonLayout();
+    model.activate("annotate"); // activates the annotate tool
+    const after = model.getButtonLayout();
+    expect(after).not.toBe(before);
+  });
+
+  it("returns a DIFFERENT reference after _openDrawerId changes", () => {
+    const before = model.getButtonLayout();
+    model.activate("filters"); // opens the filters drawer
+    const after = model.getButtonLayout();
+    expect(after).not.toBe(before);
+  });
+
+  it("returns a DIFFERENT reference after _keyboardOpen changes", () => {
+    const draft = { active: false, text: "", fallbackText: "Note" };
+    const draftModel = new VRSpatialMenuModel(makeManager({ getAnnotationDraft: vi.fn(() => draft) }));
+    const before = draftModel.getButtonLayout();
+
+    draft.active = true;
+    draftModel.syncFromManager(); // flips _keyboardOpen
+    const after = draftModel.getButtonLayout();
+    expect(after).not.toBe(before);
+  });
+
+  it("does not leak a stale cached layout across onSessionEnd/onSessionStart", () => {
+    model.activate("clip"); // adds the contextual row, primes the cache
+    const withContext = model.getButtonLayout();
+
+    model.onSessionEnd();
+    model.onSessionStart();
+    const fresh = model.getButtonLayout();
+
+    // Session end clears the active tool, so the fresh layout must be the
+    // plain static grid again — not the cached contextual-row layout.
+    expect(fresh).not.toBe(withContext);
+    expect(fresh).toHaveLength(VR_MENU_BUTTONS.length);
+  });
+});
+
 describe("VRSpatialMenuModel — action dispatch", () => {
   let manager;
   let model;

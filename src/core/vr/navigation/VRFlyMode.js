@@ -10,7 +10,15 @@ export class VRFlyMode {
     this._options = {
       baseSpeed: 2.0, // meters per second at scale 1.0
       boostMultiplier: 3.0,
-      deadzone: 0.15, // Thumbstick deadzone
+      // Thumbstick deadzone. Must be >= the worst-case resting drift on a
+      // diagonal, not just per-axis: the deadzone is applied to the RADIAL
+      // magnitude (see _getMovementInput), and a worn Quest 2 stick resting
+      // at (x, x) on both axes has magnitude x*sqrt(2). A per-axis-safe
+      // 0.15/0.15 rest point (each axis under the old 0.15 threshold) has
+      // hypot ~0.212, which used to pass the deadzone and produce a small
+      // but permanent unwanted drift. 0.2 covers a diagonal rest point of
+      // ~0.14/axis with margin.
+      deadzone: 0.2,
       // Exponential smoothing time constant (seconds) — dt-correct, unlike a
       // per-frame smoothing factor (see update()). -(1/72)/Math.log(0.9)
       // matches the feel of the old smoothing:0.9 at 72 Hz.
@@ -106,6 +114,28 @@ export class VRFlyMode {
       y: this._velocity.y + (targetVelocity.y - this._velocity.y) * alpha,
       z: this._velocity.z + (targetVelocity.z - this._velocity.z) * alpha,
     };
+
+    // Idle deadband: exponential decay toward a released stick's zero target
+    // asymptotically approaches {0,0,0} but never exactly reaches it, so
+    // `position` was ALWAYS non-null and vrContext.vrOrigin got a new
+    // (epsilon-different) value every frame forever. That permanently defeats
+    // VREnvironment.updateTransform's exact-float dirty check (see
+    // VREnvironment.js ~132-140), re-transforming all 7 environment actors
+    // every frame even when the user is standing still. Snap components below
+    // a noise floor (relative to this frame's speed) to exactly 0, and when
+    // all three are exactly zero, report no movement at all.
+    const idleThreshold = 1e-4 * speed;
+    if (Math.abs(this._velocity.x) < idleThreshold) this._velocity.x = 0;
+    if (Math.abs(this._velocity.y) < idleThreshold) this._velocity.y = 0;
+    if (Math.abs(this._velocity.z) < idleThreshold) this._velocity.z = 0;
+
+    if (
+      this._velocity.x === 0 &&
+      this._velocity.y === 0 &&
+      this._velocity.z === 0
+    ) {
+      return { position: null, orientation: null, isBoosting: false, speed: 0 };
+    }
 
     // Calculate position delta (data space, see scaledSpeed comment above)
     const positionDelta = {

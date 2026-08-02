@@ -229,12 +229,21 @@ class VRExplorationManager extends BaseManager {
     // (squeeze > 0.7), pinch on Vision Pro (triggerPressed). This keeps grip
     // dedicated to "pull the world for navigation" while trigger stays free
     // for object-move and the menu.
-    const gripPredicate = (hand) => {
+    //
+    // Schmitt trigger: engage high, release low. A single threshold made a grip
+    // resting near 0.7 chatter at frame rate — every OFF frame froze the world
+    // and suppressed fly, every ON frame re-anchored and discarded the hand
+    // travel since the last anchor, so the grab felt sticky and stopped
+    // tracking. The `engaged` argument is supplied by VRGrabMode, which knows
+    // whether the grab is currently active.
+    const GRIP_ENGAGE = 0.7;
+    const GRIP_RELEASE = 0.4;
+    const gripPredicate = (hand, engaged = false) => {
       if (!hand) return false;
-      // Vision Pro's transient-pointer is gripless (squeezeValue always 0)
+      // Vision Pro's transient-pointer is gripless (squeezeValue always 0) and
+      // its pinch is digital — no hysteresis needed or possible.
       if (hand.isTransientPointer) return hand.triggerPressed === true;
-      // Tracked controllers: use squeeze (grip button)
-      return (hand.squeezeValue || 0) > 0.7;
+      return (hand.squeezeValue || 0) > (engaged ? GRIP_RELEASE : GRIP_ENGAGE);
     };
     this._navigationController.setWorldGrabEngagement(gripPredicate);
 
@@ -1972,21 +1981,31 @@ class VRExplorationManager extends BaseManager {
       // sync, avatars, pointer broadcast — still read the raw poses).
       //
       // Isolated in its own try/catch (unlike the rest of this frame body,
-      // which shares one try/catch below): vrSpatialUI.update() is the
-      // newest, highest-risk per-frame call (canvas/texture work), and this
-      // whole method runs every frame — an uncaught throw here would repeat
-      // on every subsequent frame and stall nav/tools/avatar sync right along
-      // with the menu. Isolating it means a menu-only failure stays
-      // menu-only, and gets logged instead of silently freezing the session.
+      // which shares one try/catch below): vrSpatialUI.hitTest() is the
+      // newest, highest-risk per-frame call (canvas/texture work upstream of
+      // it in the same module), and this whole method runs every frame — an
+      // uncaught throw here would repeat on every subsequent frame and stall
+      // nav/tools/avatar sync right along with the menu. Isolating it means a
+      // menu-only failure stays menu-only, and gets logged instead of
+      // silently freezing the session.
+      //
+      // FRAME-ORDER CONTRACT: this is PHASE 1 (hitTest) of the menu's
+      // per-frame update, deliberately called here — before navigation below
+      // mutates vrContext.vrScale/vrOrigin — because it's pure XR-metre
+      // geometry (head/controller poses), entirely independent of that
+      // transform. PHASE 2 (layout, which DOES depend on the transform) runs
+      // later, after nav — see the vrSpatialUI.layout() call below
+      // vrEnvironment.updateTransform(). Splitting it this way fixes a
+      // one-frame placement lag: previously, calling the combined update()
+      // here meant the panel's actors were positioned using vrContext's
+      // transform from frame N-1 while the camera rendered frame N, so the
+      // panel would visibly swim against the world by up to a frame's worth
+      // of the user's locomotion/scale distance whenever they moved.
       let menuResult = null;
       try {
-        menuResult =
-          vrSpatialUI.update(inputState, {
-            vrScale: vrContext.vrScale,
-            vrOrigin: vrContext.vrOrigin,
-          }) || null;
+        menuResult = vrSpatialUI.hitTest(inputState) || null;
       } catch (e) {
-        log.error(`VR frame: vrSpatialUI.update failed — ${e?.message}`, e?.stack || e);
+        log.error(`VR frame: vrSpatialUI.hitTest failed — ${e?.message}`, e?.stack || e);
       }
       const menuHovering = !!menuResult?.hovering;
       const menuHand = menuResult?.hand || 'right';
@@ -2065,10 +2084,6 @@ class VRExplorationManager extends BaseManager {
         }
       }
 
-      // Keep the floor/environment anchored under the user as they
-      // teleport/fly/scale/follow (no-ops internally if nothing changed).
-      vrEnvironment.updateTransform(vrContext.vrScale, vrContext.vrOrigin);
-
       // B button (right controller) toggles isolation mode: pull the model
       // to room scale for walk-around inspection, press again to restore.
       const bPressed = inputState.controllers?.right?.buttons?.b || false;
@@ -2105,9 +2120,32 @@ class VRExplorationManager extends BaseManager {
       // Update avatar system
       vrAvatarSystem.update(deltaTime, inputState);
 
-      // NOTE: the in-scene tool menu was already updated at the top of the
-      // frame (before nav/tools) so its hit-test can gate their input — see
-      // the INPUT ARBITRATION block above.
+      // Everything that can mutate vrContext.vrScale/vrOrigin has now run:
+      // navigation, participant-follow, the B-button isolation toggle, and
+      // tool actions. Place the world-anchored in-scene geometry LAST, so it
+      // uses exactly the transform this frame's camera is about to render
+      // with.
+      //
+      // Keep the floor/environment anchored under the user as they
+      // teleport/fly/scale/follow (no-ops internally if nothing changed).
+      vrEnvironment.updateTransform(vrContext.vrScale, vrContext.vrOrigin);
+
+      // FRAME-ORDER CONTRACT (see the vrSpatialUI.hitTest() call above): this
+      // is PHASE 2 (layout) of the menu's per-frame update — placement only.
+      // hitTest ran at the top of the frame because it is pure XR-metre
+      // geometry and its result has to gate nav/tool input; layout runs here
+      // because it is the only half that depends on vrScale/vrOrigin.
+      // Previously the combined update() ran at the top, so the panel was
+      // positioned with frame N-1's transform while the camera rendered frame
+      // N — the panel visibly swam against the world by a frame's worth of
+      // the user's locomotion whenever they moved. Isolated in its own
+      // try/catch for the same reason as hitTest() — a menu-only placement
+      // failure must not stall the handler's draw.
+      try {
+        vrSpatialUI.layout({ vrScale: vrContext.vrScale, vrOrigin: vrContext.vrOrigin });
+      } catch (e) {
+        log.error(`VR frame: vrSpatialUI.layout failed — ${e?.message}`, e?.stack || e);
+      }
 
       // Let handler update VR rendering (synchronous stereo render — see
       // VTKInstanceHandler.updateVRExploration). Gets the tool-gated clone so a

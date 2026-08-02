@@ -4,12 +4,27 @@ import { VRScaleController } from "../VRScaleController.js";
 
 // A gripless (transient-pointer) hand: pinch shows up as triggerPressed, and
 // squeezeValue is always 0 — the exact profile that used to make scaling
-// impossible before the trigger-based detection.
+// impossible before the trigger-based detection. isTransientPointer: true is
+// what _isEngaged now uses to route to the trigger-based check (A2a) instead
+// of treating this as a tracked controller with squeeze always 0 (never
+// engaged).
 function pinchHand(pos, pressed = true) {
   return {
     pose: { position: pos },
     triggerPressed: pressed,
     squeezeValue: 0,
+    isTransientPointer: true,
+  };
+}
+
+// A Quest 2 tracked controller: no isTransientPointer, engages via squeeze
+// only (grip button), independent of triggerPressed (trigger is the
+// object-move gesture on tracked controllers, see VRExplorationManager).
+function trackedHand(pos, { squeezeValue = 0, triggerPressed = false } = {}) {
+  return {
+    pose: { position: pos },
+    triggerPressed,
+    squeezeValue,
   };
 }
 
@@ -93,5 +108,153 @@ describe("VRScaleController — two-hand pinch gesture", () => {
     );
     expect(res.scaling).toBe(false);
     expect(c.isScaling()).toBe(false);
+  });
+});
+
+describe("VRScaleController — A2a platform gate (tracked controller vs transient pointer)", () => {
+  it("does NOT engage when two tracked (non-transient-pointer) controllers pull both triggers with squeezeValue 0", () => {
+    const ctx = { vrScale: 1, vrRotation: 0 };
+    const c = new VRScaleController(ctx);
+    const res = c.update(
+      input(
+        trackedHand({ x: -0.2, y: 0, z: 0 }, { triggerPressed: true, squeezeValue: 0 }),
+        trackedHand({ x: 0.2, y: 0, z: 0 }, { triggerPressed: true, squeezeValue: 0 })
+      ),
+      0.016
+    );
+    expect(res.scaling).toBe(false);
+    expect(c.isScaling()).toBe(false);
+  });
+
+  it("engages when two tracked controllers squeeze past gripThreshold (0.7)", () => {
+    const ctx = { vrScale: 1, vrRotation: 0 };
+    const c = new VRScaleController(ctx);
+    const res = c.update(
+      input(
+        trackedHand({ x: -0.2, y: 0, z: 0 }, { squeezeValue: 0.8 }),
+        trackedHand({ x: 0.2, y: 0, z: 0 }, { squeezeValue: 0.8 })
+      ),
+      0.016
+    );
+    expect(res.scaling).toBe(true);
+  });
+
+  it("engages when a transient-pointer source pulls both triggers", () => {
+    const ctx = { vrScale: 1, vrRotation: 0 };
+    const c = new VRScaleController(ctx);
+    const res = c.update(
+      input(pinchHand({ x: -0.2, y: 0, z: 0 }), pinchHand({ x: 0.2, y: 0, z: 0 })),
+      0.016
+    );
+    expect(res.scaling).toBe(true);
+  });
+});
+
+describe("VRScaleController — A2b squeeze hysteresis", () => {
+  it("stays engaged when squeeze drops to 0.5 (below 0.7 engage, above 0.4 release), and ends at 0.3", () => {
+    const ctx = { vrScale: 1, vrRotation: 0 };
+    const c = new VRScaleController(ctx);
+
+    // Engage both hands above gripThreshold.
+    let res = c.update(
+      input(
+        trackedHand({ x: -0.2, y: 0, z: 0 }, { squeezeValue: 0.8 }),
+        trackedHand({ x: 0.2, y: 0, z: 0 }, { squeezeValue: 0.8 })
+      ),
+      0.016
+    );
+    expect(res.scaling).toBe(true);
+
+    // Drop to 0.5 — between release (0.4) and engage (0.7). Should stay engaged.
+    res = c.update(
+      input(
+        trackedHand({ x: -0.2, y: 0, z: 0 }, { squeezeValue: 0.5 }),
+        trackedHand({ x: 0.2, y: 0, z: 0 }, { squeezeValue: 0.5 })
+      ),
+      0.016
+    );
+    expect(res.scaling).toBe(true);
+    expect(c.isScaling()).toBe(true);
+
+    // Drop to 0.3 — below release threshold. Gesture should end.
+    res = c.update(
+      input(
+        trackedHand({ x: -0.2, y: 0, z: 0 }, { squeezeValue: 0.3 }),
+        trackedHand({ x: 0.2, y: 0, z: 0 }, { squeezeValue: 0.3 })
+      ),
+      0.016
+    );
+    expect(res.scaling).toBe(false);
+    expect(c.isScaling()).toBe(false);
+  });
+});
+
+describe("VRScaleController — A2c incremental twist + separation guards", () => {
+  it("accumulates twist past +/-180 degrees monotonically instead of wrapping", () => {
+    const ctx = { vrScale: 1, vrRotation: 0 };
+    const c = new VRScaleController(ctx);
+    const radius = 0.3; // hand separation well above MIN_TWIST_SEPARATION_M (0.15)
+
+    // Anchor the gesture at theta=0 in the same parameterization used by the
+    // sweep below (z-aligned hands => currentAngle = atan2(0, 2r) = 0), so
+    // the accumulated rotation directly tracks theta from the start.
+    c.update(
+      input(
+        pinchHand({ x: 0, y: 0, z: -radius }),
+        pinchHand({ x: 0, y: 0, z: radius })
+      ),
+      0.016
+    );
+
+    // Sweep the handlebar heading through many small steps, well past a full
+    // +/-180 degree turn from the start heading, and confirm the accumulated
+    // rotation increases monotonically (no snap-back / sign flip at the seam).
+    const steps = 40;
+    let prevRotation = 0;
+    let sawIncrease = false;
+    for (let i = 1; i <= steps; i++) {
+      // Sweep angle theta from just past 0 up through > 2*PI worth of
+      // heading change (parameterized so consecutive steps are small).
+      const theta = (i / steps) * 3 * Math.PI; // 3*PI total sweep
+      const x = radius * Math.sin(theta);
+      const z = radius * Math.cos(theta);
+      const res = c.update(
+        input(
+          pinchHand({ x: -x, y: 0, z: -z }),
+          pinchHand({ x, y: 0, z })
+        ),
+        0.016
+      );
+      if (i > 1) {
+        expect(res.newRotation).toBeGreaterThan(prevRotation - 0.5); // no full-turn snap-back
+        if (res.newRotation > prevRotation) sawIncrease = true;
+      }
+      prevRotation = res.newRotation;
+    }
+    // Total accumulated rotation should reflect the full sweep, i.e. exceed
+    // a single +/-PI wrap boundary — proof the frozen-baseline wrap is gone.
+    expect(Math.abs(prevRotation)).toBeGreaterThan(Math.PI);
+    expect(sawIncrease).toBe(true);
+  });
+
+  it("hands closer than MIN_TWIST_SEPARATION_M (0.15m) produce no rotation change", () => {
+    const ctx = { vrScale: 1, vrRotation: 0 };
+    const c = new VRScaleController(ctx);
+
+    // Anchor at a safe separation.
+    c.update(
+      input(pinchHand({ x: -0.2, y: 0, z: 0 }), pinchHand({ x: 0.2, y: 0, z: 0 })),
+      0.016
+    );
+
+    // Bring hands to within 0.1m (below the 0.15m twist guard) while also
+    // changing heading — rotation must not move even though scale still
+    // tracks distance.
+    const res = c.update(
+      input(pinchHand({ x: -0.05, y: 0, z: 0 }), pinchHand({ x: 0.05, y: 0, z: 0.02 })),
+      0.016
+    );
+    expect(res.newRotation).toBe(0);
+    expect(ctx.vrRotation).toBe(0);
   });
 });

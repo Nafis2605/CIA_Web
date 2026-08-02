@@ -4869,6 +4869,17 @@ console.log('Tools:', tools);
     // rotation hasn't changed.
     this._applyVRDataRotation(vrContext);
 
+    // Update controller visuals (hand/ray transforms + visibility) BEFORE the
+    // eye loop draws. This only mutates actor transforms/visibility — it does
+    // not read anything the eye loop computes (no renderer.getViewport() or
+    // other per-eye state) — so it's safe to run here. Doing it here instead
+    // of after the eye loop means the controller models and pointer ray use
+    // THIS frame's poses on THIS frame's draw; previously the call sat after
+    // the loop, so the actor transforms were only picked up by the NEXT
+    // frame's traverseAllPasses(), making the pointer ray render a full frame
+    // (~14 ms at 72 Hz) behind the hand the user is aiming with.
+    this._updateVRExplorationControllers(vrContext, inputState);
+
     // Bind the XR framebuffer and clear it once for both eyes. The clear
     // color matches VREnvironment's bright BG_BOTTOM so the surround reads as
     // a light room rather than the default black gl.clear().
@@ -4936,9 +4947,6 @@ console.log('Tools:', tools);
     // Reset the renderer viewport so nothing downstream inherits a half-screen
     // (per-eye) viewport.
     renderer.setViewport(0, 0, 1, 1);
-
-    // Update controller visuals
-    this._updateVRExplorationControllers(vrContext, inputState);
   }
 
   /**

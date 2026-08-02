@@ -341,6 +341,12 @@ export class VRSpatialMenuModel {
     // domain id so one small map serves every deferred toggle instead of a
     // field pair per button — see _holdDeferred/_readDeferredHold.
     this._deferredHolds = new Map(); // id -> { value, atMs }
+    // getButtonLayout() memoisation — see the method doc for why. Keyed on
+    // the three fields the returned geometry/labels actually depend on;
+    // cleared on session start/end so a fresh session never reads a stale
+    // layout from a previous one.
+    this._layoutCache = null;
+    this._layoutCacheKey = null;
   }
 
   // ===========================================================================
@@ -365,12 +371,30 @@ export class VRSpatialMenuModel {
    *   cu:number,cv:number}>} cu/cv = cell center (for placing labels/icons)
    */
   getButtonLayout() {
+    // Memoised: VTKVRSpatialUI calls this FOUR times per frame (hitTest,
+    // _currentRowCount, _layoutButtons, getButtonStates), and computeGridLayout
+    // allocates a Map + per-row arrays + a fresh object per button every call —
+    // several hundred short-lived objects/frame at 72Hz otherwise. The result
+    // only ever changes when one of these three fields changes, so a cheap key
+    // string is enough to skip the rebuild on every other call this frame (and
+    // across frames where nothing changed at all). Verified: shift state does
+    // NOT affect the returned geometry/labels (computeGridLayout(VR_KEYBOARD_KEYS)
+    // is passed the raw table; shift only surfaces via getButtonStates'
+    // kbd-shift branch), so it is deliberately excluded from the key.
+    const key = `${this._keyboardOpen ? 1 : 0}|${this._activeToolId ?? ""}|${this._openDrawerId ?? ""}`;
+    if (this._layoutCacheKey === key) return this._layoutCache;
+
     // Modal: while an annotation draft is open, the panel IS the keyboard —
     // no static grid, no contextual row, no drawer. hitTest/activate/
     // getButtonStates all read getButtonLayout(), so returning the keyboard's
     // own grid here is the entire mode switch; nothing downstream needs to
     // know "keyboard" exists as a concept.
-    if (this._keyboardOpen) return computeGridLayout(VR_KEYBOARD_KEYS);
+    if (this._keyboardOpen) {
+      const layout = computeGridLayout(VR_KEYBOARD_KEYS);
+      this._layoutCacheKey = key;
+      this._layoutCache = layout;
+      return layout;
+    }
 
     const contextual = VR_MENU_CONTEXTUAL_BUTTONS.filter(
       (b) => b.contextTool === this._activeToolId
@@ -415,7 +439,10 @@ export class VRSpatialMenuModel {
       ];
     }
 
-    return computeGridLayout(allButtons);
+    const layout = computeGridLayout(allButtons);
+    this._layoutCacheKey = key;
+    this._layoutCache = layout;
+    return layout;
   }
 
   // ===========================================================================
@@ -1071,6 +1098,10 @@ export class VRSpatialMenuModel {
   /** Called on VR session start. Panel becomes visible and re-syncs state. */
   onSessionStart() {
     this._visible = true;
+    // A stale layout from a previous session must never leak into a fresh
+    // one — see the getButtonLayout() cache note.
+    this._layoutCache = null;
+    this._layoutCacheKey = null;
     this.syncFromManager();
     return this._visible;
   }
@@ -1090,6 +1121,8 @@ export class VRSpatialMenuModel {
     this._draftText = "";
     this._draftFallback = "";
     this._deferredHolds.clear();
+    this._layoutCache = null;
+    this._layoutCacheKey = null;
     return this._visible;
   }
 

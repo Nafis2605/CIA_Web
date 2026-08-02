@@ -3,6 +3,14 @@
 
 import { vr as log } from "@Utils/logger.js";
 
+// Below this hand separation, atan2(dx, dz) is tracking-noise-sized (the X/Z
+// deltas are near zero), so the "handlebar" heading is essentially random —
+// don't let it inject rotation jitter into vrRotation.
+const MIN_TWIST_SEPARATION_M = 0.15;
+// Floor for the grip-distance ratio's denominator (and numerator), so hands
+// nearly touching don't produce a divide-by-near-zero scale spike.
+const MIN_GRIP_SEPARATION_M = 0.05;
+
 export class VRScaleController {
   constructor(vrContext, options = {}) {
     this._vrContext = vrContext;
@@ -15,6 +23,10 @@ export class VRScaleController {
       // Math.log(0.8) matches the feel of the old smoothing:0.8 at 72 Hz.
       smoothingTau: 0.0622,
       gripThreshold: 0.7, // Grip value to consider "gripping"
+      // Release threshold, lower than gripThreshold (hysteresis). Without a
+      // gap, squeeze noise hovering right at 0.7 rapidly starts/stops the
+      // gesture every frame.
+      gripReleaseThreshold: 0.4,
       ...options,
     };
 
@@ -27,20 +39,36 @@ export class VRScaleController {
     this._initialScale = null;
     this._initialAngle = null;
     this._initialRotation = null;
+    this._lastAngle = null;
+    this._rotationAccum = 0;
   }
 
   /**
-   * True when a hand is "engaged" for the two-hand gesture: a pinch
-   * (triggerPressed) on Apple Vision Pro's gripless transient-pointer — whose
-   * squeezeValue is always 0 — or a grip squeeze on tracked controllers.
+   * True when a hand is "engaged" for the two-hand gesture. Mirrors the
+   * world-grab predicate in VRExplorationManager (~232-238): transient-
+   * pointer sources (Apple Vision Pro's gripless pinch — squeezeValue is
+   * always 0) engage on triggerPressed; tracked controllers (Quest 2) use
+   * squeeze ONLY. Without this split, pulling BOTH TRIGGERS on Quest 2 (e.g.
+   * mid object-move) also engaged this gesture, which has the highest
+   * precedence in VRNavigationController and silently suppressed grab, fly
+   * and snap-turn.
+   *
+   * @param {Object} controller
+   * @param {boolean} [engaged] - Whether this hand is already part of an
+   *   active gesture. When true, the (lower) release threshold is used
+   *   instead of the engage threshold, giving squeeze hysteresis so noise
+   *   hovering near the threshold doesn't chatter the gesture on/off.
    * @private
    */
-  _isEngaged(controller) {
+  _isEngaged(controller, engaged = false) {
     if (!controller) return false;
-    return (
-      controller.triggerPressed === true ||
-      (controller.squeezeValue || 0) > this._options.gripThreshold
-    );
+    if (controller.isTransientPointer) {
+      return controller.triggerPressed === true;
+    }
+    const threshold = engaged
+      ? this._options.gripReleaseThreshold
+      : this._options.gripThreshold;
+    return (controller.squeezeValue || 0) > threshold;
   }
 
   /**
@@ -60,7 +88,10 @@ export class VRScaleController {
     const leftController = inputState.controllers?.left;
     const rightController = inputState.controllers?.right;
 
-    if (this._isEngaged(leftController) && this._isEngaged(rightController)) {
+    if (
+      this._isEngaged(leftController, this._isScaling) &&
+      this._isEngaged(rightController, this._isScaling)
+    ) {
       return this._handleTwoHandGesture(
         leftController,
         rightController,
@@ -108,7 +139,8 @@ export class VRScaleController {
     // so the ramp feels the same regardless of frame rate. A per-frame
     // smoothing factor (the old `smoothing: 0.8` applied every frame,
     // independent of deltaTime) converges faster at higher Hz.
-    const distanceRatio = currentDistance / this._initialGripDistance;
+    const safeCurrent = Math.max(currentDistance, MIN_GRIP_SEPARATION_M);
+    const distanceRatio = safeCurrent / this._initialGripDistance;
     const targetScale = this._initialScale / distanceRatio;
     const alpha = 1 - Math.exp(-deltaTime / this._options.smoothingTau);
     const scaledTarget =
@@ -122,8 +154,21 @@ export class VRScaleController {
 
     // --- Yaw from the change in handlebar angle ---
     // Flip the sign here if the twist feels reversed on-device.
-    const deltaAngle = this._normalizeAngle(currentAngle - this._initialAngle);
-    const newRotation = this._initialRotation + deltaAngle;
+    //
+    // Integrate PER-FRAME deltas. The previous form,
+    // _normalizeAngle(currentAngle - this._initialAngle), used a FROZEN
+    // baseline: twisting past +/-180 degrees from the gesture's start
+    // heading wrapped the sign and snapped the world a full turn mid-gesture.
+    // Per-frame steps are milliradians, so _normalizeAngle here only ever
+    // removes a genuine +/-PI seam crossing.
+    if (currentDistance >= MIN_TWIST_SEPARATION_M) {
+      this._rotationAccum += this._normalizeAngle(currentAngle - this._lastAngle);
+    }
+    // Re-seed unconditionally: a dip below the separation threshold must be
+    // SKIPPED, not deferred — otherwise noise accumulated while the hands
+    // were too close gets injected in one step when they separate again.
+    this._lastAngle = currentAngle;
+    const newRotation = this._initialRotation + this._rotationAccum;
     this._vrContext.vrRotation = newRotation;
 
     return {
@@ -151,10 +196,12 @@ export class VRScaleController {
    */
   _startGesture(initialDistance, initialAngle) {
     this._isScaling = true;
-    this._initialGripDistance = initialDistance;
+    this._initialGripDistance = Math.max(initialDistance, MIN_GRIP_SEPARATION_M);
     this._initialScale = this._scale;
     this._initialAngle = initialAngle;
     this._initialRotation = this._vrContext.vrRotation || 0;
+    this._lastAngle = initialAngle;
+    this._rotationAccum = 0;
     log.debug("Two-hand gesture started", {
       initialDistance,
       initialScale: this._scale,
@@ -172,6 +219,8 @@ export class VRScaleController {
     this._initialScale = null;
     this._initialAngle = null;
     this._initialRotation = null;
+    this._lastAngle = null;
+    this._rotationAccum = 0;
     log.debug("Two-hand gesture ended", {
       finalScale: this._scale,
       finalRotation: this._vrContext.vrRotation,

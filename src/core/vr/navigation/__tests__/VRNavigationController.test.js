@@ -76,21 +76,28 @@ describe("VRNavigationController — layered always-on model", () => {
   it("returns no movement when the stick is centered (deadzone)", () => {
     const { controller } = makeController();
     const result = controller.update(leftStick({ x: 0, y: 0 }), {}, 0.016);
-    // Fly returns the current origin unchanged (no drift from a centered stick).
-    expect(result.position).toEqual({ x: 0, y: 0, z: 0 });
+    // A8 idle deadband: a fully centered stick targets exactly zero velocity,
+    // so fly's per-component snap-to-zero (see VRFlyMode.update) fires
+    // immediately and the layer reports no movement at all (position: null)
+    // rather than re-writing vrOrigin to an unchanged value every frame.
+    expect(result.position).toBeNull();
   });
 
   it("WALK mode locks vertical movement; FLY allows it", () => {
     // Vertical input comes from the A button (see VRFlyMode._getMovementInput).
+    // Combine with forward stick so overall velocity isn't exactly zero (the
+    // A8 idle deadband would otherwise null out `position` entirely and there
+    // would be no y to compare) — this isolates WALK's ground-lock from A8.
     const flyC = makeController().controller;
     let flyResult;
-    for (let i = 0; i < 10; i++) flyResult = flyC.update(leftStick({ a: true }), {}, 0.016);
+    for (let i = 0; i < 10; i++) flyResult = flyC.update(leftStick({ a: true, y: -1 }), {}, 0.016);
     expect(Math.abs(flyResult.position.y)).toBeGreaterThan(0);
 
     const walkC = makeController().controller;
     walkC.setMode(EXPLORATION_MODES.WALK);
     let walkResult;
-    for (let i = 0; i < 10; i++) walkResult = walkC.update(leftStick({ a: true }), {}, 0.016);
+    for (let i = 0; i < 10; i++) walkResult = walkC.update(leftStick({ a: true, y: -1 }), {}, 0.016);
+    expect(walkResult.position).not.toBeNull();
     expect(walkResult.position.y).toBeCloseTo(0, 6);
   });
 

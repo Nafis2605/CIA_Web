@@ -255,6 +255,10 @@ export class VRSpatialUI {
     this._reshowTabActor = null;
     this._reshowTabLabelActor = null;
     this._reshowTabCard = null; // {canvas, ctx, texture, stateKey} for hover redraw
+    // Hover result from THIS frame's hitTest()'s _hitTestReshowTab, latched
+    // here so layout()'s _layoutReshowTab (which runs later, after nav) knows
+    // whether to paint the tab's hover state without re-running the ray test.
+    this._reshowHovering = false;
     // Backing panel — one dark rounded card behind the whole button grid.
     this._backingPanelActor = null;
     this._backingCanvas = null;
@@ -1089,11 +1093,92 @@ export class VRSpatialUI {
    *   hand did the picking. Returns null when the menu is not initialized or
    *   has no input — the frame loop treats that as "no menu interaction this
    *   frame". While manually hidden, only the tiny reshow tab is hit-tested
-   *   (see _updateReshowTab) — the full button grid does not run at all, so
+   *   (see _hitTestReshowTab) — the full button grid does not run at all, so
    *   tool triggers elsewhere in the view behave completely normally.
+   *
+   * Thin wrapper over hitTest() + layout() (frame-order contract below) —
+   * kept ONLY so the two phases can still be exercised back-to-back with the
+   * same transform in one call, and so the pre-existing test suite continues
+   * to exercise the whole pipeline unmodified. VRExplorationManager._onFrame
+   * itself calls hitTest() and layout() separately, straddling navigation —
+   * see those methods.
    */
   update(inputState, transform) {
+    const result = this.hitTest(inputState);
+    this.layout(transform);
+    return result;
+  }
+
+  /**
+   * PHASE 1 (call BEFORE navigation updates this frame's vrScale/vrOrigin) —
+   * pure XR-metre geometry, entirely independent of the XR→data transform
+   * (never reads/writes _vrScale/_vrOrigin — those only feed _toData, called
+   * exclusively from layout()'s methods below). Re-syncs the model against
+   * the manager, re-anchors the panel from the raw head pose, hit-tests the
+   * controller ray against the panel (or, while manually hidden, the tiny
+   * reshow tab), and — on a rising-edge select — ACTIVATES the hovered
+   * button.
+   *
+   * Activation MUST stay in this early phase: a button press has to take
+   * effect before nav/tools/the handler run later in this SAME frame (e.g.
+   * tapping "Hide" must hide the panel before layout() decides, below, which
+   * path to render this same frame), not a frame later.
+   *
+   * @param {object} inputState
+   * @returns {{hovering:boolean, buttonId:string|null, hand:string}|null}
+   */
+  hitTest(inputState) {
     if (!this._model || !inputState) return null;
+
+    if (!this._model.isVisible()) {
+      return this._hitTestReshowTab(inputState);
+    }
+
+    // Keep highlights aligned with the manager (tool may have changed via the
+    // DOM menu, isolation via the B-button).
+    this._model.syncFromManager();
+
+    this._updateAnchor(inputState.headPose);
+    // Needed here, not only in layout(): _intersectPanel below divides by
+    // this._panelHeight to resolve the hit's v-coordinate, so it must already
+    // reflect the row count implied by the state syncFromManager just pulled.
+    // layout() recomputes this again after its own actor-reconcile step —
+    // see the comment there.
+    this._panelHeight = this._computePanelHeight(this._currentRowCount());
+
+    const ray = this._pickRay(inputState);
+    const hit = ray ? this._intersectPanel(ray.origin, ray.direction) : null;
+    this._hoverButtonId = hit ? this._model.hitTest(hit.u, hit.v)?.id ?? null : null;
+
+    // Rising-edge select (trigger on controllers, pinch on transient-pointer).
+    const selectPressed = this._isSelectPressed(inputState);
+    if (selectPressed && !this._lastSelectPressed && this._hoverButtonId) {
+      this._model.activate(this._hoverButtonId);
+    }
+    this._lastSelectPressed = selectPressed;
+
+    // The picking hand mirrors _pickRay's preference (right, else left).
+    const hand = inputState.controllers?.right ? "right" : "left";
+    return { hovering: !!this._hoverButtonId, buttonId: this._hoverButtonId ?? null, hand };
+  }
+
+  /**
+   * PHASE 2 (call AFTER navigation updates this frame's vrScale/vrOrigin,
+   * before the stereo draw) — places every actor using the transform THIS
+   * frame's camera will actually render with, fixing the one-frame
+   * placement lag the hitTest/layout split exists to remove (see the
+   * frame-order comment at the VRExplorationManager._onFrame call sites).
+   *
+   * Re-reads this._model.isVisible() rather than trusting anything cached
+   * during hitTest() — an activation THAT SAME hitTest() call (tapping
+   * "Hide", or the reshow tab bringing the panel back) may have just
+   * flipped it, and this must take the correspondingly correct path this
+   * same frame, not one frame later.
+   *
+   * @param {{vrScale?:number, vrOrigin?:number[]}} [transform]
+   */
+  layout(transform) {
+    if (!this._model) return;
 
     // Latch the current XR→data transform so _layoutButtons/_layoutStatus can
     // place the panel in the data-space renderer at a fixed physical size.
@@ -1104,14 +1189,11 @@ export class VRSpatialUI {
 
     if (!this._model.isVisible()) {
       this._hideFullPanelActors();
-      return this._updateReshowTab(inputState);
+      this._layoutReshowTab();
+      return;
     }
     if (this._reshowTabActor) this._reshowTabActor.setVisibility(false);
     if (this._reshowTabLabelActor) this._reshowTabLabelActor.setVisibility(false);
-
-    // Keep highlights aligned with the manager (tool may have changed via the
-    // DOM menu, isolation via the B-button).
-    this._model.syncFromManager();
 
     // Rebuild only the contextual row's actors when the active tool changes
     // (not the whole panel) — avoids tearing down/recreating all 25 static
@@ -1132,10 +1214,13 @@ export class VRSpatialUI {
       this._panelWidth = mode === "keyboard" ? KEYBOARD_PANEL_WIDTH : PANEL_WIDTH;
       this._panelDrop = mode === "keyboard" ? KEYBOARD_PANEL_DROP : PANEL_DROP;
       this._panelSideOffset = mode === "keyboard" ? KEYBOARD_PANEL_SIDE_OFFSET : PANEL_SIDE_OFFSET;
-      // _updateAnchor early-returns unless the head has drifted past
-      // REANCHOR_DISTANCE, so without nulling this the new width/drop/offset
-      // would sit unused until the user physically walked half a metre —
-      // the panel would keep rendering at its OLD footprint/position.
+      // _updateAnchor (called from hitTest(), not here) early-returns unless
+      // the head has drifted past REANCHOR_DISTANCE, so without nulling this
+      // the new width/drop/offset would sit unused until the user physically
+      // walked half a metre — the panel would keep rendering at its OLD
+      // footprint/position. Because hitTest() already ran earlier THIS frame,
+      // nulling it here only takes effect starting with the NEXT frame's
+      // hitTest() — one frame of lag on keyboard open. Imperceptible.
       this._lastHeadPos = null;
       // Repaint the header in place (same canvas/texture, see
       // _drawBackingPanel) — the group legend makes no sense above a QWERTY
@@ -1154,28 +1239,11 @@ export class VRSpatialUI {
     }
     this._panelHeight = this._computePanelHeight(this._currentRowCount());
 
-    this._updateAnchor(inputState.headPose);
     this._layoutBackingPanel();
     this._layoutButtons();
     this._layoutStatus();
     this._layoutHint();
-
-    const ray = this._pickRay(inputState);
-    const hit = ray ? this._intersectPanel(ray.origin, ray.direction) : null;
-    this._hoverButtonId = hit ? this._model.hitTest(hit.u, hit.v)?.id ?? null : null;
-
-    // Rising-edge select (trigger on controllers, pinch on transient-pointer).
-    const selectPressed = this._isSelectPressed(inputState);
-    if (selectPressed && !this._lastSelectPressed && this._hoverButtonId) {
-      this._model.activate(this._hoverButtonId);
-    }
-    this._lastSelectPressed = selectPressed;
-
     this._applyButtonVisuals();
-
-    // The picking hand mirrors _pickRay's preference (right, else left).
-    const hand = inputState.controllers?.right ? "right" : "left";
-    return { hovering: !!this._hoverButtonId, buttonId: this._hoverButtonId ?? null, hand };
   }
 
   /** Hide every full-panel actor (backing/buttons/labels/status/hint) while the reshow tab is shown. @private */
@@ -1268,9 +1336,10 @@ export class VRSpatialUI {
       if (!entry) continue; // reconciled out this frame; skip
       const { actor, labelActor } = entry;
 
-      // Raise the hovered card toward the user for tactile depth (uses the
-      // previous frame's hover — a 1-frame lag is imperceptible and keeps this
-      // hot path from re-running the hit-test).
+      // Raise the hovered card toward the user for tactile depth. Reflects
+      // THIS frame's hover — hitTest() (which sets _hoverButtonId) runs
+      // earlier in the same frame as layout() (which calls this), so there
+      // is no lag to account for here.
       const lift = region.id === this._hoverButtonId ? CARD_HOVER_LIFT : 0;
 
       // UV center → offset from panel center, in meters
@@ -1566,21 +1635,62 @@ export class VRSpatialUI {
   }
 
   /**
-   * Per-frame update while the panel is manually hidden: position the tiny
-   * reshow tab at the same anchor the full panel would occupy, hit-test it
-   * against the current ray, and on rising-edge select, show the panel again.
-   * Uses the exact same anchoring/ray/select machinery as the full panel, so
-   * it works identically on gamepad and gripless (Vision Pro) input.
+   * hitTest() half of the reshow-tab pair below: while the panel is manually
+   * hidden, re-anchor from the raw head pose (same lazy anchoring the full
+   * panel uses) and hit-test the tiny reshow tab against the current ray —
+   * pure XR-metre geometry, no transform involved. Latches the hover result
+   * on this._reshowHovering for _layoutReshowTab (which runs later, after
+   * nav) to paint without re-running the ray test. On rising-edge select,
+   * makes the panel visible again immediately (this._model.setVisible(true))
+   * so layout() takes the now-visible path this SAME frame, not one frame
+   * later. Uses the exact same ray/select machinery as the full panel, so it
+   * works identically on gamepad and gripless (Vision Pro) input.
+   *
+   * Shares this._lastSelectPressed with the full-panel path in hitTest()
+   * above — safe because exactly one of the two runs per frame (gated on
+   * this._model.isVisible()), so the rising edge is only ever consumed once
+   * per frame either way.
    * @private
    */
-  _updateReshowTab(inputState) {
+  _hitTestReshowTab(inputState) {
     if (!this._reshowTabActor) return null;
     this._updateAnchor(inputState.headPose);
     const a = this._panelAnchor;
     if (!a) {
+      this._reshowHovering = false;
+      return null;
+    }
+
+    const ray = this._pickRay(inputState);
+    const hovering = ray ? this._intersectReshowTab(ray.origin, ray.direction) : false;
+    this._reshowHovering = hovering;
+
+    const selectPressed = this._isSelectPressed(inputState);
+    if (selectPressed && !this._lastSelectPressed && hovering) {
+      this._model.setVisible(true);
+    }
+    this._lastSelectPressed = selectPressed;
+
+    const hand = inputState.controllers?.right ? "right" : "left";
+    return { hovering, buttonId: hovering ? "__reshow__" : null, hand };
+  }
+
+  /**
+   * layout() half of the reshow-tab pair: places the tab actor at the panel
+   * anchor computed by _hitTestReshowTab earlier this frame, using THIS
+   * frame's XR→data transform, and repaints its card for the hover state
+   * _hitTestReshowTab already determined (this._reshowHovering) — no ray
+   * test here, placement only. Mirrors _layoutButtons/_layoutBackingPanel's
+   * split from their own hit-testing.
+   * @private
+   */
+  _layoutReshowTab() {
+    if (!this._reshowTabActor) return;
+    const a = this._panelAnchor;
+    if (!a) {
       this._reshowTabActor.setVisibility(false);
       if (this._reshowTabLabelActor) this._reshowTabLabelActor.setVisibility(false);
-      return null;
+      return;
     }
 
     const { center, normal } = a;
@@ -1592,11 +1702,9 @@ export class VRSpatialUI {
     this._reshowTabActor.setScale(RESHOW_TAB_SIZE_M * inv, RESHOW_TAB_SIZE_M * inv, inv);
     this._reshowTabActor.setVisibility(true);
 
-    const ray = this._pickRay(inputState);
-    const hovering = ray ? this._intersectReshowTab(ray.origin, ray.direction) : false;
     // Redraw the reshow card only on hover-state change (dirty-checked), same
     // as the button cards — setColor no longer tints a textured card.
-    const key = hovering ? "hover" : "idle";
+    const key = this._reshowHovering ? "hover" : "idle";
     if (this._reshowTabCard && this._reshowTabCard.stateKey !== key) {
       this._drawCard(
         this._reshowTabCard.ctx,
@@ -1620,19 +1728,6 @@ export class VRSpatialUI {
       this._reshowTabLabelActor.setScale(inv, inv, inv);
       this._reshowTabLabelActor.setVisibility(true);
     }
-
-    const selectPressed = this._isSelectPressed(inputState);
-    if (selectPressed && !this._lastSelectPressed && hovering) {
-      this._model.setVisible(true);
-      // Hide immediately so the tab doesn't linger under the full panel this
-      // same frame — the next update() call rebuilds the full panel's state.
-      this._reshowTabActor.setVisibility(false);
-      if (this._reshowTabLabelActor) this._reshowTabLabelActor.setVisibility(false);
-    }
-    this._lastSelectPressed = selectPressed;
-
-    const hand = inputState.controllers?.right ? "right" : "left";
-    return { hovering, buttonId: hovering ? "__reshow__" : null, hand };
   }
 
   /** Forward (-Z) vector of a quaternion {x,y,z,w}. @private */
@@ -1709,6 +1804,7 @@ export class VRSpatialUI {
     this._reshowTabActor = null;
     this._reshowTabLabelActor = null;
     this._reshowTabCard = null;
+    this._reshowHovering = false;
     this._backingPanelActor = null;
     this._backingCanvas = null;
     this._backingCtx = null;

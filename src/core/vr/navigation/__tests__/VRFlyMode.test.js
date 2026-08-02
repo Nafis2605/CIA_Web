@@ -128,6 +128,28 @@ describe("VRFlyMode — thumbstick sign + orientation transform", () => {
     expect(input.z).toBe(0);
   });
 
+  it("A1 regression guard: a worn-stick diagonal rest (0.12, 0.12), hypot ~0.1697, produces EXACTLY zero movement at deadzone 0.2", () => {
+    const { fly } = makeFly();
+    const input = fly._getMovementInput({
+      thumbstick: { x: 0.12, y: 0.12 },
+      buttons: {},
+      squeezeValue: 0,
+    });
+    expect(input.x).toBe(0);
+    expect(input.z).toBe(0);
+  });
+
+  it("A1: a clearly-intentional push (0.5, 0.5) still moves at deadzone 0.2", () => {
+    const { fly } = makeFly();
+    const input = fly._getMovementInput({
+      thumbstick: { x: 0.5, y: 0.5 },
+      buttons: {},
+      squeezeValue: 0,
+    });
+    expect(input.x).toBeGreaterThan(0);
+    expect(input.z).toBeGreaterThan(0);
+  });
+
   it("dt-invariance: integrating constant input for 1s at 1/72s vs 1/90s steps yields displacement within ~2%", () => {
     const { fly: fly72, vrContext: ctx72 } = makeFly();
     const { fly: fly90, vrContext: ctx90 } = makeFly();
@@ -146,5 +168,50 @@ describe("VRFlyMode — thumbstick sign + orientation transform", () => {
     const ratio = disp72 / disp90;
     expect(ratio).toBeGreaterThan(0.98);
     expect(ratio).toBeLessThan(1.02);
+  });
+});
+
+describe("VRFlyMode — A8 idle deadband", () => {
+  it("with zero stick input, after enough frames the returned position becomes null and update() does not throw", () => {
+    const { fly, vrContext } = makeFly();
+    const zeroInput = stickInput(0, { x: 0, y: 0 });
+
+    let result;
+    // First frame or two may still report a tiny non-null position while the
+    // (already-zero-targeted) velocity decays across the idle threshold; run
+    // enough frames for it to settle to exactly zero and return null.
+    for (let i = 0; i < 30; i++) {
+      expect(() => {
+        result = fly.update(zeroInput, {}, 0.016);
+      }).not.toThrow();
+      if (result.position === null) break;
+      vrContext.vrOrigin = [result.position.x, result.position.y, result.position.z];
+    }
+
+    expect(result.position).toBeNull();
+    expect(result.orientation).toBeNull();
+    expect(result.isBoosting).toBe(false);
+    expect(result.speed).toBe(0);
+  });
+
+  it("releasing the stick after moving eventually settles to a null position (velocity decays through the idle threshold)", () => {
+    const { fly, vrContext } = makeFly();
+
+    // Get moving.
+    for (let i = 0; i < 10; i++) {
+      const result = fly.update(stickInput(0, { y: -1 }), {}, 0.016);
+      vrContext.vrOrigin = [result.position.x, result.position.y, result.position.z];
+    }
+
+    // Release the stick and let velocity decay to exactly zero.
+    let result;
+    const zeroInput = stickInput(0, { x: 0, y: 0 });
+    for (let i = 0; i < 200; i++) {
+      result = fly.update(zeroInput, {}, 0.016);
+      if (result.position === null) break;
+      vrContext.vrOrigin = [result.position.x, result.position.y, result.position.z];
+    }
+
+    expect(result.position).toBeNull();
   });
 });

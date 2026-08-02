@@ -55,10 +55,18 @@ vi.mock("@Core/instances/types/vtk/vr/VTKVRAvatars.js", () => ({
   vrAvatarSystem: { initialize: vi.fn(), dispose: vi.fn(), update: vi.fn() },
 }));
 
-// Spatial UI: control what update() reports (hover / hand) per test.
-const mockSpatialUpdate = vi.fn(() => ({ hovering: false, hand: "right", buttonId: null }));
+// Spatial UI: control what hitTest() reports (hover / hand) per test. Split
+// into hitTest() (phase 1, before nav — raw input arbitration, what these
+// tests exercise) and layout() (phase 2, after nav — see the frame-order
+// test below) mirroring VRExplorationManager._onFrame's real call sites.
+const mockSpatialHitTest = vi.fn(() => ({ hovering: false, hand: "right", buttonId: null }));
+const mockSpatialLayout = vi.fn();
 vi.mock("@Core/instances/types/vtk/vr/VTKVRSpatialUI.js", () => ({
-  vrSpatialUI: { update: (...a) => mockSpatialUpdate(...a), dispose: vi.fn() },
+  vrSpatialUI: {
+    hitTest: (...a) => mockSpatialHitTest(...a),
+    layout: (...a) => mockSpatialLayout(...a),
+    dispose: vi.fn(),
+  },
 }));
 vi.mock("@Core/vr/environment/VREnvironment.js", () => ({
   vrEnvironment: { updateTransform: vi.fn() },
@@ -135,14 +143,14 @@ describe("VRExplorationManager._onFrame — input arbitration (R2)", () => {
 
   it("passes the RAW input state to the spatial menu (before nav/tools)", () => {
     runFrame();
-    expect(mockSpatialUpdate).toHaveBeenCalledTimes(1);
-    const raw = mockSpatialUpdate.mock.calls[0][0];
+    expect(mockSpatialHitTest).toHaveBeenCalledTimes(1);
+    const raw = mockSpatialHitTest.mock.calls[0][0];
     // Raw: the pinch trigger is still present for the menu to consume.
     expect(raw.controllers.right.triggerPressed).toBe(true);
   });
 
   it("menu hover strips the trigger from BOTH nav and tool updates", () => {
-    mockSpatialUpdate.mockReturnValueOnce({ hovering: true, hand: "right", buttonId: "move" });
+    mockSpatialHitTest.mockReturnValueOnce({ hovering: true, hand: "right", buttonId: "move" });
     runFrame();
 
     const navInput = navUpdate.mock.calls[0][0];
@@ -154,7 +162,7 @@ describe("VRExplorationManager._onFrame — input arbitration (R2)", () => {
   });
 
   it("does NOT strip the trigger when the pointer is not over the menu", () => {
-    mockSpatialUpdate.mockReturnValueOnce({ hovering: false, hand: "right", buttonId: null });
+    mockSpatialHitTest.mockReturnValueOnce({ hovering: false, hand: "right", buttonId: null });
     runFrame();
     expect(navUpdate.mock.calls[0][0].controllers.right.triggerPressed).toBe(true);
     expect(toolUpdate.mock.calls[0][0].controllers.right.triggerPressed).toBe(true);
@@ -162,7 +170,7 @@ describe("VRExplorationManager._onFrame — input arbitration (R2)", () => {
 
   it("an active tool strips the trigger from nav (annotation pinch must not aim teleport) but tools keep it", () => {
     activeTool = { id: "annotate" };
-    mockSpatialUpdate.mockReturnValueOnce({ hovering: false, hand: "right", buttonId: null });
+    mockSpatialHitTest.mockReturnValueOnce({ hovering: false, hand: "right", buttonId: null });
     runFrame();
 
     // Nav must not see the pinch...
@@ -173,15 +181,33 @@ describe("VRExplorationManager._onFrame — input arbitration (R2)", () => {
 
   it("does not mutate the object _gatherInputState returned (menu sees raw even after gating)", () => {
     activeTool = { id: "annotate" };
-    mockSpatialUpdate.mockReturnValueOnce({ hovering: true, hand: "right", buttonId: "move" });
+    mockSpatialHitTest.mockReturnValueOnce({ hovering: true, hand: "right", buttonId: "move" });
     runFrame();
     // The exact object handed to the menu still reports the pinch as pressed,
     // even though nav/tools received a stripped clone this same frame.
-    const raw = mockSpatialUpdate.mock.calls[0][0];
+    const raw = mockSpatialHitTest.mock.calls[0][0];
     expect(raw.controllers.right.triggerPressed).toBe(true);
     // And the gated clone the nav saw is a DIFFERENT object with it stripped.
     expect(navUpdate.mock.calls[0][0]).not.toBe(raw);
     expect(navUpdate.mock.calls[0][0].controllers.right.triggerPressed).toBe(false);
+  });
+
+  // A4: hitTest() must run before nav (asserted throughout this file via
+  // navUpdate/toolUpdate seeing hitTest's arbitration result), and layout()
+  // must run after nav, with THIS frame's post-nav transform — not the
+  // pre-nav vrContext snapshot hitTest() itself never even receives.
+  it("calls layout() once per frame, after nav, with the frame's vrScale/vrOrigin", () => {
+    navUpdate.mockReturnValue({ vrScale: 2.5, position: { x: 4, y: 5, z: 6 } });
+    runFrame();
+
+    expect(mockSpatialLayout).toHaveBeenCalledTimes(1);
+    expect(mockSpatialHitTest).toHaveBeenCalledTimes(1);
+    // hitTest() takes only inputState — no transform argument at all.
+    expect(mockSpatialHitTest.mock.calls[0]).toHaveLength(1);
+    // layout() sees the transform AFTER nav applied navUpdate's result to
+    // vrContext (vrScale 2.5, origin [4,5,6]), not the pre-frame vrContext
+    // ({ vrScale: 1, vrOrigin: [1, 2, 3] } from beforeEach).
+    expect(mockSpatialLayout).toHaveBeenCalledWith({ vrScale: 2.5, vrOrigin: [4, 5, 6] });
   });
 
   it("persists VR hints exactly once when a grab ends", () => {

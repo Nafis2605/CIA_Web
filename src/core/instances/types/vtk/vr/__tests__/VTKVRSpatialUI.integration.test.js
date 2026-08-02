@@ -270,10 +270,20 @@ describe("VRSpatialUI integration — initialize/update/dispose against a fake r
     }
   });
 
-  it("opening the keyboard forces a re-anchor and actually moves the panel centre", () => {
+  // NOTE on the one-frame lag asserted below: update() is a thin wrapper over
+  // hitTest() (re-anchors from the raw head pose) then layout() (detects the
+  // mode switch and nulls _lastHeadPos to force a re-anchor) — see the
+  // "benign consequences" comment on layout()'s mode-switch block in
+  // VTKVRSpatialUI.js. Because hitTest() runs BEFORE layout() within the same
+  // update() call, nulling _lastHeadPos in layout() cannot make THAT SAME
+  // call's hitTest() re-anchor — only the NEXT call's hitTest() sees
+  // _lastHeadPos === null and actually recomputes the anchor. This mirrors
+  // VRExplorationManager._onFrame's real frame order (hitTest() before nav,
+  // layout() after), where the lag is exactly one rendered frame — imperceptible.
+  it("opening the keyboard forces a re-anchor and actually moves the panel centre, one frame after the mode switch", () => {
     // The draft is toggled via a mutable object the manager mock reads live,
-    // so the SAME input (identical head position) drives two update() calls —
-    // isolating the mode switch as the only thing that changed.
+    // so the SAME input (identical head position) drives repeated update()
+    // calls — isolating the mode switch as the only thing that changed.
     const draft = { active: false, text: "", fallbackText: "Note" };
     const manager = makeManager({ getAnnotationDraft: vi.fn(() => draft) });
     const renderer = makeFakeRenderer();
@@ -288,12 +298,19 @@ describe("VRSpatialUI integration — initialize/update/dispose against a fake r
     draft.active = true; // open the draft -> the model reports keyboard mode
     ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
 
-    // Width actually swapped to the keyboard's own (wider) footprint...
+    // Width actually swaps to the keyboard's own (wider) footprint on this
+    // very call — that happens in layout(), same call as the mode detection.
     expect(ui._panelWidth).not.toBe(menuWidth);
-    // ...and _lastHeadPos was nulled so _updateAnchor recomputed instead of
-    // early-returning on REANCHOR_DISTANCE — with an IDENTICAL head pose, the
-    // only way the centre can differ is the drop/side-offset swap taking
-    // effect immediately rather than after the user walks half a metre.
+    // But the re-anchor itself lags by one call: this call's hitTest() ran
+    // BEFORE layout() nulled _lastHeadPos, so with an IDENTICAL head pose it
+    // early-returned on REANCHOR_DISTANCE and the centre hasn't moved yet.
+    expect(ui._panelAnchor.center).toEqual(menuCenter);
+
+    // A third call's hitTest() now sees _lastHeadPos === null (nulled by the
+    // previous call's layout()) and recomputes — with the SAME identical head
+    // pose, the only way the centre can differ is the drop/side-offset swap
+    // finally taking effect.
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
     expect(ui._panelAnchor.center).not.toEqual(menuCenter);
   });
 
@@ -368,6 +385,133 @@ describe("VRSpatialUI integration — initialize/update/dispose against a fake r
     expect(ui._buttonActors.size).toBe(0);
     expect(ui._parkedActors.size).toBe(0);
     expect(addCount).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// hitTest()/layout() frame-order split (A4)
+//
+// update() previously did hit-testing AND placement in one pass, called
+// BEFORE navigation updates vrContext.vrScale/vrOrigin each frame — so the
+// panel's actors were placed with frame N-1's transform while the camera
+// rendered frame N, and the panel visibly swam against the world whenever
+// the user moved/scaled. The fix splits update() into hitTest() (pure
+// XR-metre geometry, runs before nav) and layout() (placement, runs after
+// nav, with THIS frame's transform) — see VTKVRSpatialUI.js for the full
+// rationale. update() itself becomes a thin wrapper kept only so this whole
+// file's pre-existing pipeline tests keep exercising both phases together.
+// ---------------------------------------------------------------------------
+describe("VRSpatialUI hitTest()/layout() frame-order split (A4)", () => {
+  let getContextSpy;
+
+  beforeEach(() => {
+    getContextSpy = vi
+      .spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockImplementation(() => createFakeCtx());
+    vi.stubGlobal(
+      "Path2D",
+      class FakePath2D {
+        constructor(_pathData) {}
+      }
+    );
+  });
+
+  afterEach(() => {
+    getContextSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("update() behaves identically to calling hitTest() then layout() directly (thin-wrapper contract)", () => {
+    const rendererA = makeFakeRenderer();
+    const uiA = new VRSpatialUI();
+    uiA.initialize(rendererA, makeManager());
+
+    const rendererB = makeFakeRenderer();
+    const uiB = new VRSpatialUI();
+    uiB.initialize(rendererB, makeManager());
+
+    const input = makeInputState();
+    const transform = { vrScale: 1.0, vrOrigin: [0, 0, 0] };
+
+    const wrapperResult = uiA.update(input, transform);
+    const splitResult = uiB.hitTest(input);
+    uiB.layout(transform);
+
+    // update()'s return value IS hitTest()'s return value (layout() returns
+    // nothing) — the wrapper contract.
+    expect(wrapperResult).toEqual(splitResult);
+
+    // Every button actor lands in the same place, with the same visibility,
+    // whichever path drove it.
+    expect(uiA._buttonActors.size).toBe(uiB._buttonActors.size);
+    for (const [id, entryA] of uiA._buttonActors) {
+      const entryB = uiB._buttonActors.get(id);
+      expect(entryB, `button "${id}" should exist on both UIs`).toBeDefined();
+      expect(entryB.actor.getPosition()).toEqual(entryA.actor.getPosition());
+      expect(entryB.actor.getVisibility()).toBe(entryA.actor.getVisibility());
+    }
+    expect(uiA._hoverButtonId).toBe(uiB._hoverButtonId);
+  });
+
+  it("layout() uses the transform passed to IT, not one passed to a previous hitTest() call", () => {
+    const renderer = makeFakeRenderer();
+    const ui = new VRSpatialUI();
+    ui.initialize(renderer, makeManager());
+
+    // hitTest() takes no transform at all — its signature is (inputState)
+    // only. Establish the panel anchor, then lay out once at the identity
+    // transform to get each button's PHYSICAL (pre-transform) position.
+    ui.hitTest(makeInputState());
+    ui.layout({ vrScale: 1.0, vrOrigin: [0, 0, 0] });
+    const anyId = VR_MENU_BUTTONS[0].id;
+    const physicalPos = ui._buttonActors.get(anyId).actor.getPosition().slice();
+
+    // No new hitTest() call in between — if layout() were somehow reusing a
+    // transform latched earlier (or defaulting instead of reading its own
+    // argument), this second layout() call would reproduce physicalPos.
+    ui.layout({ vrScale: 2.0, vrOrigin: [1, 2, 3] });
+    const scaledPos = ui._buttonActors.get(anyId).actor.getPosition();
+
+    const expected = [
+      physicalPos[0] / 2 + 1,
+      physicalPos[1] / 2 + 2,
+      physicalPos[2] / 2 + 3,
+    ];
+    for (let i = 0; i < 3; i++) {
+      expect(scaledPos[i]).toBeCloseTo(expected[i], 5);
+    }
+  });
+
+  it("activating a button that hides the panel during hitTest() makes layout() take the hidden path in the SAME frame", () => {
+    const renderer = makeFakeRenderer();
+    const ui = new VRSpatialUI();
+    ui.initialize(renderer, makeManager());
+
+    // Establish a normal frame first so every button actor has a real world
+    // position to aim the next frame's ray at.
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+    expect(ui.getModel().isVisible()).toBe(true);
+    const hidePos = ui._buttonActors.get("hide-menu").actor.getPosition();
+
+    // hitTest() alone: aim at "Hide" with the trigger down (rising edge from
+    // the previous frame's release). This must activate hide-menu — and
+    // hence flip the model to invisible — entirely within hitTest(), before
+    // layout() ever runs this frame.
+    const hitResult = ui.hitTest(makeInputStateAimedAt(hidePos, { triggerPressed: true }));
+    expect(hitResult?.buttonId).toBe("hide-menu");
+    expect(ui.getModel().isVisible()).toBe(false);
+
+    // layout() re-reads isVisible() rather than trusting anything cached
+    // during hitTest(), so it must take the hidden path THIS SAME call.
+    ui.layout({ vrScale: 1.0, vrOrigin: [0, 0, 0] });
+
+    if (ui._backingPanelActor) {
+      expect(ui._backingPanelActor.getVisibility()).toBe(false);
+    }
+    for (const { actor } of ui._buttonActors.values()) {
+      expect(actor.getVisibility()).toBe(false);
+    }
+    expect(ui._reshowTabActor.getVisibility()).toBe(true);
   });
 });
 

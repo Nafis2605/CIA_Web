@@ -44,16 +44,22 @@ const GRAB_GAIN = 1.0;
 // GRIP predicate instead (squeeze on tracked controllers, pinch on gripless
 // Vision Pro sources) so grip pulls the world while the trigger stays free for
 // object-move / tools / the menu — see VRNavigationController.
-const DEFAULT_IS_ENGAGED = (hand) => !!hand?.triggerPressed;
+// Second argument (`engaged`) ignored by default, so existing callers/tests
+// (which only ever pass the hand) are unchanged.
+const DEFAULT_IS_ENGAGED = (hand, _engaged) => !!hand?.triggerPressed;
 
 export class VRGrabMode {
   /**
    * @param {Object} vrContext - live VR context (vrScale / vrOrigin are the
    *   locomotion state this mode writes through its returned result).
    * @param {Object} [options]
-   * @param {(hand:Object)=>boolean} [options.isEngaged] - predicate deciding
-   *   whether a controller is currently "gripping" for this grab. Defaults to
-   *   the trigger so existing callers/tests are unchanged.
+   * @param {(hand:Object, engaged?:boolean)=>boolean} [options.isEngaged] -
+   *   predicate deciding whether a controller is currently "gripping" for
+   *   this grab. `engaged` is the CURRENT grab state for that hand, passed so
+   *   a predicate can apply hysteresis (e.g. a Schmitt trigger: engage at a
+   *   high threshold, release at a lower one) instead of chattering on a
+   *   single threshold. Defaults to the trigger, ignoring `engaged`, so
+   *   existing callers/tests are unchanged.
    */
   constructor(vrContext, options = {}) {
     this._vrContext = vrContext;
@@ -80,6 +86,10 @@ export class VRGrabMode {
     // True once update() has run for a frame; cleared by onFrameSkipped() so a
     // grab that resumes after a suppressed frame re-anchors instead of jumping.
     this._ranLastFrame = false;
+    // Hand latched for the duration of the current grab (see _pickHandName).
+    // Prevents a mid-grab re-pick from comparing the new hand's position
+    // against the old hand's anchor and teleporting vrOrigin.
+    this._grabHand = null;
   }
 
   /**
@@ -98,8 +108,11 @@ export class VRGrabMode {
    *   frame the pinch releases (so the frame loop can persist the final pose).
    */
   update(inputState) {
-    const hand = this._pickHand(inputState);
-    const pressed = !!hand && this._isEngaged(hand);
+    const handName = this._pickHandName(inputState);
+    const hand = handName ? inputState?.controllers?.[handName] : null;
+    // Pass the current grab state so the predicate applies the release (low)
+    // threshold once engaged — see gripPredicate in VRExplorationManager.
+    const pressed = !!hand && this._isEngaged(hand, this._grabbing);
     const pos = hand?.pose?.position;
 
     // Falling edge OR pose loss while grabbing → end the grab, hold last pose.
@@ -107,6 +120,7 @@ export class VRGrabMode {
       this._grabbing = false;
       this._wasPressed = pressed;
       this._ranLastFrame = true;
+      this._grabHand = null;
       return { position: this._lastPosition ? { ...this._lastPosition } : null, grabEnded: true };
     }
 
@@ -114,6 +128,7 @@ export class VRGrabMode {
     if (!this._grabbing && pressed && !this._wasPressed && pos) {
       this._anchor(pos);
       this._grabbing = true;
+      this._grabHand = handName;
     }
 
     let result = { position: null };
@@ -145,19 +160,28 @@ export class VRGrabMode {
   }
 
   /**
-   * Pick the grabbing hand. Prefer a hand that is BOTH posed and currently
-   * engaged (so gripping the left hand grabs with the left, not the right),
-   * falling back to any posed hand so the rising-edge anchor still fires the
-   * frame a grip begins.
+   * Pick the name ('right'/'left') of the grabbing hand. Prefer a hand that
+   * is BOTH posed and currently engaged (so gripping the left hand grabs
+   * with the left, not the right), falling back to any posed hand so the
+   * rising-edge anchor still fires the frame a grip begins.
+   *
+   * While a grab is in progress the hand is LATCHED: re-picking mid-grab
+   * would compare the new hand's position against the old hand's anchor and
+   * teleport vrOrigin by the full inter-hand distance in one frame. Losing
+   * the latched hand's pose returns null, which routes update() into its
+   * falling-edge branch — the grab ends cleanly on the last good position
+   * rather than switching hands.
    * @private
    */
-  _pickHand(inputState) {
-    const right = inputState?.controllers?.right;
-    const left = inputState?.controllers?.left;
-    if (right?.pose && this._isEngaged(right)) return right;
-    if (left?.pose && this._isEngaged(left)) return left;
-    if (right?.pose) return right;
-    if (left?.pose) return left;
+  _pickHandName(inputState) {
+    const c = inputState?.controllers || {};
+    if (this._grabbing && this._grabHand) {
+      return c[this._grabHand]?.pose ? this._grabHand : null;
+    }
+    if (c.right?.pose && this._isEngaged(c.right, false)) return 'right';
+    if (c.left?.pose && this._isEngaged(c.left, false)) return 'left';
+    if (c.right?.pose) return 'right';
+    if (c.left?.pose) return 'left';
     return null;
   }
 

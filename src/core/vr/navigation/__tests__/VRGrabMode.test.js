@@ -138,3 +138,119 @@ describe("VRGrabMode", () => {
     expect(mode.isGrabbing()).toBe(false);
   });
 });
+
+/** Build an input state with both hands posed, each with its own squeeze value. */
+function bothHands(rightPos, rightSqueeze, leftPos, leftSqueeze) {
+  return {
+    controllers: {
+      right: rightPos && {
+        pose: { position: rightPos },
+        squeezeValue: rightSqueeze,
+      },
+      left: leftPos && {
+        pose: { position: leftPos },
+        squeezeValue: leftSqueeze,
+      },
+    },
+  };
+}
+
+// Schmitt-trigger predicate matching VRExplorationManager's gripPredicate:
+// engage above 0.7, stay engaged down to 0.4 once already engaged.
+const GRIP_ENGAGE = 0.7;
+const GRIP_RELEASE = 0.4;
+function hysteresisPredicate(hand, engaged = false) {
+  if (!hand) return false;
+  if (hand.isTransientPointer) return hand.triggerPressed === true;
+  return (hand.squeezeValue || 0) > (engaged ? GRIP_RELEASE : GRIP_ENGAGE);
+}
+
+describe("VRGrabMode grip hysteresis + hand latch (A3)", () => {
+  let ctx;
+  let mode;
+
+  beforeEach(() => {
+    ctx = { vrScale: 1.0, vrOrigin: [0, 0, 0] };
+    mode = new VRGrabMode(ctx, { isEngaged: hysteresisPredicate });
+  });
+
+  it("grip at 0.8 engages; dropping to 0.5 (below engage, above release) keeps it engaged and tracking", () => {
+    const engaged = mode.update(bothHands({ x: 0, y: 0, z: 0 }, 0.8, null, 0));
+    expect(mode.isGrabbing()).toBe(true);
+    expect(engaged.position).toEqual({ x: 0, y: 0, z: 0 });
+
+    // Squeeze sags to 0.5 — below the 0.7 engage threshold but above the 0.4
+    // release threshold. With hysteresis this must NOT end the grab.
+    const sagging = mode.update(bothHands({ x: 0, y: 0, z: 1 }, 0.5, null, 0));
+    expect(mode.isGrabbing()).toBe(true);
+    expect(sagging.grabEnded).toBeFalsy();
+    // The world keeps tracking the hand (origin moves by -delta/scale).
+    expect(sagging.position.z).toBeCloseTo(-1, 6);
+
+    // Dropping further to 0.3 (below the release threshold) ends the grab.
+    const released = mode.update(bothHands({ x: 0, y: 0, z: 1 }, 0.3, null, 0));
+    expect(released.grabEnded).toBe(true);
+    expect(mode.isGrabbing()).toBe(false);
+  });
+
+  it("latches the grabbing hand: engaging the other hand mid-grab does not steal it or jump vrOrigin", () => {
+    // Start the grab with the right hand only.
+    const started = mode.update(bothHands({ x: 0, y: 0, z: 0 }, 0.8, null, 0));
+    expect(mode.isGrabbing()).toBe(true);
+    expect(started.position).toEqual({ x: 0, y: 0, z: 0 });
+
+    // Now the left hand ALSO becomes engaged, far away from the right hand,
+    // while the right hand has moved only a little. If hand selection were
+    // re-evaluated every frame it would jump to picking the (now-preferred)
+    // right-vs-left tie differently or, worse, compute delta against the
+    // wrong hand's anchor. The delta must still come from the right hand.
+    const bothEngaged = mode.update(
+      bothHands({ x: 0, y: 0, z: 0.2 }, 0.8, { x: 5, y: 5, z: 5 }, 0.8)
+    );
+    expect(mode.isGrabbing()).toBe(true);
+    // Delta computed from the right hand's motion only (0.2 on z), not any
+    // combination involving the left hand's far-away position.
+    expect(bothEngaged.position.z).toBeCloseTo(-0.2, 6);
+    expect(bothEngaged.position.x).toBeCloseTo(0, 6);
+    expect(bothEngaged.position.y).toBeCloseTo(0, 6);
+  });
+
+  it("losing the latched hand's pose ends the grab rather than switching to the other hand", () => {
+    mode.update(bothHands({ x: 0, y: 0, z: 0 }, 0.8, null, 0));
+    expect(mode.isGrabbing()).toBe(true);
+
+    // Right hand loses tracking (no pose); left hand is posed and engaged.
+    const input = {
+      controllers: {
+        right: { squeezeValue: 0.8 }, // no pose
+        left: { pose: { position: { x: 1, y: 1, z: 1 } }, squeezeValue: 0.8 },
+      },
+    };
+    const r = mode.update(input);
+    expect(r.grabEnded).toBe(true);
+    expect(mode.isGrabbing()).toBe(false);
+  });
+
+  it("a transient-pointer hand engages purely on triggerPressed, with no hysteresis", () => {
+    const tpMode = new VRGrabMode(ctx, { isEngaged: hysteresisPredicate });
+    const input = (pressed) => ({
+      controllers: {
+        right: {
+          pose: { position: { x: 0, y: 0, z: 0 } },
+          isTransientPointer: true,
+          triggerPressed: pressed,
+          squeezeValue: 0, // gripless — always 0
+        },
+        left: null,
+      },
+    });
+
+    const engaged = tpMode.update(input(true));
+    expect(tpMode.isGrabbing()).toBe(true);
+    expect(engaged.position).toEqual({ x: 0, y: 0, z: 0 });
+
+    const released = tpMode.update(input(false));
+    expect(released.grabEnded).toBe(true);
+    expect(tpMode.isGrabbing()).toBe(false);
+  });
+});

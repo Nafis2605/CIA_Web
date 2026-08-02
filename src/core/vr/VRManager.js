@@ -284,12 +284,18 @@ class VRManager extends BaseManager {
     // Update session render state. Set ONCE here, never per-frame: now that
     // the camera converts data units to metres via physicalScale
     // (VTKInstanceHandler._updateCameraFromVRPose), these depthNear/depthFar
-    // values are true metres and are correct at every vrScale. 0.05 m (vs the
-    // 0.1 default) allows closer inspection.
+    // values are true metres and are correct at every vrScale. 0.05 was a
+    // regression from a previous commit — it bought nothing (the menu panel
+    // sits at ~0.6 m, well past 0.05) and doubled the near:far ratio to
+    // 20000:1 (0.05/1000), halving depth-buffer precision. 0.1/200 gives a
+    // 2000:1 ratio. 200 m rather than a tighter far plane because the
+    // dataset renders in data space at `diagonal * vrScale` physical metres,
+    // so a far plane of 100 m would clip the dataset past roughly 40x
+    // auto-fit zoom.
     this._xrSession.updateRenderState({
       baseLayer: this._xrLayer,
-      depthNear: 0.05,
-      depthFar: 1000,
+      depthNear: 0.1,
+      depthFar: 200,
     });
 
     log.debug("WebGL layer configured for XR");
