@@ -62,6 +62,10 @@ const FIT_DISTANCE_M =
   (PANEL_PLANE_M + PANEL_CLEARANCE_M) / (1 - Math.sin(FIT_HALF_ANGLE_RAD));
 const FIT_DIAGONAL_M = 2 * FIT_DISTANCE_M * Math.sin(FIT_HALF_ANGLE_RAD);
 
+// How long a "Building glyphs…" style status label may persist before the
+// panel falls back to its normal status line (see getPendingWorkLabel).
+const PENDING_WORK_TTL_MS = 3000;
+
 class VRExplorationManager extends BaseManager {
   constructor() {
     super();
@@ -1577,18 +1581,79 @@ class VRExplorationManager extends BaseManager {
       return false;
     }
 
+    // Pick settings the DATA can actually satisfy, rather than inheriting
+    // VTKGlyphFeature's defaults.
+    //
+    // Those defaults are glyphType 'arrow' (requiresOrientation) with
+    // scalingMode 'vector', and VR passed orientationArray = undefined when the
+    // dataset had no vector array. Worse, SCALING_MODES maps 'vector' to 2,
+    // which in vtk.js is SCALE_BY_COMPONENTS, not magnitude — so with a
+    // 1-component scalar array vtk.js logs an error and nulls the scale array.
+    // Net result: every glyph drew at scaleFactor 1.0 in ABSOLUTE DATA UNITS,
+    // unoriented — invisible specks on a large dataset, scene-swamping blobs on
+    // a small one. That is the "Glyphs doesn't work" report.
+    //
+    // The shared SCALING_MODES map is left alone deliberately: correcting it is
+    // desktop-visible and would change existing saved glyph configs. Tracked
+    // separately; here we just choose the one entry that maps correctly
+    // ('scalar' -> 1 -> SCALE_BY_MAGNITUDE) and an explicit type/array pair.
+    const vectorName = vectorArrays?.[0]?.name;
+    const scalarName = scalarArrays?.[0]?.name;
+    const options = vectorName
+      ? {
+          glyphType: 'arrow',
+          scalingMode: 'scalar',
+          orientationArray: vectorName,
+          scaleArray: vectorName,
+        }
+      : {
+          // 'sphere' is requiresOrientation:false, so it renders correctly with
+          // no vector data — unlike 'arrow', which has nothing to point along.
+          glyphType: 'sphere',
+          scalingMode: 'off',
+          orientationArray: null,
+          colorMode: scalarName ? 'scalar' : 'solid',
+          colorArray: scalarName || null,
+        };
+    options.scaleFactor = this._autoGlyphScaleFactor(polydata);
+
     // The expensive part — vtkGlyphFeature.enableGlyphs runs
-    // _buildSubsampledPolydata, an O(N) copy of every point + point-data
-    // array — is the actual cause of the mid-frame shake this fixes. Only
-    // this call and its sync patch are deferred; everything above already
-    // ran synchronously so we can return the optimistic `true` right now.
-    const orientationArray = vectorArrays?.[0]?.name;
+    // _buildSubsampledPolydata plus first-draw shader compilation — is
+    // deferred; everything above already ran synchronously so we can return
+    // the optimistic `true` right now.
     this._deferHeavy('Building glyphs…', () => {
-      vtkGlyphFeature.enableGlyphs(instanceId, polydata, { orientationArray });
+      vtkGlyphFeature.enableGlyphs(instanceId, polydata, options);
       this._pushVisualizationPatch({ glyph: vtkGlyphFeature.getConfigForSync(instanceId) });
     });
     this._emit('glyphsToggled', { enabled: true });
     return true;
+  }
+
+  /**
+   * A glyph size that suits the dataset, in DATA units.
+   *
+   * VTKGlyphFeature's default is a hardcoded 1.0, which is meaningless without
+   * knowing the data's scale: sub-pixel on a dataset spanning thousands of
+   * units, scene-swamping on a normalised one. Derive it from the mean point
+   * spacing instead — `diagonal / cbrt(N)` — halved, because the sphere and
+   * arrow sources have radius ~0.5, so scaleFactor reads as a diameter.
+   * @private
+   */
+  _autoGlyphScaleFactor(polydata) {
+    try {
+      const b = this._activeContext?.vrContext?.dataBounds;
+      const diagonal =
+        Array.isArray(b) && b.length === 6
+          ? Math.hypot(b[1] - b[0], b[3] - b[2], b[5] - b[4])
+          : 0;
+      const n = polydata?.getNumberOfPoints?.() || 0;
+      if (!(diagonal > 1e-9) || n < 2) return 1.0;
+      const spacing = diagonal / Math.cbrt(n);
+      // Clamp so a pathological aspect ratio can't produce a degenerate size.
+      return Math.max(diagonal * 1e-4, Math.min(diagonal * 0.1, spacing * 0.5));
+    } catch {
+      return 1.0;
+    }
   }
 
   /** @returns {boolean} whether glyphs are currently enabled on the active dataset */
@@ -2075,8 +2140,16 @@ class VRExplorationManager extends BaseManager {
    * @private
    */
   _deferHeavy(label, fn) {
+    // Coalesce a repeat of the same action. Because the guards run
+    // synchronously but the mutation is deferred, a second tap before the
+    // drain reads pre-tap state — so double-tapping Threshold used to enqueue
+    // toggle() twice (net: off) while the menu optimistically showed "on".
+    const tail = this._deferredWork[this._deferredWork.length - 1];
+    if (tail && tail.label === label) return;
+
     this._deferredWork.push({ label, fn });
     this._pendingWorkLabel = label;
+    this._pendingWorkAtMs = Date.now();
   }
 
   /**
@@ -2110,6 +2183,7 @@ class VRExplorationManager extends BaseManager {
       }
     }
     this._pendingWorkLabel = this._deferredWork[0]?.label ?? null;
+    this._pendingWorkAtMs = this._pendingWorkLabel ? Date.now() : 0;
   }
 
   /**
@@ -2119,6 +2193,15 @@ class VRExplorationManager extends BaseManager {
    *   glyphs…" (etc.) instead of silently freezing while the work runs.
    */
   getPendingWorkLabel() {
+    if (!this._pendingWorkLabel) return null;
+    // TTL. VRSpatialMenuModel.getStatusLine short-circuits on this label
+    // unconditionally, so a queue that somehow stops draining would leave the
+    // panel reading "Building glyphs…" for the rest of the session, hiding the
+    // dataset name, scale and nav mode. Belt and braces with the `finally` in
+    // _onFrame that keeps the drain running.
+    if (Date.now() - (this._pendingWorkAtMs || 0) > PENDING_WORK_TTL_MS) {
+      return null;
+    }
     return this._pendingWorkLabel;
   }
 
@@ -2340,19 +2423,27 @@ class VRExplorationManager extends BaseManager {
       // menu pinch doesn't leak into the handler's own interaction handling.
       handler.updateVRExploration?.(vrContext, frame, toolInput, viewerPose);
 
-      // Drain one deferred heavy task (if any), now that both eyes for THIS
-      // frame have been drawn — see _deferHeavy for why this runs here and
-      // not at the top of the frame (VTKVRSpatialUI._layoutStatus reads
-      // getPendingWorkLabel() before activate() enqueues, so a label queued
-      // this frame is only visible to the user starting next frame; draining
-      // at the end of that next frame means it renders before the stall).
-      this._drainDeferredWork();
-
       // Emit frame event for UI
       this._emit('frame', { time, inputState, deltaTime });
 
     } catch (error) {
       log.error('Error in VR frame loop:', error);
+    } finally {
+      // Drain one deferred heavy task, now that both eyes for THIS frame have
+      // been drawn.
+      //
+      // MUST be in `finally`. It used to sit at the end of the try block,
+      // downstream of ~9 unguarded calls (input gathering, navigation, tools,
+      // avatars, the handler's draw). Any of those throwing skipped the drain —
+      // and because the cause is per-frame state, it skipped it on every
+      // subsequent frame too. The queue then grew forever and Glyphs, Style,
+      // Threshold and Isosurface silently stopped applying while the session
+      // carried on rendering normally, with only a log line to show for it.
+      try {
+        this._drainDeferredWork();
+      } catch (e) {
+        log.error(`VR deferred drain failed — ${e?.message}`, e?.stack || e);
+      }
     }
   }
 
