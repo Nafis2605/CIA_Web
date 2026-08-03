@@ -3,6 +3,12 @@ import { presence as log } from "@Utils/logger.js";
 import { config } from "@Core/config/clientConfig.js";
 import { authService } from "@Services/authService.js";
 import { getStoredMockUserId, getDefaultMockUser, getMockUser } from "@Config/mockUsers.js";
+import {
+  getDeviceId,
+  getDeviceName,
+  getDeviceEmail,
+  hasDeviceName,
+} from "@Core/identity/deviceIdentity.js";
 
 // Initialize or retrieve user ID
 let userId = localStorage.getItem("cia_user_id");
@@ -18,12 +24,35 @@ if (!userId) {
 let userName = localStorage.getItem("cia_username");
 let userColor = null;
 
+/**
+ * Whether dev bypass is active (no Keycloak; identity comes from mock users
+ * or the per-device identity).
+ * @returns {boolean}
+ */
+function isDevBypassMode() {
+  return config.devBypassAuth === true || config.devBypassAuth === "true";
+}
+
+/**
+ * Whether the dev fallback identity is the persistent per-device one rather
+ * than the shared default mock user. Single revert switch — see
+ * `identity.deviceFallback` in clientConfig.
+ * @returns {boolean}
+ */
+function useDeviceFallback() {
+  return config.identity?.deviceFallback !== false;
+}
+
 export function getUserId() {
-  const isDevMode =
-    config.devBypassAuth === true || config.devBypassAuth === "true";
+  const isDevMode = isDevBypassMode();
   if (isDevMode) {
+    // An explicitly selected mock identity (?devUser=alice, DevUserSwitcher)
+    // always wins.
     const mockUserId = getStoredMockUserId();
-    return mockUserId || getDefaultMockUser().id;
+    if (mockUserId) return mockUserId;
+    // Otherwise this browser is its own user, not a shared "CIA Admin".
+    if (useDeviceFallback()) return getDeviceId();
+    return getDefaultMockUser().id;
   }
   const authUser = authService.getUser?.();
   if (authUser?.id) {
@@ -33,13 +62,16 @@ export function getUserId() {
 }
 
 export function getUserName() {
-  const isDevMode =
-    config.devBypassAuth === true || config.devBypassAuth === "true";
+  const isDevMode = isDevBypassMode();
   if (isDevMode) {
     const mockUserId = getStoredMockUserId();
     if (mockUserId) {
       const mockUser = getMockUser(mockUserId);
       if (mockUser) return mockUser.name;
+    }
+    if (useDeviceFallback()) {
+      // A name typed into the entry/VR prompt wins over the UA-derived one.
+      return userName || getDeviceName();
     }
     return getDefaultMockUser().name;
   }
@@ -56,14 +88,14 @@ export function getUserName() {
 }
 
 export function getUserEmail() {
-  const isDevMode =
-    config.devBypassAuth === true || config.devBypassAuth === "true";
+  const isDevMode = isDevBypassMode();
   if (isDevMode) {
     const mockUserId = getStoredMockUserId();
     if (mockUserId) {
       const mockUser = getMockUser(mockUserId);
       if (mockUser) return mockUser.email;
     }
+    if (useDeviceFallback()) return getDeviceEmail();
     return getDefaultMockUser().email;
   }
   const authUser = authService.getUser?.();
@@ -77,6 +109,37 @@ export function getUserEmail() {
 export function hasUserName() {
   // return false; // Always return false to ensure modal prompt for now during tab testing
   return !!userName;
+}
+
+/**
+ * Whether the user should be asked for a display name before entering a
+ * collaborative surface (VR in particular, where every participant is listed
+ * by name).
+ *
+ * Never prompts when the identity was supplied externally: `?devUser=alice`
+ * in dev, or a signed-in Keycloak user in production.
+ *
+ * NOTE for callers on the VR entry path: resolve this on a PRIOR user
+ * interaction. WebXR `requestSession()` needs fresh user activation, so an
+ * async modal in the same click that calls `startExploration` burns the
+ * activation and VR entry fails silently.
+ *
+ * @returns {boolean}
+ */
+export function needsDisplayNamePrompt() {
+  if (isDevBypassMode()) {
+    // Explicit mock identity (?devUser=) already carries a name.
+    if (getStoredMockUserId()) return false;
+    if (!useDeviceFallback()) return false;
+  } else {
+    // Signed-in users get their name from the token.
+    const authUser = authService.getUser?.();
+    if (authUser) return false;
+  }
+
+  if (hasUserName()) return false;
+  if (hasDeviceName()) return false;
+  return true;
 }
 
 // Called by React modal to set the username

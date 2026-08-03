@@ -24,6 +24,8 @@ export class AvatarManager {
     this._localUserInfo = null;
     this._localAvatarUrl = null;
     this._enabled = true;
+    // yAvatars is ROOM-global, not per VR session — see _onRemotePresence.
+    this._sessionId = null;
   }
 
   // ===========================================================================
@@ -42,6 +44,7 @@ export class AvatarManager {
     this._renderer = renderer;
     this._session = session;
     this._vrContext = vrContext;
+    this._sessionId = session?.id || null;
 
     this._localUserInfo = {
       userId: getUserId(),
@@ -49,6 +52,8 @@ export class AvatarManager {
       color: getUserColor(),
       avatarUrl: this._localAvatarUrl,
       isSpeaking: false,
+      // 'dataset' | 'filter' | null — see setLocalActivity.
+      activity: null,
       isLocal: true,
     };
 
@@ -61,17 +66,22 @@ export class AvatarManager {
     // Broadcast local metadata so remotes can show our name/color/url
     this._broadcastPresence();
 
-    // Add any participants that were already in the session when we joined
-    if (session?.getParticipants) {
-      for (const p of session.getParticipants()) {
-        if (p.odUserId !== this._localUserInfo.userId) {
-          this.addRemoteUser({
-            userId: p.odUserId,
-            displayName: p.userName,
-            color: p.userColor,
-          });
-        }
-      }
+    // Add any participants that were already in the session when we joined.
+    //
+    // This used to guard on `session.getParticipants` — a method
+    // VRExplorationSession does not have (the array is `session.participants`;
+    // the query helpers are getVRParticipants()/getDesktopParticipants()). The
+    // whole branch was dead, so a joiner created ZERO remote controllers here
+    // and only materialised peers when their first pose packet happened to
+    // land — up to a full send interval of an empty room, and forever if a peer
+    // was idle enough not to be sending.
+    for (const p of Array.isArray(session?.participants) ? session.participants : []) {
+      if (!p?.odUserId || p.odUserId === this._localUserInfo.userId) continue;
+      this.addRemoteUser({
+        userId: p.odUserId,
+        displayName: p.userName,
+        color: p.userColor,
+      });
     }
 
     log.info('AvatarManager initialized for session:', session?.id);
@@ -135,6 +145,25 @@ export class AvatarManager {
   }
 
   /**
+   * Mark this user as the one currently changing the shared data, so every
+   * other headset sees a halo + "EDITING" badge on their avatar.
+   *
+   * Called from VRExplorationManager._signalManipulation (and its idle timer),
+   * i.e. at manipulation-event rate — NOT per frame. No-op if unchanged, and
+   * sendLocalPresence additionally drops an unchanged payload, so a stream of
+   * repeated signals costs nothing on the wire.
+   *
+   * @param {string|null} target - 'dataset' | 'filter' | null
+   */
+  setLocalActivity(target) {
+    if (!this._localUserInfo) return;
+    const next = target || null;
+    if (this._localUserInfo.activity === next) return;
+    this._localUserInfo.activity = next;
+    this._broadcastPresence();
+  }
+
+  /**
    * Broadcast the full current local metadata (name/color/url/isSpeaking) so no
    * individual field update clobbers the others.
    * @private
@@ -146,6 +175,8 @@ export class AvatarManager {
       color: this._localUserInfo.color,
       avatarUrl: this._localUserInfo.avatarUrl || null,
       isSpeaking: this._localUserInfo.isSpeaking || false,
+      sessionId: this._sessionId,
+      activity: this._localUserInfo.activity || null,
     });
   }
 
@@ -188,6 +219,7 @@ export class AvatarManager {
     this._renderer = null;
     this._session = null;
     this._vrContext = null;
+    this._sessionId = null;
     log.debug('AvatarManager disposed');
   }
 
@@ -211,6 +243,15 @@ export class AvatarManager {
   }
 
   _onRemotePresence(userId, data) {
+    // yAvatars is the ROOM-global avatar map, not a per-session one: a peer
+    // exploring a DIFFERENT VR session on the same view/room writes into it
+    // too, and would otherwise be spawned into our scene. Only reject on a
+    // positive mismatch — a peer that predates the sessionId field (or a
+    // session with no id yet) still gets an avatar rather than vanishing.
+    if (this._sessionId && data?.sessionId && data.sessionId !== this._sessionId) {
+      return;
+    }
+
     let controller = this._remotes.get(userId);
     if (!controller) {
       this.addRemoteUser({
@@ -230,6 +271,7 @@ export class AvatarManager {
         avatarUrl: data.avatarUrl,
       },
       speaking: data.isSpeaking || false,
+      activity: data.activity || null,
     });
   }
 }

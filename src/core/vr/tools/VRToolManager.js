@@ -8,10 +8,24 @@ import { VRClipBoxTool } from './VRClipBoxTool.js';
 import { VRProbeTool } from './VRProbeTool.js';
 
 export class VRToolManager {
-  constructor(handler, vrContext) {
+  /**
+   * @param {object} handler - the owning VTK instance handler
+   * @param {object} vrContext
+   * @param {object} [options]
+   * @param {(label: string) => boolean} [options.canManipulate] - permission
+   *   predicate injected by VRExplorationManager (the data-manipulation
+   *   token, see VRManipulationLock). Injected rather than imported because
+   *   VRExplorationManager already imports this module — importing it back
+   *   would be a cycle. Absent => everything is permitted, which is what keeps
+   *   a bare `new VRToolManager(handler, ctx)` behaving as it always did.
+   */
+  constructor(handler, vrContext, options = {}) {
     this._handler = handler;
     this._vrContext = vrContext;
     this._activeTool = null;
+    this._canManipulate = typeof options.canManipulate === 'function'
+      ? options.canManipulate
+      : null;
 
     // Register available tools
     this._tools = new Map([
@@ -24,12 +38,24 @@ export class VRToolManager {
     // Context passed to tools. `renderer` is exposed as a live getter (the
     // VR scene renderer lives at vrContext.sceneObjects.renderer and may not
     // exist yet at construction time) so tools can add actors lazily.
+    //
+    // `canManipulate` follows the same live-getter discipline: tools call it
+    // at COMMIT time, never cache it, so a token handed over mid-session takes
+    // effect on the very next placement.
+    const canManipulate = this._canManipulate;
     this._toolContext = {
       handler: this._handler,
       vrContext: this._vrContext,
       manager: this,
       get renderer() {
         return this.vrContext?.sceneObjects?.renderer || null;
+      },
+      /**
+       * @param {string} label - what is being attempted, for the refusal notice
+       * @returns {boolean} true when this user may commit shared changes
+       */
+      canManipulate(label) {
+        return canManipulate ? canManipulate(label) !== false : true;
       },
     };
   }

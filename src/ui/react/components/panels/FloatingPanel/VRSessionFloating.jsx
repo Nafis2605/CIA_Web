@@ -120,6 +120,9 @@ export const VRSessionFloating = memo(function VRSessionFloating({
     leaveSession,
     endSession,
     createSnapshot,
+    manipulationHolder,
+    activityByUserId,
+    grantControl,
   } = useVRSession(projectId);
 
   // Auto-open panel when VR session becomes active
@@ -223,6 +226,9 @@ export const VRSessionFloating = memo(function VRSessionFloating({
         onEndSession={endSession}
         onLeaveSession={leaveSession}
         onCreateSnapshot={createSnapshot}
+        manipulationHolder={manipulationHolder}
+        activityByUserId={activityByUserId}
+        onGrantControl={grantControl}
       />
     </FloatingPanel>
   );

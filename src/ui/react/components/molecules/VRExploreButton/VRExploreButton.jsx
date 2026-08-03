@@ -15,6 +15,12 @@ import { vrExplorationManager } from "@Core/vr/VRExplorationManager.js";
 import { workspaceManager } from "@Core/instances/workspaceManager.js";
 import { PARTICIPATION_MODE } from "@Core/data/models/VRExplorationSession.js";
 import { VRLaunchModal } from "@UI/react/components/modals/VRLaunchModal";
+import { UsernameModal } from "@UI/react/components/modals/UsernameModal";
+import {
+  needsDisplayNamePrompt,
+  setUserName,
+} from "@Collaboration/presence/userManagement.js";
+import { setDeviceName } from "@Core/identity/deviceIdentity.js";
 import { toast } from "@UI/react/store/toastStore.js";
 import "./VRExploreButton.scss";
 
@@ -54,6 +60,7 @@ export function VRExploreButton({
   // Modal state
   const [showLaunchModal, setShowLaunchModal] = useState(false);
   const [showSessionList, setShowSessionList] = useState(false);
+  const [showNamePrompt, setShowNamePrompt] = useState(false);
 
   // Check VR support on mount
   useEffect(() => {
@@ -121,6 +128,18 @@ export function VRExploreButton({
   }, [activeSessions, dataset]);
 
   /**
+   * Handle the display-name prompt being submitted.
+   * Sets both the collaboration display name and the persistent device name,
+   * so the headset keeps this name across reloads.
+   */
+  const handleNameSubmit = useCallback((name) => {
+    setUserName(name);
+    setDeviceName(name);
+    setShowNamePrompt(false);
+    toast.info(`Saved as "${name}" — tap Enter VR again to start`);
+  }, []);
+
+  /**
    * Handle button click
    */
   const handleClick = useCallback(() => {
@@ -128,6 +147,15 @@ export function VRExploreButton({
       // Full teardown of tools/spatial UI/avatars/environment, then
       // vrManager.exitVR() internally — not a bare session end.
       vrExplorationManager.leaveSession();
+      return;
+    }
+
+    // Ask for a display name BEFORE any VR entry path. This click deliberately
+    // does not continue into VR: WebXR requestSession() needs fresh user
+    // activation, and an intervening async modal burns it. The user submits a
+    // name, then taps Enter VR again.
+    if (needsDisplayNamePrompt()) {
+      setShowNamePrompt(true);
       return;
     }
 
@@ -262,6 +290,20 @@ export function VRExploreButton({
         {/* Active pulse */}
         {isInVR && <span className="vr-explore-button__pulse" />}
       </button>
+
+      {/* Display-name prompt — shown on the click BEFORE the one that enters
+          VR, so the WebXR user activation is never spent on this modal. */}
+      {showNamePrompt && (
+        <UsernameModal
+          onSubmit={handleNameSubmit}
+          onCancel={() => setShowNamePrompt(false)}
+          title="Name yourself"
+          subtitle="Everyone in the VR session sees this name"
+          label="Display name"
+          submitLabel="Save name"
+          hint="Tap Enter VR again once your name is saved"
+        />
+      )}
 
       {/* Launch Modal */}
       <VRLaunchModal

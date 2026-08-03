@@ -146,6 +146,30 @@ export class VRControlManager {
     return this._pendingRequest;
   }
 
+  /**
+   * Re-key onto a different Y.js session id (session convergence — see
+   * VRExplorationManager.startExploration / VRParticipantSync.rekey). Unlike
+   * VRParticipantSync, this map is bound once in the CONSTRUCTOR
+   * (`vr-control-<session.id>`), so without this method a re-keyed session
+   * would silently keep reading/writing the pre-rekey map forever.
+   *
+   * @param {string} newSessionId
+   */
+  rekey(newSessionId) {
+    if (!newSessionId || newSessionId === this._session.id) return;
+
+    this._observers.forEach(cleanup => cleanup());
+    this._observers = [];
+
+    this._session.id = newSessionId;
+    this._yControlRequests = ydoc.getMap(`vr-control-${newSessionId}`);
+    this._pendingRequest = null;
+
+    this._setupObservers();
+
+    log.info(`VRControlManager re-keyed to session ${newSessionId}`);
+  }
+
   cleanup() {
     this._observers.forEach(cleanup => cleanup());
     this._observers = [];

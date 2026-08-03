@@ -17,6 +17,10 @@ const LABEL_H = 64;
 const LABEL_WORLD_WIDTH = 0.32;  // meters wide in VR
 const LABEL_WORLD_HEIGHT = 0.08; // meters tall
 const LABEL_Y_OFFSET = 0.28;     // meters above head center
+// "EDITING" badge drawn at the right edge when the user is manipulating the
+// shared data (see setActivity).
+const BADGE_W = 66;
+const BADGE_H = 26;
 
 /**
  * Renders a 3D name label in VR space.
@@ -32,6 +36,10 @@ export class AvatarLabel {
     this._displayName = '';
     this._color = '#ffffff';
     this._speaking = false;
+    // What this user is manipulating ('dataset' | 'filter' | null) — drives the
+    // amber badge drawn on the right of the name. Presence-rate, see
+    // SimpleAvatarFallback.setActivity.
+    this._activity = null;
     this._renderer = null;
   }
 
@@ -109,6 +117,19 @@ export class AvatarLabel {
     this._redraw();
   }
 
+  /**
+   * Show/hide the "changing the data" badge. Dirty-checked like setSpeaking —
+   * _redraw() ends in a GPU texture upload, so it must only run on an actual
+   * change.
+   * @param {string|null} activity
+   */
+  setActivity(activity) {
+    const next = activity || null;
+    if (this._activity === next) return;
+    this._activity = next;
+    this._redraw();
+  }
+
   setVisible(visible) {
     this._actor?.setVisibility(visible);
   }
@@ -152,14 +173,32 @@ export class AvatarLabel {
     ctx.arc(22, LABEL_H / 2, 9, 0, Math.PI * 2);
     ctx.fill();
 
-    // Name text
+    // Name text. The badge (when present) eats into the width available for
+    // the name, so the truncation budget shrinks with it rather than letting
+    // a long name run underneath the badge.
+    const badgeW = this._activity ? BADGE_W : 0;
     ctx.fillStyle = '#ffffff';
     ctx.font = 'bold 22px Arial, sans-serif';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'middle';
-    const maxW = LABEL_W - 48;
+    const maxW = LABEL_W - 48 - badgeW;
     const text = this._truncate(ctx, this._displayName, maxW);
     ctx.fillText(text, 40, LABEL_H / 2);
+
+    // Activity badge: this person is changing the shared data right now. Amber,
+    // matching the roster's holder card and the head halo, so the three read as
+    // one signal.
+    if (this._activity) {
+      const bx = LABEL_W - BADGE_W - 8;
+      const by = (LABEL_H - BADGE_H) / 2;
+      ctx.fillStyle = 'rgba(255,183,72,0.95)';
+      roundRectPath(ctx, bx, by, BADGE_W, BADGE_H, 8);
+      ctx.fill();
+      ctx.fillStyle = '#241703';
+      ctx.font = 'bold 14px Arial, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('EDITING', bx + BADGE_W / 2, LABEL_H / 2);
+    }
 
     this._uploadTexture();
   }

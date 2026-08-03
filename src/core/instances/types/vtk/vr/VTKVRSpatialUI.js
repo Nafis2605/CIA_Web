@@ -130,6 +130,12 @@ const CARD_STYLES = {
   // working one and a tap just silently does nothing — the failure mode the
   // Views button's "no-other-views" result was added to avoid.
   disabled: { fill: "rgba(24,27,36,0.72)", border: "rgba(70,78,100,0.38)" },
+  // The participant who currently holds the data-manipulation token
+  // (VRManipulationLock), on their roster cell in the people drawer. Amber
+  // rather than the teal "active" so "this person controls the data" never
+  // reads as "this button is switched on" — the two mean different things and
+  // can be true of different cells at the same time.
+  holder: { fill: "rgba(96,66,18,0.96)", border: "rgba(255,190,92,0.98)" },
 };
 
 // Per-activity accent, keyed by a button's `group` (VR_MENU_GROUPS). Applied as
@@ -234,6 +240,9 @@ export class VRSpatialUI {
     // not every frame.
     this._lastActiveToolId = null;
     this._lastOpenDrawerId = null;
+    // Coarse people-drawer roster signature from the model, so the roster row's
+    // actors are only reconciled when the row actually changes shape.
+    this._lastRosterKey = "";
     // Status line (dataset / scale / nav mode) — a single dynamic label kept
     // separate from the static button labels since its text changes. Canvas/
     // context/texture/plane are kept around so _redrawStatusLabel can update
@@ -587,6 +596,11 @@ export class VRSpatialUI {
           texture: card.texture,
           stateKey: card.stateKey,
           group: region.group ?? null,
+          // What the label canvas currently reads. Static buttons never change
+          // it; roster cells do (see _refreshRosterLabels), and this is the
+          // dirty-check that keeps that from repainting on every frame.
+          labelText: region.label ?? "",
+          labelPaintTime: now(),
         });
         this._renderer.addActor(card.actor);
         if (label) this._renderer.addActor(label.actor);
@@ -1259,18 +1273,30 @@ export class VRSpatialUI {
       this._drawBackingPanel(mode);
     }
 
+    // The people drawer's roster row appears/disappears with the roster
+    // itself, which the model exposes as a COARSE key — see
+    // VRSpatialMenuModel._refreshRoster. Comparing the key (rather than
+    // reconciling unconditionally) is what keeps a roster that is merely
+    // *observed* every frame from rebuilding actors every frame.
+    const rosterKey = this._model.getRosterKey?.() ?? "";
     if (
       activeToolId !== this._lastActiveToolId ||
       openDrawerId !== this._lastOpenDrawerId ||
+      rosterKey !== this._lastRosterKey ||
       modeChanged
     ) {
       this._lastActiveToolId = activeToolId;
       this._lastOpenDrawerId = openDrawerId;
+      this._lastRosterKey = rosterKey;
       this._reconcileButtonActors();
     }
     this._panelHeight = this._computePanelHeight(this._currentRowCount());
 
     this._layoutBackingPanel();
+    // Before _layoutButtons: a swapped roster label is a NEW actor, and only
+    // _layoutButtons positions/shows it. Repainting after it would leave the
+    // new label at the origin, invisible, for one frame.
+    this._refreshRosterLabels();
     this._layoutButtons();
     this._layoutStatus();
     this._layoutHint();
@@ -1627,6 +1653,60 @@ export class VRSpatialUI {
   }
 
   /**
+   * Repaint the people-drawer roster cells whose label text has changed.
+   *
+   * Roster cards are keyed by POSITION (`roster-0`..`roster-4`), so the same
+   * five actors are reused as people join, leave, or get handed the data token
+   * and the precedence order reshuffles — which means the NAME on a given card
+   * can change without the card itself being rebuilt.
+   *
+   * Every repaint is a canvas draw plus an uploadCanvasTexture() — a GPU
+   * upload. So this uses exactly the two-stage gate _layoutStatus already
+   * uses: a dirty-check on the text, and on top of it LABEL_REPAINT_INTERVAL_MS
+   * so a burst of roster churn (three people joining at once) cannot fire five
+   * uploads on five consecutive frames. When the gate defers a repaint,
+   * `labelText` is left UNCHANGED so this method re-enters on later frames and
+   * eventually paints whatever the latest text is — nothing is dropped, only
+   * delayed by at most one interval.
+   * @private
+   */
+  _refreshRosterLabels() {
+    if (!this._renderer || !this._model) return;
+    const t = now();
+
+    for (const region of this._model.getButtonLayout()) {
+      if (region.kind !== "roster-entry") continue;
+      const entry = this._buttonActors.get(region.id);
+      if (!entry) continue;
+
+      const text = region.label || "";
+      if (entry.labelText === text) continue;
+      if (t - (entry.labelPaintTime || 0) < LABEL_REPAINT_INTERVAL_MS) continue;
+
+      // The label plane is sized to its own text's aspect ratio at build time
+      // (see _createButtonContentActor), so a different name needs a different
+      // plane — repainting the existing canvas in place would stretch the new
+      // text to the old name's width. Swap the actor instead.
+      try {
+        const label = this._createButtonContentActor(
+          text,
+          region.icon,
+          BUTTON_LABEL_WORLD_HEIGHT,
+          COLOR_LABEL
+        );
+        if (entry.labelActor) this._renderer.removeActor(entry.labelActor);
+        entry.labelActor = label?.actor ?? null;
+        if (label) this._renderer.addActor(label.actor);
+        entry.labelText = text;
+        entry.labelPaintTime = t;
+      } catch (err) {
+        log.error(`VR roster label "${region.id}" failed to repaint — ${err?.message}`);
+        // Leave labelText alone: the next frame past the gate retries.
+      }
+    }
+  }
+
+  /**
    * Repaint each button card for its current visual state (idle / hover /
    * active), but only when that state actually changed — the card canvas +
    * texture upload is far more work than the old setColor, so a dirty-check per
@@ -1644,6 +1724,11 @@ export class VRSpatialUI {
       if (state?.active) key = "active";
       else if (state?.disabled) key = "disabled";
       else if (id === this._hoverButtonId) key = "hover";
+      // Holder is the roster cell's IDLE variant — it loses to hover so
+      // pointing at the cell still gives the usual "you are about to press
+      // this" feedback, and to disabled so a stale participant still reads as
+      // unreachable.
+      else if (state?.holder) key = "holder";
       if (entry.stateKey !== key && entry.ctx) {
         this._drawCard(entry.ctx, entry.canvas, entry.texture, key, entry.group);
         entry.stateKey = key;
@@ -1897,6 +1982,7 @@ export class VRSpatialUI {
     this._panelHeight = this._computePanelHeight(5);
     this._lastActiveToolId = null;
     this._lastOpenDrawerId = null;
+    this._lastRosterKey = "";
     this._panelWidth = PANEL_WIDTH;
     this._panelDrop = PANEL_DROP;
     this._panelSideOffset = PANEL_SIDE_OFFSET;

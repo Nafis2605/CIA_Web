@@ -273,6 +273,44 @@ export class VRExplorationSession {
     return participant;
   }
 
+  /**
+   * Add a participant, or update one already present WITHOUT recreating it.
+   *
+   * Prefer this over addParticipant for anything driven by a repeating network
+   * message (presence pings, pose packets). addParticipant calls
+   * removeParticipant first, so re-calling it mints a new VRParticipant and
+   * resets `joinedAt` — and host promotion resolves ties by lowest `joinedAt`,
+   * so a `joinedAt` that keeps moving makes that ordering meaningless.
+   *
+   * @param {string} odUserId
+   * @param {string} [userName]
+   * @param {string} [userColor]
+   * @param {string} [mode] - only applied when provided; an omitted mode leaves
+   *   the existing one alone rather than silently demoting a VR explorer.
+   * @returns {VRParticipant}
+   */
+  upsertParticipant(odUserId, userName, userColor, mode) {
+    const existing = this.getParticipant(odUserId);
+    if (!existing) {
+      return this.addParticipant(
+        odUserId,
+        userName,
+        userColor,
+        mode || PARTICIPATION_MODE.DESKTOP_OBSERVER
+      );
+    }
+
+    if (userName) existing.userName = userName;
+    if (userColor) existing.userColor = userColor;
+    if (mode && mode !== existing.mode) {
+      existing.mode = mode;
+      existing.permissions = this._getDefaultPermissions(mode);
+    }
+    existing.lastActiveAt = Date.now();
+    // joinedAt deliberately untouched.
+    return existing;
+  }
+
   removeParticipant(odUserId) {
     const index = this.participants.findIndex(p => p.odUserId === odUserId);
     if (index !== -1) {

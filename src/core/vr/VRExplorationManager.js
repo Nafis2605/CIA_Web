@@ -14,6 +14,7 @@ import { VRParticipantSync } from '@Core/vr/VRParticipantSync.js';
 import { VRToolManager } from '@Core/vr/tools/VRToolManager.js';
 import { VRSnapshotManager } from '@Core/vr/VRSnapshotManager.js';
 import { VRControlManager } from '@Core/vr/VRControlManager.js';
+import { VRManipulationLock } from '@Core/vr/VRManipulationLock.js';
 import { VRNavigationController } from '@Core/vr/navigation/VRNavigationController.js';
 import { workspaceManager } from '@Core/instances/workspaceManager.js';
 import { getViewConfigurationManager } from '@Init/appInitializer.js';
@@ -34,6 +35,16 @@ import { vtkGlyphFeature, isGlyphFeatureAvailable } from '@Core/instances/types/
 import { instanceTools } from '@VTK/vtkInstanceTools.js';
 import { pushSharedVisualizationUpdate } from '@Services/visualizationSyncService.js';
 import { vrCursorSync } from '@Core/vr/VRCursorSync.js';
+import {
+  yVRSessions,
+  getVRSessionForView,
+  claimVRSession,
+  heartbeatVRSession,
+  releaseVRSession,
+  syncManipulatorToYjs,
+  yManipulatorState,
+} from '@Collaboration/yjs/yjsSetup.js';
+import { presenceSystem } from '@Collaboration/presence/presenceSystem.js';
 import { mapXRPointToData, controllerForward } from '@Core/vr/tools/vrPlaneMath.js';
 import { vrEnvironment } from '@Core/vr/environment/VREnvironment.js';
 import { voiceRoomService, getVoiceRoomName } from '@Services/voice/voiceRoomService.js';
@@ -66,6 +77,53 @@ const FIT_DIAGONAL_M = 2 * FIT_DISTANCE_M * Math.sin(FIT_HALF_ANGLE_RAD);
 // panel falls back to its normal status line (see getPendingWorkLabel).
 const PENDING_WORK_TTL_MS = 3000;
 
+// Minimum gap between surface picks for the pointer's hit marker (10 Hz).
+//
+// VTKInstanceHandler.raycastVR rebuilds its pick list (_getVRPickTargets) on
+// EVERY call and then runs a vtkCellPicker pass, so it is nowhere near a
+// 90 Hz-per-frame budget. The hit point only has to look attached to the
+// surface, and at 10 Hz the ray itself still moves every frame — only the dot
+// quantizes. Between picks the cached hit is reused verbatim.
+const POINTER_PICK_MS = 100;
+
+// Minimum gap between shared vr-sessions registry housekeeping ticks
+// (heartbeat + host-promotion check) — see _tickVRSessionRegistry. 1 Hz is
+// generous next to VR_SESSION_STALE_MS (15s), and keeps this off the
+// per-frame budget entirely.
+const VR_SESSION_HEARTBEAT_MS = 1000;
+
+// How long _watchVRSessionConvergence keeps listening to yVRSessions after a
+// claim/adopt, to catch a competing write that resolves the claim race AFTER
+// our own synchronous claimVRSession() call already returned (see its
+// docstring in yjsSetup.js).
+const VR_SESSION_CONVERGE_WATCH_MS = 3000;
+
+// How long an in-VR notice ("X has data control") stays on the spatial menu's
+// status line. Long enough to read at arm's length inside a headset, short
+// enough that it never masks the dataset/scale/mode line for a whole gesture.
+const VR_NOTICE_MS = 2500;
+
+// How long after the last shared-data change this user stays lit as the
+// "active manipulator" on every desktop client (the existing
+// yjsSetup.syncManipulatorToYjs / onManipulatorChange channel). Matches the
+// desktop camera-manipulation debounce so VR and desktop activity decay alike.
+const MANIPULATOR_IDLE_MS = 1500;
+
+// Human-readable names for the keys _pushVisualizationPatch can carry, used
+// only for the refusal notice ("Glyphs needs data control — Alice has it").
+const PATCH_LABELS = Object.freeze({
+  clipBox: 'Clip',
+  representation: 'Appearance',
+  glyph: 'Glyphs',
+  threshold: 'Threshold',
+  isosurface: 'Isosurface',
+  transform: 'Move Object',
+});
+
+// Which patch keys read as "filtering" rather than "changing the dataset" on
+// the desktop manipulator-awareness UI (see _signalManipulation).
+const FILTER_PATCH_KEYS = new Set(['clipBox', 'threshold', 'isosurface', 'glyph']);
+
 class VRExplorationManager extends BaseManager {
   constructor() {
     super();
@@ -80,6 +138,17 @@ class VRExplorationManager extends BaseManager {
     this._snapshotManager = null;
     this._controlManager = null;
     this._navigationController = null;
+
+    // Data-manipulation token (Phase 3). Null outside an active session — and
+    // EVERY gate below fails OPEN on null, so nothing that worked before this
+    // existed can be blocked by its absence (see _hasManipulationControl).
+    /** @type {VRManipulationLock|null} */
+    this._manipulationLock = null;
+    this._offManipulationLock = null;
+    // Transient in-headset message, { text, untilMs } — see _flashVRNotice.
+    this._vrNotice = null;
+    // Debounce handle for the "this user is manipulating" activity signal.
+    this._manipulatorIdleTimer = null;
 
     // Frame loop — driven by vrManager's single XR rAF loop, not our own.
     // _offFrame/_offSessionEnded hold the unsubscribe functions returned by
@@ -124,6 +193,18 @@ class VRExplorationManager extends BaseManager {
     // Floor point under the head in XR metres, refreshed each frame. Used as
     // the pivot for scale changes that originate outside the frame loop.
     this._lastHeadFloorXR = null;
+
+    // Throttle cache for the pointer's surface pick — { pos, atMs }. See
+    // POINTER_PICK_MS and _pickPointerHit.
+    /** @type {{pos: {x:number,y:number,z:number}|null, atMs: number}|null} */
+    this._lastPointerHit = null;
+
+    // Session convergence (Phase 1): unsubscribe for the short-lived
+    // post-claim yVRSessions observer (see _watchVRSessionConvergence), and
+    // the Date.now() guard for the ≤1 Hz registry heartbeat/host-promotion
+    // tick (see _tickVRSessionRegistry).
+    this._offVRSessionObserver = null;
+    this._lastVRSessionHeartbeat = 0;
 
     // Bind methods
     this._onFrame = this._onFrame.bind(this);
@@ -175,13 +256,50 @@ class VRExplorationManager extends BaseManager {
       ...sessionConfig,
     });
 
-    // Register with the server before sub-managers are constructed:
-    // VRParticipantSync keys its Y.js map by session.id, so the canonical
-    // (server) id must be adopted first for joiners to sync avatars.
-    if (!serverSession) {
-      const serverRow = await this._tryRegisterSession(session);
-      if (serverRow?.id) {
-        session.id = serverRow.id;
+    // SESSION CONVERGENCE (defect: a second "Enter VR" tap on the same view
+    // used to mint its own vrsession_<ts>_<rand> id, opening a DIFFERENT
+    // `vr-participants-<id>` Y.js map — the two users were invisible to each
+    // other, and the server's GET /vr/sessions can't fix it (it filters on
+    // projectId, which is undefined for locally loaded datasets). The id
+    // must be settled before sub-managers are constructed: VRParticipantSync
+    // keys its Y.js map by session.id, so joiners need the canonical id to
+    // sync avatars against the same map.
+    //
+    // Three paths, in priority order:
+    //  1. Explicit join (config.serverSession) — id is already canonical.
+    //  2. A live room-scoped registry record already exists for this view
+    //     (another client entered VR on it first) — adopt its sessionId/host
+    //     directly and skip server registration entirely. This also removes
+    //     the up-to-1500ms _tryRegisterSession race from the joiner's path.
+    //  3. Neither — we're first. Register with the server as before, then
+    //     claim the registry slot; someone racing us for the SAME slot may
+    //     still beat us to it (Y.js Map is last-writer-wins), so adopt
+    //     whatever claimVRSession() returns rather than assuming we won it.
+    if (serverSession?.id) {
+      // Path 1 — nothing to adopt, id is already canonical.
+    } else {
+      const liveRecord = getVRSessionForView(instance.viewConfigId);
+      if (liveRecord) {
+        // Path 2
+        session.id = liveRecord.sessionId;
+        session.ownerUserId = liveRecord.hostUserId;
+        session.ownerUserName = liveRecord.hostUserName;
+      } else {
+        // Path 3
+        const serverRow = await this._tryRegisterSession(session);
+        if (serverRow?.id) {
+          session.id = serverRow.id;
+        }
+        const claimed = claimVRSession(instance.viewConfigId, {
+          sessionId: session.id,
+          hostUserId: getUserId(),
+          hostUserName: getUserName(),
+          datasetId: session.datasetId,
+          projectId: session.projectId,
+        });
+        session.id = claimed.sessionId;
+        session.ownerUserId = claimed.hostUserId;
+        session.ownerUserName = claimed.hostUserName;
       }
     }
 
@@ -197,6 +315,10 @@ class VRExplorationManager extends BaseManager {
     this._participantSync = new VRParticipantSync(session);
     this._snapshotManager = new VRSnapshotManager(session, getViewConfigurationManager());
     this._controlManager = new VRControlManager(session);
+    // Data-control token. Deliberately NOT VRControlManager: that models a
+    // desktop user puppeteering a VR user's viewpoint, which is orthogonal to
+    // "who may push shared visualization patches". See VRManipulationLock.
+    this._manipulationLock = new VRManipulationLock(session);
 
     // Request XR session via VRManager — the sole owner of session lifecycle,
     // reference space and the XRWebGLLayer. This must be the only place that
@@ -246,8 +368,13 @@ class VRExplorationManager extends BaseManager {
     this._applyInitialPlacement(vrContext, sessionConfig);
     this._needsPoseCorrection = true;
 
-    // Initialize tool manager with handler
-    this._toolManager = new VRToolManager(handler, vrContext);
+    // Initialize tool manager with handler. The `canManipulate` predicate is
+    // INJECTED rather than imported by the tools, so VRAnnotationTool/
+    // VRMeasureTool can refuse a placement without importing this manager
+    // (which imports them — that would be a cycle).
+    this._toolManager = new VRToolManager(handler, vrContext, {
+      canManipulate: (label) => this._requireManipulationControl(label),
+    });
 
     // Initialize navigation controller. The onObjectMoved callback lets the
     // MOVE_OBJECT mode broadcast the active dataset's transform to collaborators.
@@ -305,6 +432,25 @@ class VRExplorationManager extends BaseManager {
     // Start participant sync
     this._participantSync.start();
 
+    // Data-control token. The host claims it by default so a fresh session has
+    // exactly one authority instead of N headsets racing on the same patch
+    // channel; everyone else asks for it (see requestManipulationControl).
+    this._safeInitStep('manipulationLock.start', () => {
+      this._manipulationLock.start();
+      if (session.ownerUserId === getUserId()) {
+        this._manipulationLock.claimAsHost();
+      }
+      this._offManipulationLock = this._manipulationLock.onChange((state) =>
+        this._emit('manipulationControlChanged', state)
+      );
+    });
+
+    // Watch the shared registry for a short window after claiming/adopting a
+    // slot for this view — a claim race can resolve AFTER our own synchronous
+    // claimVRSession() call returns, once a competing write propagates over
+    // the network (see claimVRSession's docstring).
+    this._watchVRSessionConvergence(instance.viewConfigId, session);
+
     // Initialize avatar system
     const avatarRenderer = vrContext.sceneObjects?.renderer;
     if (avatarRenderer) {
@@ -334,6 +480,17 @@ class VRExplorationManager extends BaseManager {
     if (avatarRenderer) {
       this._safeInitStep('vrSpatialUI.initialize', () => vrSpatialUI.initialize(avatarRenderer, this));
     }
+
+    // Tell the ROOM (not just the session) that this user is now in a headset.
+    // Desktop collaborators who never open the VR panel still need to see it —
+    // useRoomPresence's `inVR` bucket and MemberRow's VR badge both read this.
+    this._safeInitStep('presence.setVRPresence', () =>
+      presenceSystem.setVRPresence({
+        inVR: true,
+        vrSessionId: session.id,
+        vrRole: session.ownerUserId === getUserId() ? 'host' : 'participant',
+      })
+    );
 
     // Emit event
     this._emit('explorationStarted', { session, instanceId });
@@ -403,6 +560,103 @@ class VRExplorationManager extends BaseManager {
     } catch (err) {
       log.warn('VR session server registration failed (continuing locally):', err.message);
       return null;
+    }
+  }
+
+  /**
+   * Watch the shared `vr-sessions` registry for VR_SESSION_CONVERGE_WATCH_MS
+   * after claiming/adopting the slot for this view. Two clients can claim
+   * "simultaneously" (see claimVRSession's docstring) — each wins its own
+   * synchronous local claim, but once the competing write propagates over the
+   * network, Y.js's last-writer-wins resolution can silently overwrite our
+   * entry with someone else's. If that happens, our sub-managers are still
+   * keyed by our own (losing) session id and would be invisible to the
+   * winner — so re-key onto the survivor the moment we see it.
+   *
+   * Self-unsubscribes after the window; also torn down early by leaveSession
+   * via _offVRSessionObserver.
+   *
+   * @param {string} viewConfigId
+   * @param {VRExplorationSession} session
+   * @private
+   */
+  _watchVRSessionConvergence(viewConfigId, session) {
+    if (!viewConfigId) return;
+
+    // A previous call (shouldn't normally overlap, but startExploration can
+    // in principle run again before this window elapses) must not leak.
+    this._offVRSessionObserver?.();
+
+    const observer = (event) => {
+      if (!event.changes.keys.has(viewConfigId)) return;
+
+      const record = getVRSessionForView(viewConfigId);
+      if (!record || record.sessionId === session.id) return;
+
+      log.info(`VR session claim race resolved against us — re-keying ${session.id} -> ${record.sessionId}`);
+      this._participantSync?.rekey(record.sessionId);
+      this._controlManager?.rekey(record.sessionId);
+      this._manipulationLock?.rekey(record.sessionId);
+      session.id = record.sessionId;
+      session.ownerUserId = record.hostUserId;
+      session.ownerUserName = record.hostUserName;
+    };
+
+    yVRSessions.observe(observer);
+
+    const timeoutId = setTimeout(() => {
+      yVRSessions.unobserve(observer);
+      this._offVRSessionObserver = null;
+    }, VR_SESSION_CONVERGE_WATCH_MS);
+
+    this._offVRSessionObserver = () => {
+      clearTimeout(timeoutId);
+      yVRSessions.unobserve(observer);
+    };
+  }
+
+  /**
+   * Low-frequency (throttled to VR_SESSION_HEARTBEAT_MS by the caller in
+   * _onFrame) housekeeping for the shared `vr-sessions` registry:
+   *  - refresh our record's heartbeat so the stale sweep (VR_SESSION_STALE_MS)
+   *    never evicts a session that is still live;
+   *  - if the host's record has disappeared (clean release, or its heartbeat
+   *    went stale), deterministically promote exactly one remaining client —
+   *    the live VR participant with the lowest joinedAt — instead of running
+   *    a voting protocol. Every remaining client runs this same computation;
+   *    only the one that agrees it is the winner writes the claim.
+   *
+   * @param {string|undefined} viewConfigId
+   * @param {VRExplorationSession|null} session
+   * @private
+   */
+  _tickVRSessionRegistry(viewConfigId, session) {
+    if (!viewConfigId || !session) return;
+
+    heartbeatVRSession(viewConfigId, getUserId());
+
+    if (getVRSessionForView(viewConfigId)) return; // host's slot is still live
+
+    const vrParticipants = session.getVRParticipants?.() || [];
+    if (!vrParticipants.length) return;
+
+    const winner = vrParticipants.reduce((best, p) =>
+      !best || p.joinedAt < best.joinedAt ? p : best,
+      null
+    );
+    if (!winner || winner.odUserId !== getUserId()) return; // not our turn
+
+    const claimed = claimVRSession(viewConfigId, {
+      sessionId: session.id,
+      hostUserId: getUserId(),
+      hostUserName: getUserName(),
+      datasetId: session.datasetId,
+      projectId: session.projectId,
+    });
+    session.ownerUserId = claimed.hostUserId;
+    session.ownerUserName = claimed.hostUserName;
+    if (claimed.hostUserId === getUserId()) {
+      log.info(`VR session host promoted: ${getUserId()} claimed ${viewConfigId}`);
     }
   }
 
@@ -530,6 +784,9 @@ class VRExplorationManager extends BaseManager {
     this._leaving = true;
 
     const session = this._activeSession;
+    // Captured before _activeContext is nulled out in `finally` — the
+    // registry release below needs it after every other cleanup step runs.
+    const viewConfigId = this._activeContext?.instance?.viewConfigId;
 
     log.info('Leaving VR session...', { sessionId: session.id });
 
@@ -540,6 +797,25 @@ class VRExplorationManager extends BaseManager {
       this._offFrame = null;
       this._offSessionEnded?.();
       this._offSessionEnded = null;
+
+      // Stop watching for a delayed claim-race resolution (see
+      // _watchVRSessionConvergence) — nothing left to re-key onto once we're
+      // leaving.
+      await this._safeCleanupStep('vrSessionObserver.cleanup', () => {
+        this._offVRSessionObserver?.();
+        this._offVRSessionObserver = null;
+      });
+
+      // Release the shared registry slot if WE are the host, so a remaining
+      // participant's host-promotion check (_tickVRSessionRegistry) sees it
+      // vacated instead of waiting out VR_SESSION_STALE_MS. No-op for a
+      // non-host (releaseVRSession itself also guards this, but checking
+      // here avoids a pointless Y.js write from every leaving participant).
+      await this._safeCleanupStep('vrSessionRegistry.release', () => {
+        if (viewConfigId && session.ownerUserId === getUserId()) {
+          releaseVRSession(viewConfigId, getUserId());
+        }
+      });
 
       // Clean up sub-managers — each step independently guarded (see
       // _safeCleanupStep) so a failure in one can never skip the rest,
@@ -554,6 +830,14 @@ class VRExplorationManager extends BaseManager {
       await this._safeCleanupStep('toolManager.cleanup', () => this._toolManager?.cleanup());
       await this._safeCleanupStep('snapshotManager.cleanup', () => this._snapshotManager?.cleanup());
       await this._safeCleanupStep('controlManager.cleanup', () => this._controlManager?.cleanup());
+      await this._safeCleanupStep('manipulationLock.stop', () => {
+        this._offManipulationLock?.();
+        this._offManipulationLock = null;
+        this._manipulationLock?.stop();
+      });
+      // Clear our "currently manipulating" flag on every desktop client, so a
+      // VR user who exits mid-gesture doesn't stay lit forever.
+      await this._safeCleanupStep('manipulatorSignal.clear', () => this._clearManipulationSignal());
       await this._safeCleanupStep('navigationController.cleanup', () => this._navigationController?.cleanup());
 
       // Exit VR exploration on handler
@@ -592,6 +876,13 @@ class VRExplorationManager extends BaseManager {
       this._lastIsolationButtonState = false;
       this._followTargetUserId = null;
       this._inputProfileDetected = false;
+      // The cached hit belongs to the picker on the vrContext just disposed.
+      this._lastPointerHit = null;
+      // Defensive — the try block above already unsubscribes/releases these,
+      // but guarantee a clean slate even if it threw before reaching them.
+      this._offVRSessionObserver?.();
+      this._offVRSessionObserver = null;
+      this._lastVRSessionHeartbeat = 0;
       // Drop any queued heavy work so it cannot run after exit (see
       // _deferHeavy/_drainDeferredWork) — the toggle's manager/feature state
       // it would have mutated may itself be torn down by the steps above.
@@ -602,6 +893,15 @@ class VRExplorationManager extends BaseManager {
       this._snapshotManager = null;
       this._controlManager = null;
       this._navigationController = null;
+      this._offManipulationLock?.();
+      this._offManipulationLock = null;
+      this._manipulationLock = null;
+      this._vrNotice = null;
+
+      // Clear the room-wide "in VR" flag set in startExploration.
+      await this._safeCleanupStep('presence.clearVRPresence', () =>
+        presenceSystem.setVRPresence({ inVR: false, vrSessionId: null, vrRole: null })
+      );
 
       // Emit events
       this._emit('sessionLeft', { sessionId: session.id });
@@ -642,6 +942,118 @@ class VRExplorationManager extends BaseManager {
     if (!session) return [];
     const selfId = getUserId();
     return session.participants.filter((p) => p.odUserId !== selfId);
+  }
+
+  /**
+   * The session's participants in DISPLAY PRECEDENCE order, decorated with
+   * everything a roster surface (the in-VR people drawer, the desktop
+   * VRSessionPanel) needs to render a row without querying four subsystems
+   * itself.
+   *
+   * Order — deliberately NOT alphabetical or join order alone:
+   *   1. the data-control holder (who can change what everyone sees)
+   *   2. the session host (who can take it back)
+   *   3. the other VR explorers, oldest `joinedAt` first (stable: Phase 5's
+   *      upsertParticipant stopped `joinedAt` being reset by every pose packet,
+   *      so this ordering no longer reshuffles itself frame to frame)
+   *   4. desktop observers
+   * Ties inside a band break on userId so the list never jitters.
+   *
+   * Every field is read from an EXISTING source: `session.participants` for
+   * identity/mode/joinedAt, `_participantSync.getRemoteParticipants()` for
+   * liveness, `_manipulationLock` for the token, `yManipulatorState` (the same
+   * room-global channel `_signalManipulation` writes and the desktop awareness
+   * UI already observes) for activity, and `_getParticipantDataPosition` for
+   * distance.
+   *
+   * @returns {Array<{userId:string, userName:string, userColor:string,
+   *   mode:string, isSelf:boolean, isHost:boolean, isHolder:boolean,
+   *   activity:string|null, isStale:boolean, distance:number|null}>}
+   */
+  getSessionRoster() {
+    const session = this._activeSession;
+    if (!session) return [];
+
+    const selfId = getUserId();
+    const hostId = session.ownerUserId || null;
+    const holderId = this.getManipulationHolder()?.holderUserId || null;
+
+    // Liveness comes from the Y.js pose map, which only carries REMOTE entries
+    // (getRemoteParticipants filters self out) — so self is never stale.
+    const liveById = new Map();
+    try {
+      for (const p of this._participantSync?.getRemoteParticipants?.() || []) {
+        if (p?.odUserId) liveById.set(p.odUserId, p);
+      }
+    } catch (err) {
+      log.warn(`VR roster: participant sync read failed — ${err?.message}`);
+    }
+
+    const selfPos = this._getParticipantDataPosition(selfId);
+
+    const rows = (Array.isArray(session.participants) ? session.participants : [])
+      .filter((p) => p?.odUserId)
+      .map((p) => {
+        const userId = p.odUserId;
+        const isSelf = userId === selfId;
+        const live = liveById.get(userId) || null;
+        return {
+          userId,
+          userName: p.userName || userId,
+          userColor: p.userColor || '#888888',
+          mode: p.mode || PARTICIPATION_MODE.DESKTOP_OBSERVER,
+          isSelf,
+          isHost: !!hostId && userId === hostId,
+          isHolder: !!holderId && userId === holderId,
+          activity: this._readActivity(userId),
+          // A participant the session model knows about but the pose map has
+          // never seen is NOT stale — that is a desktop observer, or a VR peer
+          // whose first packet has not landed yet.
+          isStale: !isSelf && !!live?.isStale,
+          distance: isSelf ? 0 : this._distanceBetween(selfPos, this._getParticipantDataPosition(userId)),
+          joinedAt: typeof p.joinedAt === 'number' ? p.joinedAt : 0,
+        };
+      });
+
+    const rank = (r) => {
+      if (r.isHolder) return 0;
+      if (r.isHost) return 1;
+      return r.mode === PARTICIPATION_MODE.VR_EXPLORER ? 2 : 3;
+    };
+    rows.sort((a, b) => {
+      const d = rank(a) - rank(b);
+      if (d !== 0) return d;
+      if (a.joinedAt !== b.joinedAt) return a.joinedAt - b.joinedAt;
+      return a.userId < b.userId ? -1 : a.userId > b.userId ? 1 : 0;
+    });
+
+    // joinedAt was only carried to sort by; it is not part of the roster shape.
+    return rows.map(({ joinedAt: _joinedAt, ...row }) => row);
+  }
+
+  /**
+   * What this user is currently manipulating, from the room-global manipulator
+   * channel (`syncManipulatorToYjs`). Returns null when idle.
+   * @param {string} userId
+   * @returns {string|null} e.g. 'dataset' | 'filter'
+   * @private
+   */
+  _readActivity(userId) {
+    try {
+      return yManipulatorState?.get?.(userId)?.target || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** @returns {number|null} Euclidean distance in data space, null if unknown. @private */
+  _distanceBetween(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b)) return null;
+    const dx = a[0] - b[0];
+    const dy = a[1] - b[1];
+    const dz = a[2] - b[2];
+    const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    return Number.isFinite(d) ? d : null;
   }
 
   /**
@@ -746,6 +1158,192 @@ class VRExplorationManager extends BaseManager {
   respondToControlRequest(approved) {
     if (!this._controlManager) return;
     this._controlManager.respondToRequest(approved);
+  }
+
+  // ===========================================================================
+  // DATA-MANIPULATION TOKEN (delegated to VRManipulationLock)
+  // ===========================================================================
+  //
+  // Exactly one participant at a time may push SHARED data changes — clip,
+  // representation, glyphs, threshold, isosurface, dataset transform, and the
+  // placement of annotations/measurements. The host holds the token by
+  // default, can hand it to anyone, and everyone else can ask.
+  //
+  // WHAT IS DELIBERATELY NOT GATED: vrScale, vrOrigin, locomotion, follow,
+  // isolation and probe. Those are this user's own viewpoint. Gating them
+  // would mean four people in one headset session all being dragged around by
+  // whoever holds the token, which is the opposite of the requirement.
+
+  /**
+   * Silent permission read. FAILS OPEN on a missing/throwing lock — every
+   * gate in this file funnels through here, so a session constructed without
+   * a lock (or a test that fabricates _activeContext directly) behaves
+   * exactly as it did before this feature existed.
+   * @returns {boolean}
+   * @private
+   */
+  _hasManipulationControl() {
+    const lock = this._manipulationLock;
+    if (!lock || typeof lock.canManipulate !== 'function') return true;
+    try {
+      return lock.canManipulate() !== false;
+    } catch (err) {
+      log.warn(`VR manipulation lock read failed (allowing): ${err?.message}`);
+      return true;
+    }
+  }
+
+  /**
+   * Permission check WITH in-headset feedback. Returns true when the action
+   * may proceed; on refusal it flashes a notice naming the holder, because a
+   * silently dropped patch is exactly the desync this feature exists to fix.
+   * @param {string} [label] - what the user was trying to do, e.g. "Glyphs"
+   * @returns {boolean}
+   */
+  _requireManipulationControl(label = 'That change') {
+    if (this._hasManipulationControl()) return true;
+    const holderName = this.getManipulationHolder()?.holderUserName;
+    this._flashVRNotice(
+      holderName
+        ? `${label} needs data control — ${holderName} has it`
+        : `${label} needs data control`
+    );
+    return false;
+  }
+
+  /** Ask the current holder for the token. @returns {boolean} */
+  requestManipulationControl() {
+    if (!this._manipulationLock) return false;
+    const ok = this._manipulationLock.requestControl() === true;
+    this._flashVRNotice(ok ? 'Control requested' : 'You already have data control');
+    return ok;
+  }
+
+  /** Hand the token to another participant. @returns {boolean} */
+  grantManipulationControlTo(userId, userName) {
+    const ok = this._manipulationLock?.grantTo(userId, userName) === true;
+    if (ok) {
+      const name =
+        userName ||
+        this.getOtherParticipants().find((p) => p.odUserId === userId)?.userName ||
+        userId;
+      this._flashVRNotice(`Data control given to ${name}`);
+    }
+    return ok;
+  }
+
+  /** Give the token back to the session host. @returns {boolean} */
+  releaseManipulationControl() {
+    const ok = this._manipulationLock?.release() === true;
+    if (ok) this._flashVRNotice('Data control released');
+    return ok;
+  }
+
+  /**
+   * @returns {{holderUserId:string, holderUserName:string, grantedBy:string,
+   *   grantedAt:number, heartbeat:number}|null} null when nobody live holds it
+   */
+  getManipulationHolder() {
+    return this._manipulationLock?.getHolder() ?? null;
+  }
+
+  /** @returns {boolean} */
+  isManipulationHolder() {
+    return this._manipulationLock?.isHeldByMe() === true;
+  }
+
+  /** @returns {Array<{userId:string,userName:string,atMs:number}>} */
+  getManipulationRequests() {
+    return this._manipulationLock?.getRequests() ?? [];
+  }
+
+  /** Approve a pending request (holder/host only). @returns {boolean} */
+  approveManipulationRequest(userId) {
+    return this._manipulationLock?.approveRequest(userId) === true;
+  }
+
+  /** Deny a pending request (holder/host only). @returns {boolean} */
+  denyManipulationRequest(userId) {
+    return this._manipulationLock?.denyRequest(userId) === true;
+  }
+
+  // ---------------------------------------------------------------------------
+  // IN-VR NOTICE
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Show a transient message on the spatial menu's status line. Reuses the
+   * EXISTING dirty-checked status canvas (VRSpatialMenuModel.getStatusLine →
+   * VTKVRSpatialUI._layoutStatus) rather than adding an actor: a notice that
+   * costs a texture upload only while it is on screen.
+   * @param {string} text
+   * @param {number} [ms=VR_NOTICE_MS]
+   */
+  _flashVRNotice(text, ms = VR_NOTICE_MS) {
+    if (!text) return;
+    this._vrNotice = { text, untilMs: Date.now() + ms };
+  }
+
+  /**
+   * The live notice text, or null once it has expired.
+   * @returns {string|null}
+   */
+  getVRNotice() {
+    const notice = this._vrNotice;
+    if (!notice) return null;
+    if (Date.now() >= notice.untilMs) {
+      this._vrNotice = null;
+      return null;
+    }
+    return notice.text;
+  }
+
+  // ---------------------------------------------------------------------------
+  // ACTIVITY SIGNAL
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Light this user up as the active manipulator for everyone, VR and desktop
+   * alike, through the EXISTING yjsSetup manipulator channel — the same one
+   * VTKInstanceHandler uses for desktop camera drags, already observed by
+   * every desktop client via onManipulatorChange. No new plumbing, no new
+   * Y.js map, and desktop awareness UI gets VR activity for free.
+   *
+   * @param {'dataset'|'filter'} target
+   * @param {string} [action='manipulating']
+   * @private
+   */
+  _signalManipulation(target, action = 'manipulating') {
+    try {
+      syncManipulatorToYjs(getUserId(), getUserName(), target, action);
+      // In-headset counterpart of the desktop awareness UI: a marker on THIS
+      // user's avatar so the other headsets can see who is acting. Driven here
+      // — at manipulation-event rate, then again on the idle timer — never per
+      // frame; it costs one Y.js presence write (see AvatarNetworkSync's
+      // unchanged-payload short-circuit).
+      vrAvatarSystem.setLocalActivity?.(target);
+      if (this._manipulatorIdleTimer) clearTimeout(this._manipulatorIdleTimer);
+      this._manipulatorIdleTimer = setTimeout(() => {
+        this._manipulatorIdleTimer = null;
+        this._clearManipulationSignal();
+      }, MANIPULATOR_IDLE_MS);
+    } catch (err) {
+      log.warn(`VR manipulator signal failed: ${err?.message}`);
+    }
+  }
+
+  /** @private */
+  _clearManipulationSignal() {
+    if (this._manipulatorIdleTimer) {
+      clearTimeout(this._manipulatorIdleTimer);
+      this._manipulatorIdleTimer = null;
+    }
+    try {
+      syncManipulatorToYjs(getUserId(), null, null, null);
+      vrAvatarSystem.setLocalActivity?.(null);
+    } catch (err) {
+      log.warn(`VR manipulator clear failed: ${err?.message}`);
+    }
   }
 
   // ===========================================================================
@@ -1032,6 +1630,14 @@ class VRExplorationManager extends BaseManager {
 
   setNavigationMode(mode) {
     if (!this._navigationController) return;
+    // MOVE_OBJECT is the one locomotion mode that is not a per-user viewpoint:
+    // its drag rewrites the SHARED dataset transform. Letting a non-holder
+    // enter it means they drag the data locally, _pushVisualizationPatch
+    // silently drops the patch, and their view is permanently out of step with
+    // everyone else's — worse than refusing the mode outright.
+    if (mode === EXPLORATION_MODES.MOVE_OBJECT && !this._requireManipulationControl('Move Object')) {
+      return null;
+    }
     this._navigationController.setMode(mode);
     this._emit('navigationModeChanged', { mode });
     return mode;
@@ -1043,7 +1649,14 @@ class VRExplorationManager extends BaseManager {
 
   cycleNavigationMode() {
     if (!this._navigationController) return null;
-    const newMode = this._navigationController.cycleMode();
+    let newMode = this._navigationController.cycleMode();
+    // Same reasoning as setNavigationMode — the cycle must not be able to park
+    // a non-holder in MOVE_OBJECT through the back door. Step past it once
+    // (the cycle is finite and only one entry is gated, so this terminates).
+    if (newMode === EXPLORATION_MODES.MOVE_OBJECT && !this._hasManipulationControl()) {
+      this._requireManipulationControl('Move Object');
+      newMode = this._navigationController.cycleMode();
+    }
     this._emit('navigationModeChanged', { mode: newMode });
     return newMode;
   }
@@ -2364,6 +2977,18 @@ class VRExplorationManager extends BaseManager {
         this._handleToolAction(toolAction);
       }
 
+      // STEP 6.5 — pointer ray. Computed HERE, between the tools and the
+      // participant broadcast, for one reason: its result has to ride along in
+      // the same updateLocalState payload below, so a remote viewer never
+      // renders a head pose from frame N against a pointer from frame N-1.
+      // Cheap by construction — a quaternion rotate plus one mapXRPointToData,
+      // both of which the old inline _broadcastPointerRay already paid — and
+      // the only expensive part (the surface pick) is capped at 10 Hz inside
+      // and skipped entirely while the menu is hovered.
+      const pointerRay = this._computePointerRay(inputState, vrContext, {
+        skipPick: menuHovering,
+      });
+
       // Update participant sync. Head/hand poses are in THIS user's own
       // physical XR space (each participant has an independent WebXR
       // session/reference space) — vrScale/vrOrigin travel alongside so
@@ -2376,11 +3001,33 @@ class VRExplorationManager extends BaseManager {
         rightHandPose: inputState.controllers?.right?.pose,
         vrScale: vrContext.vrScale || 1.0,
         vrOrigin: vrContext.vrOrigin || [0, 0, 0],
+        // XR metres (converted by the receiver with the transform above)...
+        pointer: pointerRay,
+        // ...and the surface hit, which is ALREADY data space and shared by
+        // every viewer — see VRParticipantSync.updateLocalState.
+        pointerHit: pointerRay?.hit || null,
       });
+
+      // Shared vr-sessions registry housekeeping — heartbeat + host-promotion
+      // check (see _tickVRSessionRegistry) — throttled to VR_SESSION_HEARTBEAT_MS,
+      // same Date.now()-guard style as the pointer pick throttle above.
+      const nowForVRSessionRegistry = Date.now();
+      if (nowForVRSessionRegistry - this._lastVRSessionHeartbeat >= VR_SESSION_HEARTBEAT_MS) {
+        this._lastVRSessionHeartbeat = nowForVRSessionRegistry;
+        this._tickVRSessionRegistry(this._activeContext?.instance?.viewConfigId, this._activeSession);
+        // Same 1 Hz budget: refresh our hold on the data-control token, or (as
+        // host) reclaim one whose holder went stale. Internally throttled too,
+        // so sharing this tick is belt-and-braces rather than load-bearing.
+        try {
+          this._manipulationLock?.heartbeat();
+        } catch (err) {
+          log.warn(`VR manipulation heartbeat failed: ${err?.message}`);
+        }
+      }
 
       // Broadcast the active controller ray so desktop collaborators can see
       // where this VR user is pointing (throttled inside vrCursorSync).
-      this._broadcastPointerRay(inputState, vrContext);
+      this._broadcastPointerRay(pointerRay);
 
       // Update avatar system
       vrAvatarSystem.update(deltaTime, inputState);
@@ -2544,39 +3191,131 @@ class VRExplorationManager extends BaseManager {
   }
 
   /**
-   * Publish the local VR controller ray (in DATA space, so desktop views can
-   * render it directly) via vrCursorSync. Right hand wins when both present.
-   * Never throws — pointer visibility must not break the frame loop.
+   * Compute this frame's pointer ray for the active hand (right wins when both
+   * are tracked), plus — at most 10x/s — where that ray meets the geometry.
+   *
+   * Two consumers, TWO COORDINATE FRAMES, and mixing them up is the whole
+   * subtlety here:
+   *  - `origin`/`direction` are the SENDER's raw XR metres. They go to
+   *    VRParticipantSync, and RemoteAvatarController._toScenePose converts them
+   *    with this sender's vrScale/vrOrigin, because every participant has a
+   *    physically distinct WebXR reference space. Pre-converting them here
+   *    would make the receiver apply the transform twice.
+   *  - `dataOrigin` is the same point already mapped to data space, for the
+   *    desktop broadcast (VTKRemoteVRRays renders in data space directly).
+   *  - `hit` is a point ON the shared geometry, so it is data space for
+   *    everyone and is never re-transformed by anyone.
+   *
+   * Never throws: the pointer is cosmetic and must not be able to break the
+   * frame loop (the callers below rely on this, as does _broadcastPointerRay).
+   *
+   * @param {object} inputState - from _gatherInputState
+   * @param {object} vrContext
+   * @param {{skipPick?: boolean}} [opts] - skipPick while the spatial menu is
+   *   hovered: the ray is aimed at the panel, not the data, so picking would
+   *   burn a vtkCellPicker pass to (correctly) find nothing.
+   * @returns {{origin:{x:number,y:number,z:number},
+   *   dataOrigin:{x:number,y:number,z:number},
+   *   direction:{x:number,y:number,z:number},
+   *   hand:'left'|'right',
+   *   hit:{x:number,y:number,z:number}|null}|null}
    * @private
    */
-  _broadcastPointerRay(inputState, vrContext) {
+  _computePointerRay(inputState, vrContext, { skipPick = false } = {}) {
     try {
-      const viewId = this._activeContext?.instance?.viewConfigId;
-      if (!viewId) return;
-
-      const hand = inputState.controllers?.right?.pose
+      const hand = inputState?.controllers?.right?.pose
         ? 'right'
-        : inputState.controllers?.left?.pose
+        : inputState?.controllers?.left?.pose
           ? 'left'
           : null;
-      if (!hand) return;
+      if (!hand) return null;
 
-      const pose = inputState.controllers[hand].pose;
-      if (!pose?.position || !pose?.orientation) return;
+      const controller = inputState.controllers[hand];
+      const pose = controller.pose;
+      if (!pose?.position || !pose?.orientation) return null;
 
-      const origin = mapXRPointToData(
+      const dataOrigin = mapXRPointToData(
         pose.position,
-        vrContext.vrScale || 1.0,
-        vrContext.vrOrigin || [0, 0, 0]
+        vrContext?.vrScale || 1.0,
+        vrContext?.vrOrigin || [0, 0, 0]
       );
       const dir = controllerForward(pose.orientation);
 
-      vrCursorSync.broadcastVRPointer(
-        viewId,
-        { x: origin[0], y: origin[1], z: origin[2] },
-        { x: dir[0], y: dir[1], z: dir[2] },
-        hand
-      );
+      return {
+        origin: { x: pose.position.x, y: pose.position.y, z: pose.position.z },
+        dataOrigin: { x: dataOrigin[0], y: dataOrigin[1], z: dataOrigin[2] },
+        direction: { x: dir[0], y: dir[1], z: dir[2] },
+        hand,
+        hit: this._pickPointerHit(controller, vrContext, skipPick),
+      };
+    } catch {
+      // pointer is cosmetic — never break the frame loop
+      return null;
+    }
+  }
+
+  /**
+   * Throttled surface pick for the pointer's hit marker. Returns the cached
+   * result between picks so the caller can treat it as a per-frame value.
+   *
+   * @param {object} controller - inputState.controllers[hand]
+   * @param {object} vrContext
+   * @param {boolean} skipPick
+   * @returns {{x:number,y:number,z:number}|null} data-space hit point
+   * @private
+   */
+  _pickPointerHit(controller, vrContext, skipPick) {
+    // Aimed at the menu: drop the cache too, or the dot would hang on the last
+    // surface point while the user works the panel.
+    if (skipPick) {
+      this._lastPointerHit = null;
+      return null;
+    }
+
+    const now = Date.now();
+    const cached = this._lastPointerHit;
+    if (cached && now - cached.atMs < POINTER_PICK_MS) return cached.pos;
+
+    const handler = this._activeContext?.handler;
+    if (typeof handler?.raycastVR !== 'function' || !controller?.targetRay) {
+      this._lastPointerHit = { pos: null, atMs: now };
+      return null;
+    }
+
+    let pos = null;
+    try {
+      // Same call convention as VRAnnotationTool._performRaycast — raycastVR
+      // accepts the XRRigidTransform targetRay directly and returns
+      // { hit, position, normal, ... } in data space.
+      const result = handler.raycastVR(vrContext, controller.targetRay);
+      if (result?.hit && result.position) {
+        pos = { x: result.position.x, y: result.position.y, z: result.position.z };
+      }
+    } catch {
+      // Swallow, but still stamp the cache below so a persistently throwing
+      // picker is retried at 10 Hz rather than 90 Hz.
+      pos = null;
+    }
+
+    this._lastPointerHit = { pos, atMs: now };
+    return pos;
+  }
+
+  /**
+   * Publish an already-computed pointer ray (in DATA space, so desktop views can
+   * render it directly) via vrCursorSync.
+   * Never throws — pointer visibility must not break the frame loop.
+   *
+   * @param {ReturnType<VRExplorationManager['_computePointerRay']>} ray
+   * @private
+   */
+  _broadcastPointerRay(ray) {
+    try {
+      if (!ray) return;
+      const viewId = this._activeContext?.instance?.viewConfigId;
+      if (!viewId) return;
+
+      vrCursorSync.broadcastVRPointer(viewId, ray.dataOrigin, ray.direction, ray.hand);
     } catch {
       // pointer broadcast is cosmetic — never break the frame loop
     }
@@ -2780,6 +3519,11 @@ class VRExplorationManager extends BaseManager {
    * (visualizationSyncService → Y.js broadcast + ViewConfiguration), so an
    * in-VR change is identical to a desktop one. Fire-and-forget: must never
    * block or break the XR frame loop.
+   * THE single choke point for shared data changes, and therefore the single
+   * place the manipulation token is enforced: clip / representation / glyph /
+   * threshold / isosurface all call this directly, and _pushObjectTransformPatch
+   * funnels through it too, so one guard covers every one of them.
+   *
    * @param {object} patch - e.g. { representation: 'wireframe' } or { clipBox: {...} }
    * @private
    */
@@ -2787,6 +3531,13 @@ class VRExplorationManager extends BaseManager {
     try {
       const viewId = this._activeContext?.instance?.viewConfigId;
       if (!viewId || !patch) return;
+
+      const key = Object.keys(patch)[0];
+      if (!this._requireManipulationControl(PATCH_LABELS[key] || 'That change')) return;
+
+      // Filters (threshold/isosurface/glyph/clip) read as "filtering" work to
+      // desktop observers; everything else is a change to the dataset itself.
+      this._signalManipulation(FILTER_PATCH_KEYS.has(key) ? 'filter' : 'dataset');
 
       Promise.resolve(
         pushSharedVisualizationUpdate(viewId, patch)

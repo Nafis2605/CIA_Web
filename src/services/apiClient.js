@@ -20,6 +20,11 @@ import {
   getMockUser,
   getDefaultMockUser,
 } from "@Config/mockUsers.js";
+import {
+  getDeviceId,
+  getDeviceName,
+  getDeviceEmail,
+} from "@Core/identity/deviceIdentity.js";
 
 // =============================================================================
 // API ERROR CLASS
@@ -88,6 +93,26 @@ export class ApiError extends Error {
   toString() {
     return `ApiError [${this.status}]: ${this.message}`;
   }
+}
+
+// =============================================================================
+// HEADER HELPERS
+// =============================================================================
+
+/**
+ * Strip anything a header value cannot carry.
+ *
+ * Device display names are user-typed, and `fetch()` throws a TypeError when a
+ * header value contains characters outside ISO-8859-1 — an emoji or a CJK name
+ * would otherwise break every API call from that browser.
+ *
+ * @param {string} value
+ * @returns {string} printable-ASCII-only value (may be empty)
+ */
+function toHeaderSafe(value) {
+  if (typeof value !== "string") return "";
+  // eslint-disable-next-line no-control-regex
+  return value.replace(/[^\x20-\x7E]/g, "").trim();
 }
 
 // =============================================================================
@@ -288,7 +313,13 @@ class ApiClient {
   }
 
   /**
-   * Get dev user headers for API requests
+   * Get dev user headers for API requests.
+   *
+   * MUST resolve to the same id as `getUserId()` in
+   * `@Collaboration/presence/userManagement.js`: `x-user-id` owns the server
+   * session/view rows while the same string keys the Y.js participant maps. If
+   * the two diverge, the row owner no longer matches the participant key.
+   *
    * @private
    * @returns {Object} Headers object with user identity
    */
@@ -297,10 +328,27 @@ class ApiClient {
       return {};
     }
 
-    // Get current mock user from storage
+    // An explicitly selected mock identity (?devUser=alice) always wins.
     const storedId = getStoredMockUserId();
-    const user = storedId ? getMockUser(storedId) : getDefaultMockUser();
+    const mockUser = storedId ? getMockUser(storedId) : null;
+    if (mockUser) {
+      return {
+        "x-user-id": mockUser.id,
+        "x-user-email": mockUser.email,
+        "x-user-name": mockUser.name,
+      };
+    }
 
+    // Otherwise this browser is its own persistent user.
+    if (config.identity?.deviceFallback !== false) {
+      return {
+        "x-user-id": getDeviceId(),
+        "x-user-email": getDeviceEmail(),
+        "x-user-name": toHeaderSafe(getDeviceName()) || getDeviceId(),
+      };
+    }
+
+    const user = getDefaultMockUser();
     if (!user) {
       return {};
     }

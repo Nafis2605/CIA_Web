@@ -97,6 +97,10 @@ export class VRMeasureTool extends VRToolInterface {
     this._lastTriggerState = triggerPressed;
 
     if (triggerRisingEdge) {
+      // Data-control gate — see the identical check in VRAnnotationTool:
+      // enforced at placement, not at tool selection, and fails open when no
+      // predicate was injected into the tool context.
+      if (this._context?.canManipulate?.('Measurement') === false) return null;
       return this._addPoint(rightCtrl, frame);
     }
 

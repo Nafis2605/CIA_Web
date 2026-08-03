@@ -364,6 +364,12 @@ export class VRAnnotationTool extends VRToolInterface {
     }
 
     if (triggerRisingEdge) {
+      // Data-control gate (VRManipulationLock, injected via the tool context).
+      // Checked on PLACEMENT, not on tool selection: a non-holder can still
+      // pick Annotate, aim, and find out on the first pull that they need the
+      // token — which is far clearer than a greyed-out button. Fails open when
+      // no predicate was injected.
+      if (this._context?.canManipulate?.('Annotation') === false) return null;
       const hit = this._performRaycast(rightCtrl, frame);
       if (hit) return this._openDraft(hit);
     }

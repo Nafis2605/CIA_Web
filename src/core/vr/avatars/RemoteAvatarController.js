@@ -69,6 +69,13 @@ export class RemoteAvatarController {
       this._avatar.setSpeaking(!!state.speaking);
     }
 
+    // Who is changing the shared data. Guarded on the method's presence: the
+    // VRM avatar path has no halo/badge, and an older peer's payload has no
+    // `activity` field at all — in both cases the marker simply doesn't show.
+    if (state.activity !== undefined) {
+      this._avatar.setActivity?.(state.activity || null);
+    }
+
     const newUrl = state.userInfo?.avatarUrl;
     if (newUrl && newUrl !== this._userInfo.avatarUrl) {
       this._userInfo = { ...this._userInfo, avatarUrl: newUrl };
@@ -102,7 +109,9 @@ export class RemoteAvatarController {
     // Transform VR space → scene space
     const scenePose = this._toScenePose(this._smoothPose);
 
-    this._avatar.updatePose(scenePose);
+    // The LOCAL viewer's vrScale (not the sender's) — the avatar uses it only
+    // to keep the surface-hit marker a constant apparent size for THIS viewer.
+    this._avatar.updatePose(scenePose, this._vrContext?.vrScale || 1);
 
     // Orient label to face local user
     if (localHeadScenePos) {
@@ -154,6 +163,7 @@ export class RemoteAvatarController {
       leftHand: this._interpLimb(current.leftHand, target.leftHand, alpha),
       rightHand: this._interpLimb(current.rightHand, target.rightHand, alpha),
       pointer: target.pointer, // don't interpolate pointer — snappy is better
+      pointerHit: target.pointerHit, // same: a lagging hit dot reads as wrong, not smooth
       timestamp: target.timestamp,
       // Sender's transform — always take the latest, no interpolation
       // (it changes in discrete steps via isolation/scale presets, not
@@ -263,6 +273,15 @@ export class RemoteAvatarController {
       leftHand: toSceneLimb(pose.leftHand),
       rightHand: toSceneLimb(pose.rightHand),
       pointer: toScenePointer(pose.pointer),
+      // pointerHit passes through UNTOUCHED — no /vrScale, no +vrOrigin. Unlike
+      // head/hand/pointer.origin, it is not a point in the sender's physical XR
+      // space: it is a point ON THE SHARED GEOMETRY, produced by the sender's
+      // raycast against data-space actors, so it already IS scene space and is
+      // numerically identical for every participant. Running it through toScene()
+      // would offset every remote user's highlight by their own transform —
+      // exactly the disagreement this feature exists to remove. (Mirrors the
+      // `direction` note just above: not every field on a pose is XR-metric.)
+      pointerHit: pose.pointerHit || null,
       timestamp: pose.timestamp,
     };
   }

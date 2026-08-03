@@ -34,8 +34,9 @@
 
 /**
  * @typedef {Object} AvatarPointer
- * @property {AvatarPosePoint|null} origin
- * @property {AvatarPosePoint|null} direction - Unit vector
+ * @property {AvatarPosePoint|null} origin - SENDER's XR metres (converted on receipt)
+ * @property {AvatarPosePoint|null} direction - Unit vector; frame-independent
+ * @property {'left'|'right'} [hand]
  * @property {boolean} visible
  */
 
@@ -51,6 +52,10 @@
  * @property {AvatarLimbPose} leftHand
  * @property {AvatarLimbPose} rightHand
  * @property {AvatarPointer} pointer
+ * @property {AvatarPosePoint|null} [pointerHit] - Where the sender's ray met the
+ *   shared geometry. THE ONE FIELD HERE THAT IS NOT IN THE SENDER'S XR SPACE:
+ *   it is already in data/scene space and identical for every viewer, so it is
+ *   passed through untransformed (see RemoteAvatarController._toScenePose).
  * @property {number} timestamp - Date.now()
  * @property {number} vrScale - sender's vrScale at the time of this pose
  * @property {number[]} vrOrigin - sender's vrOrigin [x,y,z] at the time of this pose
@@ -63,6 +68,9 @@
  * @property {boolean} speaking
  * @property {string|null} [selectedObjectId]
  * @property {string|null} [currentTool]
+ * @property {string|null} [activity] - what this user is currently
+ *   manipulating ('dataset' | 'filter'), driving the avatar's halo + "EDITING"
+ *   badge. Presence-rate, never per frame.
  */
 
 /**

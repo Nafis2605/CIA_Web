@@ -334,11 +334,15 @@ describe("VRSpatialMenuModel — action dispatch", () => {
     expect(r).toMatchObject({ handled: true, action: "scale-changed", scaleValue: 10.0, buttonId: "scale-detail" });
   });
 
+  // Go To / Follow moved verbatim into the "people" drawer (they share the row
+  // with the data-control buttons now), so the drawer has to be open for them
+  // to be in the layout at all — same rule as every other drawer button.
   it("goto-participant cycles through getOtherParticipants and calls manager.goToParticipant", () => {
     manager.getOtherParticipants.mockReturnValue([
       { odUserId: "u1", userName: "Alice" },
       { odUserId: "u2", userName: "Bob" },
     ]);
+    model.activate("people");
     const r1 = model.activate("goto-participant");
     expect(manager.goToParticipant).toHaveBeenCalledWith("u1");
     expect(r1).toMatchObject({ handled: true, action: "goto-participant", userId: "u1", ok: true });
@@ -354,6 +358,7 @@ describe("VRSpatialMenuModel — action dispatch", () => {
 
   it("goto-participant is a safe no-op with nobody else in the session", () => {
     manager.getOtherParticipants.mockReturnValue([]);
+    model.activate("people");
     const r = model.activate("goto-participant");
     expect(r).toMatchObject({ handled: true, action: "goto-participant", ok: false, reason: "no-participants" });
     expect(manager.goToParticipant).not.toHaveBeenCalled();
@@ -362,6 +367,7 @@ describe("VRSpatialMenuModel — action dispatch", () => {
   it("follow-participant follows the next participant, then toggles off on a second tap", () => {
     manager.getOtherParticipants.mockReturnValue([{ odUserId: "u1", userName: "Alice" }]);
 
+    model.activate("people");
     const r1 = model.activate("follow-participant");
     expect(manager.followParticipant).toHaveBeenCalledWith("u1");
     expect(r1).toMatchObject({ handled: true, action: "follow-participant", following: "u1" });

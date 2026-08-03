@@ -151,6 +151,24 @@ export const config = Object.freeze({
   ),
 
   // ---------------------------------------------------------------------------
+  // Identity
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Identity behaviour flags.
+   *
+   * `deviceFallback` — in dev bypass with no explicit `?devUser=`, resolve the
+   * identity from `@Core/identity/deviceIdentity.js` (a persistent per-device
+   * UUID) instead of the shared default mock user. This is what lets two
+   * headsets on the same LAN be two distinct users. Set
+   * `window.__CIA_CONFIG__.identityDeviceFallback = false` to revert every
+   * call site to the old default-mock-user behaviour in one place.
+   */
+  identity: Object.freeze({
+    deviceFallback: resolveValue("identityDeviceFallback", undefined, true),
+  }),
+
+  // ---------------------------------------------------------------------------
   // Server-Side Rendering
   // ---------------------------------------------------------------------------
 

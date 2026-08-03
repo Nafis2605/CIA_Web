@@ -53,6 +53,9 @@ import {
  *   - "voice-mute":        toggles the local participant's voice mute state
  *   - "voice-join":        joins/leaves the session's voice room
  *   - "toggle-visibility": hides the panel (local UI chrome, no manager call)
+ *   - "control-request":   ask the holder for the data-manipulation token
+ *   - "control-grant":     hand that token to a requester/participant
+ *   - "control-release":   give the token back to the session host
  *   - "exit":              leave the VR session
  * @type {ReadonlyArray<{id:string,label:string,icon:string,kind:string,toolId?:string,scaleValue?:number,mode?:string,row:number}>}
  */
@@ -107,12 +110,12 @@ export const VR_MENU_BUTTONS = Object.freeze([
   { id: "snapshot-load", label: "Load", icon: "folderOpen", kind: "snapshot-load", row: 3, group: "SCENE" },
 
   // ---- Row 4 — SESSION: other people, voice, and leaving -------------------
-  // Go To/Follow cycle through other session participants rather than a full
-  // per-user list (keeps the fixed-cell UV grid simple) — every tap still does
-  // something real, just "next collaborator" instead of "this specific one".
+  // Go To/Follow used to live here as static cells. They moved VERBATIM into
+  // the "people" drawer (same ids, same kinds, same handlers) to make room for
+  // data-control without growing the row past what fits: the row was already
+  // full at 6, and control needs three cells of its own.
   // exit stays last (VTKVRSpatialUI/tests rely on the last row ending with it).
-  { id: "goto-participant", label: "Go To", icon: "target", kind: "goto-participant", row: 4, group: "SESSION" },
-  { id: "follow-participant", label: "Follow", icon: "user", kind: "follow-participant", row: 4, group: "SESSION" },
+  { id: "people", label: "People", icon: "user", kind: "drawer", drawerId: "people", row: 4, group: "SESSION" },
   { id: "voice-join", label: "Voice", icon: "headsetMic", kind: "voice-join", row: 4, group: "SESSION" },
   { id: "voice-mute", label: "Mute", icon: "mic", kind: "voice-mute", row: 4, group: "SESSION" },
   { id: "hide-menu", label: "Hide", icon: "eyeOff", kind: "toggle-visibility", row: 4, group: "SESSION" },
@@ -172,6 +175,19 @@ export const VR_MENU_DRAWERS = Object.freeze({
     { id: "iso-toggle", label: "Isosurface", icon: "layers", kind: "iso-toggle", drawerRow: 0, group: "VIEW" },
     ...STEPPER_ROW_TEMPLATE(1),
   ]),
+  // People + data control. Deliberately has NO stepper row: nothing here is
+  // numeric. drawerRow 1 is left free for the Phase 4 roster cells, which is
+  // why this drawer is one row today rather than being folded into row 4.
+  people: Object.freeze([
+    { id: "goto-participant", label: "Go To", icon: "target", kind: "goto-participant", drawerRow: 0, group: "SESSION" },
+    { id: "follow-participant", label: "Follow", icon: "user", kind: "follow-participant", drawerRow: 0, group: "SESSION" },
+    // Data-manipulation token (VRManipulationLock). Request = "may I have it";
+    // Give = hand it to the oldest requester (or the next participant);
+    // Release = hand it back to the host.
+    { id: "control-request", label: "Request", icon: "hand", kind: "control-request", drawerRow: 0, group: "SESSION" },
+    { id: "control-grant", label: "Give", icon: "share", kind: "control-grant", drawerRow: 0, group: "SESSION" },
+    { id: "control-release", label: "Release", icon: "unlock", kind: "control-release", drawerRow: 0, group: "SESSION" },
+  ]),
 });
 
 /**
@@ -226,6 +242,23 @@ const CELL_PADDING = 0.06;
 // How long a local tool tap is trusted over the manager's reported active tool.
 // Covers the async activate/deactivate round-trip (see syncFromManager).
 const TOOL_SYNC_HOLD_MS = 250;
+
+// --- People drawer roster ---------------------------------------------------
+// One row of participant cells inside the `people` drawer (drawerRow 1, which
+// VR_MENU_DRAWERS.people deliberately leaves free). Capped so the row's cells
+// stay wide enough to hit reliably with a pinch ray at PANEL_DISTANCE — five
+// cells across PANEL_WIDTH is already about the narrowest comfortable target,
+// and the roster is precedence-ORDERED (holder, host, then VR by join time),
+// so a cap truncates the least important entries, never the important ones.
+export const MAX_ROSTER_CELLS = 5;
+
+// The roster is PRESENCE-rate data, not frame-rate data. Rebuilding it every
+// frame would allocate a fresh array of decorated rows 72-90 times a second for
+// something that changes when somebody joins, leaves, or is handed the data
+// token. Refreshing on this interval also makes it structurally impossible for
+// _rosterKey — and therefore getButtonLayout()'s memo key — to differ between
+// two consecutive frames.
+const ROSTER_REFRESH_MS = 250;
 
 /**
  * Pure grid-layout math: group `buttons` by `row`, lay each row out as
@@ -347,11 +380,42 @@ export class VRSpatialMenuModel {
     // layout from a previous one.
     this._layoutCache = null;
     this._layoutCacheKey = null;
+    // Participant roster shown in the `people` drawer, refreshed at
+    // ROSTER_REFRESH_MS by syncFromManager(). `_rosterKey` is the COARSE
+    // signature that feeds getButtonLayout()'s memo key — see _refreshRoster.
+    this._roster = [];
+    this._rosterKey = "";
+    this._rosterAtMs = 0;
   }
 
   // ===========================================================================
   // LAYOUT
   // ===========================================================================
+
+  /**
+   * Turn the manager's roster rows into drawer button descriptors for the
+   * `people` drawer's second row. Kept out of getButtonLayout() so it only
+   * runs on a memo MISS, not on all four of that method's per-frame calls.
+   * @returns {Array<object>}
+   * @private
+   */
+  _rosterCells() {
+    return this._roster.slice(0, MAX_ROSTER_CELLS).map((entry, i) => ({
+      // Index-keyed, not userId-keyed: the render layer parks and re-adopts
+      // actors by button id, so a fixed set of five ids means the roster row
+      // owns at most five cards for the whole session instead of accumulating
+      // one parked card per user who has ever appeared in it.
+      id: `roster-${i}`,
+      // Name only. Anything that ticks (distance, staleness) would repaint the
+      // label canvas — a GPU texture upload — every time it moved.
+      label: entry.userName,
+      icon: entry.mode === "vr-explorer" ? "user" : "monitor",
+      kind: "roster-entry",
+      userId: entry.userId,
+      drawerRow: 1,
+      group: "SESSION",
+    }));
+  }
 
   /**
    * Compute button hit regions in panel-UV space (u,v ∈ [0,1]).
@@ -381,7 +445,18 @@ export class VRSpatialMenuModel {
     // NOT affect the returned geometry/labels (computeGridLayout(VR_KEYBOARD_KEYS)
     // is passed the raw table; shift only surfaces via getButtonStates'
     // kbd-shift branch), so it is deliberately excluded from the key.
-    const key = `${this._keyboardOpen ? 1 : 0}|${this._activeToolId ?? ""}|${this._openDrawerId ?? ""}`;
+    //
+    // _rosterKey is the fourth component and the one with teeth: the people
+    // drawer's roster row is derived from live session state, so a key that
+    // encoded anything continuous (distance, timestamps, staleness) would
+    // differ on every frame, defeating the memo entirely — computeGridLayout
+    // would re-run 4x/frame AND VTKVRSpatialUI._reconcileButtonActors would
+    // tear down and rebuild the roster cards' canvases/textures/actors every
+    // frame. It is therefore COARSE (`userId:isHolder` per cell) and refreshed
+    // only every ROSTER_REFRESH_MS. See _refreshRoster.
+    const key =
+      `${this._keyboardOpen ? 1 : 0}|${this._activeToolId ?? ""}|` +
+      `${this._openDrawerId ?? ""}|${this._rosterKey}`;
     if (this._layoutCacheKey === key) return this._layoutCache;
 
     // Modal: while an annotation draft is open, the panel IS the keyboard —
@@ -399,9 +474,15 @@ export class VRSpatialMenuModel {
     const contextual = VR_MENU_CONTEXTUAL_BUTTONS.filter(
       (b) => b.contextTool === this._activeToolId
     );
-    const drawer = this._openDrawerId
+    let drawer = this._openDrawerId
       ? VR_MENU_DRAWERS[this._openDrawerId] || []
       : [];
+    // The people drawer's static row 0 is the verbs (Go To / Follow / the data
+    // token); row 1 is the roster itself, built from live session state rather
+    // than declared in the frozen constant.
+    if (this._openDrawerId === "people" && this._roster.length) {
+      drawer = [...drawer, ...this._rosterCells()];
+    }
 
     // Extra rows stack ABOVE the static grid, assigned negative row indices
     // (which sort before every static row and, with the top-down v inversion
@@ -519,6 +600,15 @@ export class VRSpatialMenuModel {
         return this._gotoNextParticipant();
       case "follow-participant":
         return this._toggleFollowNextParticipant();
+      case "roster-entry":
+        return this._gotoRosterEntry(btn.userId);
+      // --- Data-manipulation token (see VRManipulationLock) ------------------
+      case "control-request":
+        return this._requestControl();
+      case "control-grant":
+        return this._grantControl();
+      case "control-release":
+        return this._releaseControl();
       case "annotation-label":
         return this._cycleAnnotationLabel();
       case "representation":
@@ -695,6 +785,28 @@ export class VRSpatialMenuModel {
     return { handled: true, action: "goto-participant", userId, ok };
   }
 
+  /**
+   * Tapping a roster cell goes to that specific participant — the same
+   * manager call the cycling "Go To" button makes, just without the guesswork
+   * of which person the cycle is currently on.
+   * @param {string} userId
+   * @private
+   */
+  _gotoRosterEntry(userId) {
+    if (!userId) {
+      return { handled: true, action: "roster-goto", ok: false, reason: "no-user" };
+    }
+    // Keep the Go To / Follow cycle in step with the explicit pick, so a
+    // subsequent "Follow" tap follows the person you just went to rather than
+    // resuming from wherever the cycle happened to be.
+    const others = this._call("getOtherParticipants") || [];
+    const idx = others.findIndex((p) => p?.odUserId === userId);
+    if (idx >= 0) this._participantCycleIndex = idx;
+
+    const ok = !!this._call("goToParticipant", userId);
+    return { handled: true, action: "roster-goto", userId, ok };
+  }
+
   /** Toggles off if already following anyone; otherwise follows the next participant. */
   _toggleFollowNextParticipant() {
     if (this._call("isFollowingParticipant")) {
@@ -707,6 +819,45 @@ export class VRSpatialMenuModel {
     }
     this._call("followParticipant", userId);
     return { handled: true, action: "follow-participant", following: userId };
+  }
+
+  /**
+   * Ask whoever holds the data-manipulation token for it
+   * (VRExplorationManager.requestManipulationControl → VRManipulationLock).
+   * @private
+   */
+  _requestControl() {
+    const requested = !!this._call("requestManipulationControl");
+    return { handled: true, action: "control-request", requested };
+  }
+
+  /**
+   * Hand the token on. Prefers the OLDEST pending request — someone actually
+   * asked, so answering them beats an arbitrary cycle position. With no
+   * pending request, falls back to the same next-participant cycle Go To and
+   * Follow use, so the button still does something in a session where nobody
+   * has asked yet.
+   * @private
+   */
+  _grantControl() {
+    const [oldest] = this._call("getManipulationRequests") || [];
+    if (oldest?.userId) {
+      const granted = !!this._call("grantManipulationControlTo", oldest.userId, oldest.userName);
+      return { handled: true, action: "control-grant", userId: oldest.userId, granted };
+    }
+
+    const userId = this._pickNextParticipant();
+    if (!userId) {
+      return { handled: true, action: "control-grant", granted: false, reason: "no-participants" };
+    }
+    const granted = !!this._call("grantManipulationControlTo", userId);
+    return { handled: true, action: "control-grant", userId, granted };
+  }
+
+  /** Give the token back to the session host. @private */
+  _releaseControl() {
+    const released = !!this._call("releaseManipulationControl");
+    return { handled: true, action: "control-release", released };
   }
 
   /** Advances the active tool's pending preset annotation label (see VRAnnotationTool.cycleLabel). */
@@ -1102,6 +1253,9 @@ export class VRSpatialMenuModel {
     // one — see the getButtonLayout() cache note.
     this._layoutCache = null;
     this._layoutCacheKey = null;
+    // Force a roster pull on the first syncFromManager() of the new session
+    // rather than inheriting the previous one's refresh timestamp.
+    this._rosterAtMs = 0;
     this.syncFromManager();
     return this._visible;
   }
@@ -1123,6 +1277,9 @@ export class VRSpatialMenuModel {
     this._deferredHolds.clear();
     this._layoutCache = null;
     this._layoutCacheKey = null;
+    this._roster = [];
+    this._rosterKey = "";
+    this._rosterAtMs = 0;
     return this._visible;
   }
 
@@ -1201,11 +1358,56 @@ export class VRSpatialMenuModel {
     this._draftFallback = draft?.fallbackText ?? "";
     if (!this._keyboardOpen) this._shiftMode = "off";
 
+    this._refreshRoster();
+
     return {
       activeToolId: this._activeToolId,
       isolated: this._isolated,
       gridEnabled: this._gridEnabled,
     };
+  }
+
+  /**
+   * Pull manager.getSessionRoster() at most once every ROSTER_REFRESH_MS and
+   * recompute the COARSE signature that gates getButtonLayout()'s memo.
+   *
+   * The signature deliberately contains only `userId:isHolder` per cell — who
+   * is in the row, in what order, and which one holds the data token. Those are
+   * exactly the things that change the row's GEOMETRY or its card styling.
+   * Everything else the roster carries (distance, isStale, activity) is either
+   * continuous or ticks on its own clock; folding any of it into this string
+   * would make the key differ frame to frame, which costs a full
+   * computeGridLayout plus a teardown/rebuild of the roster cards in
+   * VTKVRSpatialUI — hundreds of allocations and several texture uploads per
+   * frame, enough to drop a Quest session under 72fps.
+   *
+   * The interval alone is not the guarantee; the coarseness is. The interval
+   * just keeps the manager call itself off the frame path.
+   * @private
+   */
+  _refreshRoster() {
+    const nowMs = Date.now();
+    if (this._rosterAtMs && nowMs - this._rosterAtMs < ROSTER_REFRESH_MS) return;
+    this._rosterAtMs = nowMs;
+
+    const roster = this._call("getSessionRoster");
+    this._roster = Array.isArray(roster) ? roster : [];
+
+    const key = this._roster
+      .slice(0, MAX_ROSTER_CELLS)
+      .map((e) => `${e.userId}:${e.isHolder ? 1 : 0}`)
+      .join(",");
+    this._rosterKey = key;
+  }
+
+  /** @returns {Array<object>} the roster rows currently backing the people drawer. */
+  getRoster() {
+    return this._roster;
+  }
+
+  /** @returns {string} the coarse roster signature feeding getButtonLayout()'s memo key. */
+  getRosterKey() {
+    return this._rosterKey;
   }
 
   getActiveToolId() {
@@ -1226,7 +1428,7 @@ export class VRSpatialMenuModel {
    * active tool and whether isolation is on, so it can tint/highlight them.
    * Iterates getButtonLayout() (not the static constant) so contextual-row
    * buttons get highlighting for free while their tool is active.
-   * @returns {Array<{id:string, active:boolean}>}
+   * @returns {Array<{id:string, active:boolean, disabled:boolean, holder:boolean}>}
    */
   getButtonStates() {
     return this.getButtonLayout().map((btn) => {
@@ -1235,6 +1437,10 @@ export class VRSpatialMenuModel {
       // arrays to threshold, no volume to isosurface). The render layer dims
       // the card, so a tap that no-ops at least looks like it will.
       let disabled = false;
+      // `holder` is a THIRD card style (see VTKVRSpatialUI's CARD_STYLES),
+      // not a variant of active: "this person controls the data" is a property
+      // of the participant, not of the button being pressed.
+      let holder = false;
       if (btn.kind === "tool") active = this._activeToolId === btn.toolId;
       else if (btn.kind === "drawer") active = this._openDrawerId === btn.drawerId;
       else if (btn.id === "isolation") active = this._isolated;
@@ -1251,6 +1457,28 @@ export class VRSpatialMenuModel {
       }
       else if (btn.kind === "nav-mode-set") active = this._call("getNavigationMode") === btn.mode;
       else if (btn.id === "follow-participant") active = !!this._call("isFollowingParticipant");
+      // Roster cells: light the one you are currently following, accent the
+      // control holder, and dim anyone whose pose has gone stale (tapping them
+      // cannot go anywhere — goToParticipant has no position to aim at).
+      else if (btn.kind === "roster-entry") {
+        const entry = this._roster.find((e) => e.userId === btn.userId);
+        active = !!btn.userId && this._call("isFollowingParticipant") === btn.userId;
+        holder = !!entry?.isHolder;
+        disabled = !!entry?.isStale;
+      }
+      // Data-manipulation token. "Release" lights while you hold it (it's the
+      // only button that does anything then); "Give" is dimmed for anyone who
+      // doesn't hold it, because they have nothing to give away.
+      else if (btn.kind === "control-release") {
+        active = !!this._call("isManipulationHolder");
+      }
+      else if (btn.kind === "control-grant") {
+        disabled = !this._call("isManipulationHolder");
+      }
+      // Requesting is pointless while you already hold it.
+      else if (btn.kind === "control-request") {
+        disabled = !!this._call("isManipulationHolder");
+      }
       else if (btn.kind === "representation") {
         const mode = this._readDeferredHold("representation", this._call("getRepresentation"));
         active = !!mode && mode !== "surface";
@@ -1296,7 +1524,7 @@ export class VRSpatialMenuModel {
       // toggle-visibility, the value-* stepper, and the rest of the keyboard
       // (char/backspace/preset/confirm/cancel) are momentary actions — never
       // highlighted.
-      return { id: btn.id, active, disabled };
+      return { id: btn.id, active, disabled, holder };
     });
   }
 
@@ -1326,6 +1554,16 @@ export class VRSpatialMenuModel {
     const pendingWork = this._call("getPendingWorkLabel");
     if (typeof pendingWork === "string" && pendingWork.length) {
       return pendingWork;
+    }
+
+    // Transient notice (VRExplorationManager._flashVRNotice) — most often
+    // "X needs data control". Deliberately AFTER pendingWork: a stall the user
+    // just caused is more urgent than a refusal they can retry, and pending
+    // work self-clears in a few hundred ms anyway. Zero new actors: this rides
+    // the same dirty-checked status canvas as everything else here.
+    const notice = this._call("getVRNotice");
+    if (typeof notice === "string" && notice.length) {
+      return notice;
     }
 
     const name = this._call("getActiveDatasetName") || "Dataset";
@@ -1401,6 +1639,18 @@ export class VRSpatialMenuModel {
     // hint is about the keyboard, not the active tool's normal controls.
     if (this._keyboardOpen) {
       return "Type the note · Save places it for everyone · Cancel discards";
+    }
+    // Matching branch to getStatusLine()'s notice: the status line says WHAT
+    // was refused, this line says what to do about it. Same ordering rule —
+    // pending work wins, because there is nothing to do about a stall.
+    const notice = this._call("getVRNotice");
+    if (typeof notice === "string" && notice.length) {
+      const pendingWork = this._call("getPendingWorkLabel");
+      if (!(typeof pendingWork === "string" && pendingWork.length)) {
+        return this._call("isManipulationHolder")
+          ? "You have data control"
+          : "Open People → Request control";
+      }
     }
     if (this._activeToolId) {
       const toolHints = {

@@ -16,6 +16,7 @@ import { SubsetSelectorModal } from '@UI/react/components/modals/SubsetSelectorM
 // New canvas chrome components
 import { CanvasChrome } from '../CanvasChrome/CanvasChrome.jsx';
 import { ConfirmationDialog } from '@UI/react/components/modals/ConfirmationDialog';
+import { UsernameModal } from '@UI/react/components/modals/UsernameModal';
 import { useAdaptive } from '@UI/react/context/AdaptiveContext';
 import { CanvasChromeFooter2 } from '../CanvasChrome/CanvasChromeFooter2.jsx';
 import { CanvasInfoFooter } from '../CanvasInfoFooter/CanvasInfoFooter.jsx';
@@ -42,6 +43,8 @@ import { sessionManager } from '@Core/session/sessionManager.js';
 import { workspaceManager } from '@Core/instances/workspaceManager.js';
 import { vrManager } from '@Core/vr/VRManager.js';
 import { vrExplorationManager } from '@Core/vr/VRExplorationManager.js';
+import { needsDisplayNamePrompt, setUserName } from '@Collaboration/presence/userManagement.js';
+import { setDeviceName } from '@Core/identity/deviceIdentity.js';
 import { workspace as log } from '@Utils/logger.js';
 import { normalizeInstanceToolsResult } from '@UI/react/utils/instanceTools.js';
 import { useCanvasHistory } from '@UI/react/store/canvasHistoryStore';
@@ -512,6 +515,9 @@ function CanvasWorkspaceInner({
     const layoutContext = useLayoutContext();
     const { isVR } = useAdaptive();
     const [isInImmersiveSession, setIsInImmersiveSession] = useState(() => vrManager.isInVR());
+    // Display-name prompt shown before VR entry (never during it — see the
+    // onToggleVR handler for why the activation gesture must not be spent).
+    const [showVRNamePrompt, setShowVRNamePrompt] = useState(false);
     const { vrAvailable: isVRAvailable } = useWebXRAvailability();
     const setLeftDockedOpen = layoutContext?.setLeftOpen || (() => { });
     const setRightDockedOpen = layoutContext?.setRightOpen || (() => { });
@@ -2151,6 +2157,16 @@ function CanvasWorkspaceInner({
                         return;
                     }
 
+                    // Ask for a display name on THIS click and stop here. The
+                    // modal must resolve on a prior interaction: WebXR
+                    // requestSession() requires fresh user activation, which an
+                    // intervening async modal would consume, silently failing
+                    // VR entry. The user taps VR again after saving a name.
+                    if (needsDisplayNamePrompt()) {
+                        setShowVRNamePrompt(true);
+                        return;
+                    }
+
                     try {
                         await vrExplorationManager.startForView(contextActiveView.id, {
                             explorationMode: 'teleport',
@@ -2631,6 +2647,25 @@ function CanvasWorkspaceInner({
                 }}
                 onCancel={() => setShowCloseAllTilesConfirm(false)}
             />
+
+            {/* Display-name prompt for VR entry. Submitting only saves the
+                name — the user taps Enter VR again, so the WebXR session is
+                requested from a fresh user gesture. */}
+            {showVRNamePrompt && (
+                <UsernameModal
+                    onSubmit={(name) => {
+                        setUserName(name);
+                        setDeviceName(name);
+                        setShowVRNamePrompt(false);
+                    }}
+                    onCancel={() => setShowVRNamePrompt(false)}
+                    title="Name yourself"
+                    subtitle="Everyone in the VR session sees this name"
+                    label="Display name"
+                    submitLabel="Save name"
+                    hint="Tap Enter VR again once your name is saved"
+                />
+            )}
         </FloatingCanvasWrapper>
     );
 }

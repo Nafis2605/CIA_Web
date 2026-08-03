@@ -33,6 +33,12 @@ export function useVRSession(projectId) {
   const [currentSession, setCurrentSession] = useState(null);
   const [participants, setParticipants] = useState([]);
   const [isInVR, setIsInVR] = useState(false);
+  // Data-manipulation token (VRManipulationLock via VRExplorationManager).
+  // { holderUserId, holderUserName, ... } or null when nobody live holds it.
+  const [manipulationHolder, setManipulationHolder] = useState(null);
+  const [manipulationRequests, setManipulationRequests] = useState([]);
+  // userId → what that user is manipulating right now ('dataset' | 'filter').
+  const [activityByUserId, setActivityByUserId] = useState({});
 
   // Loading states
   const [loadingSessions, setLoadingSessions] = useState(false);
@@ -95,6 +101,65 @@ export function useVRSession(projectId) {
       window.removeEventListener("cia:vr-participant-update", syncFromManager);
       window.removeEventListener("cia:vr-participant-left", syncFromManager);
     };
+  }, []);
+
+  // Data-control token. The manager emits 'manipulationControlChanged' with
+  // { holder, requests } on every lock transition (claim, grant, release,
+  // stale-reclaim), so the desktop panel stays in step with the headsets
+  // without polling.
+  useEffect(() => {
+    const sync = (state) => {
+      setManipulationHolder(state?.holder ?? vrExplorationManager.getManipulationHolder());
+      setManipulationRequests(state?.requests ?? vrExplorationManager.getManipulationRequests());
+    };
+
+    const off = vrExplorationManager.on("manipulationControlChanged", sync);
+    sync(null); // pick up a lock already held on mount
+
+    return () => off?.();
+  }, []);
+
+  // Live "who is touching what" map. Rides the EXISTING room-global manipulator
+  // channel (yjsSetup.syncManipulatorToYjs → yjsObservers.onManipulatorChange →
+  // workspaceManager's `cia:manipulator-changed` window event) that desktop
+  // camera drags and VR's _signalManipulation both already write to — no new
+  // Y.js map, no polling.
+  useEffect(() => {
+    const onManipulatorChanged = (e) => {
+      const { userId, manipulator } = e.detail || {};
+      if (!userId) return;
+      setActivityByUserId((prev) => {
+        const target = manipulator?.target || null;
+        if ((prev[userId] || null) === target) return prev; // no re-render
+        const next = { ...prev };
+        if (target) next[userId] = target;
+        else delete next[userId];
+        return next;
+      });
+    };
+
+    window.addEventListener("cia:manipulator-changed", onManipulatorChanged);
+    return () => window.removeEventListener("cia:manipulator-changed", onManipulatorChanged);
+  }, []);
+
+  /**
+   * Hand the data-manipulation token to another participant. Only meaningful
+   * for the current holder or the host — the lock enforces that itself, this
+   * just surfaces it.
+   */
+  const grantControl = useCallback((userId, userName) => {
+    if (!userId) return false;
+    return vrExplorationManager.grantManipulationControlTo(userId, userName);
+  }, []);
+
+  /** Ask the current holder for the data-manipulation token. */
+  const requestControl = useCallback(() => {
+    return vrExplorationManager.requestManipulationControl();
+  }, []);
+
+  /** Give the token back to the session host. */
+  const releaseControl = useCallback(() => {
+    return vrExplorationManager.releaseManipulationControl();
   }, []);
 
   // Fetch active sessions for project. These are raw vr_exploration_sessions
@@ -326,6 +391,11 @@ export function useVRSession(projectId) {
     isInVR,
     isOwner,
 
+    // Data-control token
+    manipulationHolder,
+    manipulationRequests,
+    activityByUserId,
+
     // Loading states
     loadingSessions,
     joiningSession,
@@ -337,6 +407,9 @@ export function useVRSession(projectId) {
     endSession,
     createSnapshot,
     getSessionsForDataset,
+    grantControl,
+    requestControl,
+    releaseControl,
   };
 }
 
