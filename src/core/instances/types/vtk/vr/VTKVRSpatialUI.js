@@ -1244,7 +1244,15 @@ export class VRSpatialUI {
     };
   }
 
-  /** Show the full panel at the user's current gaze direction. */
+  /**
+   * Show the full panel at the user's current gaze direction. This is a
+   * gaze-anchored placement, NOT a manual one — _manualPlacement stays false
+   * afterward so _updateAnchor's lazy re-anchor-on-drift (see its docstring)
+   * keeps running on every subsequent frame and the panel keeps following the
+   * user as they move. Only an explicit header grab-drag (_beginTriggerDrag/
+   * _beginGripDrag) should latch _manualPlacement — this used to also latch
+   * it here, which froze the panel in place the moment it was (re)shown.
+   */
   showAtHead(headPose) {
     if (!this._model) return;
     this._model.setVisible(true);
@@ -1253,7 +1261,6 @@ export class VRSpatialUI {
     this._panelAnchor = null;
     this._lastHeadPos = null;
     this._updateAnchor(headPose);
-    this._manualPlacement = !!this._panelAnchor;
   }
 
   /** Left-X entry point: close when open; reopen at current gaze when closed. */
@@ -1266,6 +1273,26 @@ export class VRSpatialUI {
     } else {
       this.showAtHead(headPose);
     }
+  }
+
+  /**
+   * Invalidate the cached panel anchor so the next _updateAnchor() call
+   * recomputes unconditionally, bypassing both the position-drift gate and
+   * the manual-placement latch. Call this whenever something redefines the
+   * XR reference space itself (e.g. VRManager.applySnapTurn/setYaw) — the
+   * cached `_panelAnchor` holds raw XR-space numbers captured in the OLD
+   * frame, and a reference-space rotation is deliberately position-preserving
+   * (see applySnapTurn), so the position-drift gate never trips on its own
+   * and the stale anchor would otherwise desync from the camera permanently.
+   * Also clears a manual placement: its cached coordinates are equally
+   * invalidated by the reference-space change, so keeping it would just
+   * freeze the panel in the wrong spot instead of the right one.
+   */
+  forceReanchor() {
+    this._panelAnchor = null;
+    this._lastHeadPos = null;
+    this._lastAnchorScale = null;
+    this._manualPlacement = false;
   }
 
   /**

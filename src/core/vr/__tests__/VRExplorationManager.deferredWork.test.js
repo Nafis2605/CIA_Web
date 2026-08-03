@@ -167,6 +167,26 @@ describe("VRExplorationManager — deferred work queue (_deferHeavy / _drainDefe
     expect(vrExplorationManager.getPendingWorkLabel()).toBeNull();
   });
 
+  it("_drainDeferredWork skips refreshDataBounds when the task opts out via boundsMayChange: false", () => {
+    const refreshSpy = vi.spyOn(vrExplorationManager, "refreshDataBounds");
+    vrExplorationManager._activeContext = { vrContext: { dataBounds: [0, 1, 0, 1, 0, 1] } };
+
+    vrExplorationManager._deferHeavy("Applying appearance…", () => {}, { boundsMayChange: false });
+    vrExplorationManager._drainDeferredWork();
+
+    expect(refreshSpy).not.toHaveBeenCalled();
+  });
+
+  it("_drainDeferredWork still calls refreshDataBounds for tasks that may substitute the actor", () => {
+    const refreshSpy = vi.spyOn(vrExplorationManager, "refreshDataBounds");
+    vrExplorationManager._activeContext = { vrContext: { dataBounds: [0, 1, 0, 1, 0, 1] } };
+
+    vrExplorationManager._deferHeavy("Building glyphs…", () => {});
+    vrExplorationManager._drainDeferredWork();
+
+    expect(refreshSpy).toHaveBeenCalledTimes(1);
+  });
+
   it("toggleGlyphs() still returns false synchronously (without enqueuing) when the dataset has no vector/scalar arrays", () => {
     mockGlyphState.enabled = false;
     mockGlyphState.vectorArrays = [];

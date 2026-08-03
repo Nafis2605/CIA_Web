@@ -419,7 +419,30 @@ describe("VRSpatialUI integration — initialize/update/dispose against a fake r
     ui.toggleAtHead(newHead);
     expect(ui.getModel().isVisible()).toBe(true);
     expect(ui._panelAnchor.center).not.toEqual(original);
-    expect(ui._manualPlacement).toBe(true);
+    // Gaze-anchored (not a manual grab-drag), so the panel must keep
+    // following the user afterward — see showAtHead.
+    expect(ui._manualPlacement).toBe(false);
+  });
+
+  it("forceReanchor clears the cached anchor so the next call re-anchors even without position drift", () => {
+    const ui = new VRSpatialUI();
+    ui.initialize(makeFakeRenderer(), makeManager());
+    ui.update(makeInputState(), { vrScale: 1, vrOrigin: [0, 0, 0] });
+    const original = [...ui._panelAnchor.center];
+
+    // A small move, well under REANCHOR_DISTANCE — sanity-checks that the
+    // gate normally holds the panel in place.
+    ui.update(makeInputState({ headY: 1.65 }), { vrScale: 1, vrOrigin: [0, 0, 0] });
+    expect(ui._panelAnchor.center).toEqual(original);
+
+    // Simulates VRExplorationManager reacting to a reference-space change
+    // (e.g. a snap-turn) — see VRExplorationManager._onFrame's yaw-offset check.
+    ui.forceReanchor();
+    expect(ui._panelAnchor).toBeNull();
+
+    ui.update(makeInputState({ headY: 1.65 }), { vrScale: 1, vrOrigin: [0, 0, 0] });
+    expect(ui._panelAnchor.center).not.toEqual(original);
+    expect(ui._manualPlacement).toBe(false);
   });
 
   it("dispose() removes every actor it added and leaves no residual state", () => {

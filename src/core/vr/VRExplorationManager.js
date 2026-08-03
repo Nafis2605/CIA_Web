@@ -73,6 +73,16 @@ const FIT_DISTANCE_M =
   (PANEL_PLANE_M + PANEL_CLEARANCE_M) / (1 - Math.sin(FIT_HALF_ANGLE_RAD));
 const FIT_DIAGONAL_M = 2 * FIT_DISTANCE_M * Math.sin(FIT_HALF_ANGLE_RAD);
 
+// How high (physical metres) the dataset's own bottom bound sits above the
+// floor — a fixed pedestal rather than resting directly on it. Without this,
+// _computeAutoPlacement's grounding invariant (see there) pins a flat/short
+// dataset's bottom to the literal floor, so its center — and anything sized
+// to its bounds, like the cube-axes marker — ends up hugging the floor well
+// below a comfortable standing eye/interaction line. A fixed pedestal (not a
+// "center at eye height" placement) keeps the dataset visually anchored to
+// the floor grid rather than floating disconnected from it.
+const PEDESTAL_HEIGHT_M = 0.5;
+
 // How long a "Building glyphs…" style status label may persist before the
 // panel falls back to its normal status line (see getPendingWorkLabel).
 const PENDING_WORK_TTL_MS = 3000;
@@ -164,6 +174,10 @@ class VRExplorationManager extends BaseManager {
     this._isolationBackup = null;
     this._lastIsolationButtonState = false;
     this._lastMenuToggleButtonState = false;
+
+    // vrManager.getYawOffset() snapshot, compared each frame in _onFrame to
+    // force vrSpatialUI.forceReanchor() after a snap-turn (see there).
+    this._lastMenuYawOffset = 0;
 
     // In-VR "follow a collaborator" — soft positional follow only, never
     // touches head orientation (see followParticipant/_updateParticipantFollow).
@@ -876,6 +890,7 @@ class VRExplorationManager extends BaseManager {
       this._isolationBackup = null;
       this._lastIsolationButtonState = false;
       this._lastMenuToggleButtonState = false;
+      this._lastMenuYawOffset = 0;
       this._followTargetUserId = null;
       this._inputProfileDetected = false;
       // The cached hit belongs to the picker on the vrContext just disposed.
@@ -1679,6 +1694,17 @@ class VRExplorationManager extends BaseManager {
     // the same defect the two-hand gesture had, and a 10x preset jump makes it
     // far more violent. See VRScaleController.setScale.
     this._navigationController.setScale(scale, this._lastHeadFloorXR);
+    // setScale's pivot deliberately leaves Y untouched (see its doc comment),
+    // which is exactly right for the OLD scale-independent floor grounding
+    // but leaves the pedestal (see PEDESTAL_HEIGHT_M) stale at the previous
+    // scale's height. Re-ground now that vrScale has changed — a one-shot
+    // preset tap, not a live gesture, so there's no per-frame pivot logic to
+    // fight with here (contrast the two-hand gesture, which deliberately
+    // holds Y fixed for its own duration — see VRScaleController._pivotedOrigin).
+    const ctx = this._activeContext?.vrContext;
+    if (ctx && Array.isArray(ctx.vrOrigin)) {
+      ctx.vrOrigin[1] = this._groundY(ctx);
+    }
     this._emit('vrScaleChanged', { scale });
   }
 
@@ -1709,10 +1735,12 @@ class VRExplorationManager extends BaseManager {
     // Deferred like the other menu-triggered visualization changes (see
     // _deferHeavy / toggleGlyphs) — the mapper rebuild + sync patch run one
     // frame later; the optimistic `next` is returned immediately.
+    // boundsMayChange: false — representation only changes how the mapper
+    // draws existing geometry (surface/wireframe/points), never its bounds.
     this._deferHeavy('Applying appearance…', () => {
       instanceTools.setRepresentation?.(instanceId, next);
       this._pushVisualizationPatch({ representation: next });
-    });
+    }, { boundsMayChange: false });
     this._emit('representationChanged', { representation: next });
     return next;
   }
@@ -1733,11 +1761,11 @@ class VRExplorationManager extends BaseManager {
       return null;
     }
 
-    // Deferred — see cycleRepresentation.
+    // Deferred — see cycleRepresentation. boundsMayChange: false, same reason.
     this._deferHeavy('Applying appearance…', () => {
       instanceTools.setRepresentation?.(instanceId, mode);
       this._pushVisualizationPatch({ representation: mode });
-    });
+    }, { boundsMayChange: false });
     this._emit('representationChanged', { representation: mode });
     return mode;
   }
@@ -2296,10 +2324,12 @@ class VRExplorationManager extends BaseManager {
    */
   /**
    * Compute an auto-fit vrScale/vrOrigin so a dataset of arbitrary size and
-   * position ends up ~1m in front of the user at chest height, regardless of
-   * where its bounds sit relative to the data origin. Shared by initial VR
-   * placement (_applyInitialPlacement) and isolation mode (enterIsolation) —
-   * same math, same "diagonal spans ~2.5 physical meters" convention.
+   * position ends up ~1m in front of the user, its own bottom bound resting
+   * PEDESTAL_HEIGHT_M above the floor (not directly on it — see there),
+   * regardless of where its bounds sit relative to the data origin. Shared by
+   * initial VR placement (_applyInitialPlacement) and isolation mode
+   * (enterIsolation) — same math, same "diagonal spans ~2.5 physical meters"
+   * convention.
    * @private
    */
   _computeAutoPlacement(dataBounds) {
@@ -2326,19 +2356,24 @@ class VRExplorationManager extends BaseManager {
     // file — the distance is what keeps the dataset clear of the menu panel).
     const vrScale = FIT_DIAGONAL_M / diagonal;
 
-    // GROUNDING INVARIANT. The dataset's base sits on the floor iff its
-    // data-space Y-minimum maps to physical y=0, and since
+    // GROUNDING INVARIANT. The dataset's base sits PEDESTAL_HEIGHT_M above
+    // the floor iff its data-space Y-minimum maps to physical y=PEDESTAL_HEIGHT_M,
+    // and since
     //     xr.y(P) = (P - vrOrigin[1]) * vrScale
-    // that is exactly `vrOrigin[1] = dataBounds[2]`, independent of vrScale.
+    // that is exactly `vrOrigin[1] = dataBounds[2] - PEDESTAL_HEIGHT_M / vrScale`.
+    // vrOrigin[1] is still a FIXED data-space value once placed, independent
+    // of any later vrScale change — that's the property that matters below.
     //
-    // This one line is what fixes "the data keeps getting larger and rises
-    // over the user". Changing vrScale with vrOrigin fixed is a homothety
-    // about the XR origin, which in local-floor space is the floor point under
-    // the user — so every coordinate INCLUDING HEIGHT multiplies by s/s0. It
-    // used to start at xr.y ~= +0.6 m and double with every doubling of scale.
-    // A point sitting exactly ON the origin plane is a fixed point of that
-    // homothety, so grounding removes the rise with no per-frame clamp.
-    const groundY = b[2];
+    // Pinning SOME fixed data-space plane here is what fixes "the data keeps
+    // getting larger and rises over the user". Changing vrScale with vrOrigin
+    // fixed is a homothety about the XR origin, which in local-floor space is
+    // the floor point under the user — so every coordinate INCLUDING HEIGHT
+    // multiplies by s/s0. It used to start at xr.y ~= +0.6 m and double with
+    // every doubling of scale. A point sitting exactly on the pinned plane is
+    // a fixed point of that homothety, so grounding removes the rise with no
+    // per-frame clamp — the pedestal offset doesn't reintroduce it, since it
+    // only changes WHICH plane is pinned, not whether one is.
+    const groundY = b[2] - PEDESTAL_HEIGHT_M / vrScale;
     const vrOrigin = [
       center[0],
       groundY,
@@ -2356,16 +2391,17 @@ class VRExplorationManager extends BaseManager {
 
   /**
    * Data-space Y of the plane the dataset rests on — the value vrOrigin[1]
-   * must hold for the dataset to sit on the floor (see the grounding
-   * invariant in _computeAutoPlacement). Every writer of vrOrigin[1] has to
-   * go through this, or the first one that doesn't silently un-grounds the
-   * dataset and the ballooning returns.
+   * must hold for the dataset's bottom bound to sit PEDESTAL_HEIGHT_M above
+   * the floor (see the grounding invariant in _computeAutoPlacement). Every
+   * writer of vrOrigin[1] has to go through this, or the first one that
+   * doesn't silently un-grounds the dataset and the ballooning returns.
    * @private
    */
   _groundY(vrContext) {
     const b = vrContext?.dataBounds;
+    const vrScale = vrContext?.vrScale || 1;
     if (Array.isArray(b) && b.length === 6 && Number.isFinite(b[2])) {
-      return b[2];
+      return b[2] - PEDESTAL_HEIGHT_M / vrScale;
     }
     return vrContext?.vrOrigin?.[1] ?? 0;
   }
@@ -2496,8 +2532,8 @@ class VRExplorationManager extends BaseManager {
 
     // Horizontal target only. The vertical placement comes entirely from the
     // grounding invariant below: with vrOrigin[1] = groundY, the centre lands
-    // at (center[1] - groundY) * vrScale above the floor — i.e. exactly its
-    // own half-height, resting on the ground. No eye-height term needed.
+    // at (center[1] - groundY) * vrScale above the floor — i.e. its own
+    // half-height plus PEDESTAL_HEIGHT_M, resting on the pedestal.
     const targetX = position.x + fx * FIT_DISTANCE_M;
     const targetZ = position.z + fz * FIT_DISTANCE_M;
 
@@ -2708,6 +2744,12 @@ class VRExplorationManager extends BaseManager {
         if (Number.isFinite(mine.vrScale) && mine.vrScale > 0) {
           vrContext.vrScale = mine.vrScale;
           this._navigationController?.setScale?.(mine.vrScale);
+          // Re-ground: _groundY's data-space value depends on vrScale (see
+          // PEDESTAL_HEIGHT_M), so restoring a different scale without this
+          // would leave the pedestal height stale and drifting.
+          if (Array.isArray(vrContext.vrOrigin)) {
+            vrContext.vrOrigin[1] = this._groundY(vrContext);
+          }
         }
         if (mine.mode) this.setNavigationMode(mine.mode);
       }
@@ -2752,9 +2794,14 @@ class VRExplorationManager extends BaseManager {
    * @param {Function} fn - the deferred work; invoked with no arguments and
    *   individually try/caught by _drainDeferredWork so a failure here can
    *   never strand the queue or the frame loop.
+   * @param {{boundsMayChange?: boolean}} [opts] - boundsMayChange defaults to
+   *   true (Threshold/Isosurface/Glyphs substitute the actor with different
+   *   bounds). Pass false for tasks that only touch actor/mapper properties
+   *   (e.g. representation) so _drainDeferredWork can skip the bounds
+   *   readback — see the note there.
    * @private
    */
-  _deferHeavy(label, fn) {
+  _deferHeavy(label, fn, { boundsMayChange = true } = {}) {
     // Coalesce a repeat of the same action. Because the guards run
     // synchronously but the mutation is deferred, a second tap before the
     // drain reads pre-tap state — so double-tapping Threshold used to enqueue
@@ -2762,7 +2809,7 @@ class VRExplorationManager extends BaseManager {
     const tail = this._deferredWork[this._deferredWork.length - 1];
     if (tail && tail.label === label) return;
 
-    this._deferredWork.push({ label, fn });
+    this._deferredWork.push({ label, fn, boundsMayChange });
     this._pendingWorkLabel = label;
     this._pendingWorkAtMs = Date.now();
   }
@@ -2784,17 +2831,22 @@ class VRExplorationManager extends BaseManager {
       } catch (e) {
         log.error(`VR deferred work "${task.label}" failed — ${e?.message}`, e?.stack || e);
       }
-      // Every deferred task is a visualization change (representation,
-      // threshold, isosurface, glyphs), and Threshold/Isosurface/Glyphs
-      // SUBSTITUTE a derived actor with different bounds. Refreshing here
-      // rather than at each of the seven _deferHeavy call sites means a new
-      // one can't forget to — and stale bounds would silently put the
-      // grounding plane and the menu's angular clearance on dead geometry.
-      // Runs even if the task threw: it may have partially applied.
-      try {
-        this.refreshDataBounds();
-      } catch (e) {
-        log.warn(`VR dataBounds refresh failed — ${e?.message}`);
+      // Threshold/Isosurface/Glyphs SUBSTITUTE a derived actor with different
+      // bounds. Refreshing here rather than at each call site means a new one
+      // can't forget to — and stale bounds would silently put the grounding
+      // plane and the menu's angular clearance on dead geometry. Runs even if
+      // the task threw: it may have partially applied.
+      // Representation-only changes (see cycleRepresentation/setRepresentation)
+      // opt out via boundsMayChange: false — they never touch the actor's
+      // bounds, and this synchronous actor.getBounds() readback was extra
+      // main-thread work landing in the same XR frame slot that caused the
+      // "world shaking" glyph-rebuild bug this comment describes above.
+      if (task.boundsMayChange !== false) {
+        try {
+          this.refreshDataBounds();
+        } catch (e) {
+          log.warn(`VR dataBounds refresh failed — ${e?.message}`);
+        }
       }
     }
     this._pendingWorkLabel = this._deferredWork[0]?.label ?? null;
@@ -2843,6 +2895,19 @@ class VRExplorationManager extends BaseManager {
 
       // Get input state
       const inputState = this._gatherInputState(frame);
+
+      // A snap-turn (or any other reference-space offset) rotates the frame
+      // every subsequent pose is reported in, but is deliberately built to
+      // leave head POSITION nearly unchanged (see VRManager.applySnapTurn) —
+      // so vrSpatialUI's position-drift re-anchor gate never trips on its
+      // own, and its cached anchor would silently desync from the camera and
+      // stay frozen there. Force a fresh anchor the frame after any yaw
+      // change, before this frame's hitTest() runs.
+      const currentYawOffset = vrManager.getYawOffset?.() ?? 0;
+      if (currentYawOffset !== this._lastMenuYawOffset) {
+        this._lastMenuYawOffset = currentYawOffset;
+        vrSpatialUI.forceReanchor?.();
+      }
 
       // Quest: left X is the fast menu toggle. Reopening deliberately creates
       // a fresh anchor at the user's current gaze, so a menu left elsewhere

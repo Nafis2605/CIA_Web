@@ -518,6 +518,16 @@ export class VRSpatialMenuModel {
       ];
     }
 
+    // Surface the live roster count on the People button itself, so a solo
+    // user sees "People (1)" and knows they're already listed instead of
+    // having to open the drawer on faith that something (including
+    // themselves) is in there. this._roster is kept current by
+    // syncFromManager -> _refreshRoster, which always runs before this.
+    const rosterCount = this._roster.length;
+    allButtons = allButtons.map((b) =>
+      b.id === "people" ? { ...b, label: `People (${rosterCount})` } : b
+    );
+
     const layout = computeGridLayout(allButtons);
     this._layoutCacheKey = key;
     this._layoutCache = layout;

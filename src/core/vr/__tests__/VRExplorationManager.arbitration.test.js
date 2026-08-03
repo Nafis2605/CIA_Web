@@ -15,6 +15,7 @@ const mockVrManager = {
   isVRSupported: vi.fn(() => false),
   isSelectPressed: vi.fn(() => false),
   getReferenceSpace: vi.fn(() => ({})),
+  getYawOffset: vi.fn(() => 0),
   on: vi.fn(),
   off: vi.fn(),
 };
@@ -61,10 +62,12 @@ vi.mock("@Core/instances/types/vtk/vr/VTKVRAvatars.js", () => ({
 // test below) mirroring VRExplorationManager._onFrame's real call sites.
 const mockSpatialHitTest = vi.fn(() => ({ hovering: false, hand: "right", buttonId: null }));
 const mockSpatialLayout = vi.fn();
+const mockForceReanchor = vi.fn();
 vi.mock("@Core/instances/types/vtk/vr/VTKVRSpatialUI.js", () => ({
   vrSpatialUI: {
     hitTest: (...a) => mockSpatialHitTest(...a),
     layout: (...a) => mockSpatialLayout(...a),
+    forceReanchor: (...a) => mockForceReanchor(...a),
     toggleAtHead: vi.fn(),
     dispose: vi.fn(),
   },
@@ -110,6 +113,8 @@ describe("VRExplorationManager._onFrame — input arbitration (R2)", () => {
 
     vrExplorationManager._inputProfileDetected = true; // skip one-shot switch
     vrExplorationManager._followTargetUserId = null;
+    vrExplorationManager._lastMenuYawOffset = 0;
+    mockVrManager.getYawOffset.mockReturnValue(0);
     vrExplorationManager._activeContext = {
       handler: { updateVRExploration: vi.fn() },
       vrContext: { vrScale: 1, vrOrigin: [1, 2, 3] },
@@ -227,6 +232,27 @@ describe("VRExplorationManager._onFrame — input arbitration (R2)", () => {
     // vrContext (vrScale 2.5, origin [4,5,6]), not the pre-frame vrContext
     // ({ vrScale: 1, vrOrigin: [1, 2, 3] } from beforeEach).
     expect(mockSpatialLayout).toHaveBeenCalledWith({ vrScale: 2.5, vrOrigin: [4, 5, 6] });
+  });
+
+  // A snap-turn rotates the XR reference space itself, which is deliberately
+  // built to leave head POSITION nearly unchanged — so vrSpatialUI's own
+  // position-drift re-anchor gate never trips on its own, and its cached
+  // anchor would silently desync from the camera and stay frozen there (the
+  // "menu doesn't follow the user" bug). _onFrame watches vrManager's yaw
+  // offset itself and forces a fresh anchor the frame after it changes.
+  it("does not force a menu re-anchor when the yaw offset hasn't changed", () => {
+    runFrame();
+    expect(mockForceReanchor).not.toHaveBeenCalled();
+  });
+
+  it("forces a menu re-anchor the frame after vrManager reports a new yaw offset", () => {
+    mockVrManager.getYawOffset.mockReturnValue(Math.PI / 6); // one snap-turn step
+    runFrame();
+    expect(mockForceReanchor).toHaveBeenCalledTimes(1);
+
+    // Stays at the new offset next frame — must not keep re-forcing forever.
+    runFrame();
+    expect(mockForceReanchor).toHaveBeenCalledTimes(1);
   });
 
   it("persists VR hints exactly once when a grab ends", () => {

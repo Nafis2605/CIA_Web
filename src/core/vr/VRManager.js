@@ -950,6 +950,20 @@ class VRManager extends BaseManager {
   }
 
   /**
+   * Current accumulated snap-turn yaw offset (radians). Any change means
+   * `_referenceSpace` was just re-derived via getOffsetReferenceSpace — every
+   * pose reported afterward (including cached raw-space anchors computed
+   * before the change) is now expressed in a different coordinate frame. See
+   * applySnapTurn/setYaw; consumers that cache raw XR-space coordinates
+   * across frames (e.g. VTKVRSpatialUI's panel anchor) must watch this and
+   * invalidate their cache when it changes.
+   * @returns {number}
+   */
+  getYawOffset() {
+    return this._yawOffset;
+  }
+
+  /**
    * Get the XR WebGL layer
    * @returns {XRWebGLLayer|null}
    */

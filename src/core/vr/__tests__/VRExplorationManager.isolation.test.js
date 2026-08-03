@@ -69,7 +69,7 @@ describe("VRExplorationManager isolation mode", () => {
     };
   });
 
-  it("enterIsolation auto-fits the model and rests it on the floor", () => {
+  it("enterIsolation auto-fits the model and rests it on the pedestal", () => {
     const ok = vrExplorationManager.enterIsolation();
 
     expect(ok).toBe(true);
@@ -84,8 +84,10 @@ describe("VRExplorationManager isolation mode", () => {
     expect((0.5 - ctx.vrOrigin[2]) * ctx.vrScale).toBeLessThan(-2);
 
     // GROUNDED: the data-space bottom (dataBounds[2] = 0) maps to physical
-    // y = 0. This is what stops a two-hand zoom lifting the model overhead.
-    expect((ctx.dataBounds[2] - ctx.vrOrigin[1]) * ctx.vrScale).toBeCloseTo(0, 10);
+    // y = PEDESTAL_HEIGHT_M (0.5), not the literal floor — see
+    // VRExplorationManager.js's PEDESTAL_HEIGHT_M. This is what stops a
+    // two-hand zoom lifting the model overhead.
+    expect((ctx.dataBounds[2] - ctx.vrOrigin[1]) * ctx.vrScale).toBeCloseTo(0.5, 10);
 
     expect(mockVrManager.enterIsolationMode).toHaveBeenCalledWith("view-1");
     expect(vrExplorationManager.isIsolated()).toBe(true);
@@ -103,7 +105,7 @@ describe("VRExplorationManager isolation mode", () => {
     // floating or sunk on exit.
     expect(ctx.vrOrigin[0]).toBe(5);
     expect(ctx.vrOrigin[2]).toBe(7);
-    expect((ctx.dataBounds[2] - ctx.vrOrigin[1]) * ctx.vrScale).toBeCloseTo(0, 10);
+    expect((ctx.dataBounds[2] - ctx.vrOrigin[1]) * ctx.vrScale).toBeCloseTo(0.5, 10);
     expect(mockVrManager.exitIsolationMode).toHaveBeenCalled();
     expect(vrExplorationManager.isIsolated()).toBe(false);
   });
