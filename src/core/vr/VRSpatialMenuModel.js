@@ -78,7 +78,6 @@ export const VR_MENU_BUTTONS = Object.freeze([
   // "move-object": trigger drags the ACTIVE dataset's transform for every
   // collaborator (shared), not just the local view.
   { id: "move-object", label: "Move Obj", icon: "transform", kind: "nav-mode-set", mode: "move-object", row: 1, group: "MOVE" },
-  { id: "walk", label: "Walk", icon: "footprints", kind: "nav-mode-set", mode: "walk", row: 1, group: "MOVE" },
   // "teleport": trigger aims the arc and commits on release.
   { id: "teleport", label: "Teleport", icon: "zap", kind: "nav-mode-set", mode: "teleport", row: 1, group: "MOVE" },
 
@@ -95,29 +94,14 @@ export const VR_MENU_BUTTONS = Object.freeze([
   // there was nowhere to put threshold/isosurface at all. See VR_MENU_DRAWERS.
   { id: "appearance", label: "Style", icon: "cube", kind: "drawer", drawerId: "appearance", row: 2, group: "VIEW" },
   { id: "filters", label: "Filters", icon: "filter", kind: "drawer", drawerId: "filters", row: 2, group: "VIEW" },
-  { id: "glyphs", label: "Glyphs", icon: "arrowUpRight", kind: "glyph-toggle", row: 2, group: "VIEW" },
-
-  // ---- Row 3 — SCENE: what is shown, and saving/restoring it ---------------
-  { id: "isolation", label: "Isolate", icon: "fullscreen", kind: "toggle", row: 3, group: "SCENE" },
-  // Labelled "Views", not "Grid": this lays out your OTHER open views in space
-  // (VRMultiViewGrid) and has nothing to do with a reference grid. The id stays
-  // "grid" so _toggleGrid/isGridModeEnabled/getButtonStates and the existing
-  // tests keep working — only the user-facing label was ever wrong.
-  { id: "grid", label: "Views", icon: "layoutGrid", kind: "toggle", row: 3, group: "SCENE" },
-  { id: "ref-grid", label: "Grid", icon: "grid", kind: "scene-grid", row: 3, group: "SCENE" },
-  { id: "axes", label: "Axes", icon: "axis3d", kind: "scene-axes", row: 3, group: "SCENE" },
-  { id: "snapshot-save", label: "Save", icon: "save", kind: "snapshot-save", row: 3, group: "SCENE" },
-  { id: "snapshot-load", label: "Load", icon: "folderOpen", kind: "snapshot-load", row: 3, group: "SCENE" },
-
-  // ---- Row 4 — SESSION: other people, voice, and leaving -------------------
-  // Go To/Follow used to live here as static cells. They moved VERBATIM into
-  // the "people" drawer (same ids, same kinds, same handlers) to make room for
-  // data-control without growing the row past what fits: the row was already
-  // full at 6, and control needs three cells of its own.
+  // ---- Row 4 — SESSION: the essential session controls ---------------------
+  // Less-frequent scene, snapshot, voice and alternate-navigation actions
+  // live in the Advanced drawer. Keeping the default surface to four rows
+  // gives every Quest-facing card and label materially more screen space.
   // exit stays last (VTKVRSpatialUI/tests rely on the last row ending with it).
   { id: "people", label: "People", icon: "user", kind: "drawer", drawerId: "people", row: 4, group: "SESSION" },
-  { id: "voice-join", label: "Voice", icon: "headsetMic", kind: "voice-join", row: 4, group: "SESSION" },
-  { id: "voice-mute", label: "Mute", icon: "mic", kind: "voice-mute", row: 4, group: "SESSION" },
+  { id: "isolation", label: "Isolate", icon: "fullscreen", kind: "toggle", row: 4, group: "SESSION" },
+  { id: "advanced", label: "More", icon: "sliders", kind: "drawer", drawerId: "advanced", row: 4, group: "SESSION" },
   { id: "hide-menu", label: "Hide", icon: "eyeOff", kind: "toggle-visibility", row: 4, group: "SESSION" },
   { id: "exit", label: "Exit VR", icon: "doorOpen", kind: "exit", row: 4, group: "SESSION" },
 ]);
@@ -187,6 +171,20 @@ export const VR_MENU_DRAWERS = Object.freeze({
     { id: "control-request", label: "Request", icon: "hand", kind: "control-request", drawerRow: 0, group: "SESSION" },
     { id: "control-grant", label: "Give", icon: "share", kind: "control-grant", drawerRow: 0, group: "SESSION" },
     { id: "control-release", label: "Release", icon: "unlock", kind: "control-release", drawerRow: 0, group: "SESSION" },
+  ]),
+  // Controls intentionally kept off the default surface so the core menu is
+  // readable on Quest 2. Nothing is removed; the existing dispatch paths are
+  // reused unchanged when this drawer is open.
+  advanced: Object.freeze([
+    { id: "walk", label: "Walk", icon: "footprints", kind: "nav-mode-set", mode: "walk", drawerRow: 0, group: "MOVE" },
+    { id: "glyphs", label: "Glyphs", icon: "arrowUpRight", kind: "glyph-toggle", drawerRow: 0, group: "VIEW" },
+    { id: "voice-join", label: "Voice", icon: "headsetMic", kind: "voice-join", drawerRow: 0, group: "SESSION" },
+    { id: "voice-mute", label: "Mute", icon: "mic", kind: "voice-mute", drawerRow: 0, group: "SESSION" },
+    { id: "grid", label: "Views", icon: "layoutGrid", kind: "toggle", drawerRow: 1, group: "SCENE" },
+    { id: "ref-grid", label: "Grid", icon: "grid", kind: "scene-grid", drawerRow: 1, group: "SCENE" },
+    { id: "axes", label: "Axes", icon: "axis3d", kind: "scene-axes", drawerRow: 1, group: "SCENE" },
+    { id: "snapshot-save", label: "Save", icon: "save", kind: "snapshot-save", drawerRow: 1, group: "SCENE" },
+    { id: "snapshot-load", label: "Load", icon: "folderOpen", kind: "snapshot-load", drawerRow: 1, group: "SCENE" },
   ]),
 });
 

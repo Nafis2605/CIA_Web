@@ -129,6 +129,23 @@ describe("VRExplorationManager._gatherInputState — transient-pointer support",
     expect(state.controllers.left.isTransientPointer).toBe(false);
   });
 
+  it("maps Quest face buttons by hand so left X is distinct from right A", () => {
+    const buttons = Array.from({ length: 6 }, () => ({ pressed: false, value: 0 }));
+    buttons[4] = { pressed: true, value: 1 };
+    const left = {
+      handedness: "left",
+      targetRaySpace: {},
+      gripSpace: {},
+      gamepad: { buttons, axes: [] },
+      hand: null,
+    };
+    const right = { ...left, handedness: "right", targetRaySpace: {}, gripSpace: {} };
+
+    const state = vrExplorationManager._gatherInputState(makeFrame([left, right]), {});
+    expect(state.controllers.left.buttons).toMatchObject({ x: true, y: false, a: false, b: false });
+    expect(state.controllers.right.buttons).toMatchObject({ x: false, y: false, a: true, b: false });
+  });
+
   it("skips hand-tracking sources and sources without poses", () => {
     const handSource = { handedness: "left", hand: {}, targetRaySpace: {} };
     const noPose = {

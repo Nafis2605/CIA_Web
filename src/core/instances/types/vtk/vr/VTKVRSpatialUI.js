@@ -33,7 +33,7 @@
 // dispatch lives in VRSpatialMenuModel (pure, unit-tested).
 
 import { vr as log } from "@Utils/logger.js";
-import { VRSpatialMenuModel, VR_MENU_GROUPS } from "@Core/vr/VRSpatialMenuModel.js";
+import { VRSpatialMenuModel } from "@Core/vr/VRSpatialMenuModel.js";
 import { readVRAccessibilitySettings } from "@Core/vr/vrAccessibilityStore.js";
 // Canvas->texture and rounded-rect tracing now live in the shared VR text
 // primitive (src/core/vr/ui/VRTextBillboard.js) so the menu, avatar labels and
@@ -58,7 +58,7 @@ import vtkTexture from "@kitware/vtk.js/Rendering/Core/Texture";
 // drawers arrived) still give ~0.13 m cells — about 6.2 degrees at
 // PANEL_DISTANCE, comfortable for both a Quest controller ray and a Vision Pro
 // gaze pinch.
-const PANEL_WIDTH = 0.78;
+const PANEL_WIDTH = 0.9;
 // Keyboard mode's own panel geometry — swapped in over the menu's constants
 // above whenever VRSpatialMenuModel.isKeyboardOpen() is true (see update()'s
 // mode switch). At the menu's 0.78 m width a 10-column row (digits, QWERTY,
@@ -89,9 +89,9 @@ const ROW_HEIGHT_MIN_M = 0.1;
 // so the panel did not clear the forward axis, and against a dataset
 // subtending ~77 deg the required offset was ~67 deg of azimuth — outside any
 // usable gaze cone. Shrinking the entry fit is what made this solvable.
-const PANEL_DISTANCE = 1.6;
-const PANEL_DROP = 0.55; // how far below eye-line the panel center sits
-const PANEL_SIDE_OFFSET = 0.28; // minimum lateral offset, metres
+const PANEL_DISTANCE = 1.45;
+const PANEL_DROP = 0.42; // how far below eye-line the panel center sits
+const PANEL_SIDE_OFFSET = 0.24; // minimum lateral offset, metres
 // Clearance budget for _adaptiveSideOffset: how far past the dataset's edge to
 // place the panel, and how far off-axis it may ever be pushed.
 const SIDE_MARGIN_RAD = (8 * Math.PI) / 180;
@@ -104,8 +104,8 @@ const REANCHOR_DISTANCE = 0.5;
 
 // Button/state colours now live in CARD_STYLES (CSS strings) since cards are
 // canvas-drawn rather than solid-tinted quads. See below.
-const COLOR_LABEL = "#f3f5ff"; // matches old COLOR_LABEL = [0.95, 0.96, 1.0]
-const COLOR_STATUS = "#b3c2d9"; // matches old COLOR_STATUS = [0.7, 0.76, 0.85]
+const COLOR_LABEL = "#ffffff";
+const COLOR_STATUS = "#dbe8f8";
 
 // --- Card styling ---------------------------------------------------------
 // Each button background is now a ROUNDED CARD drawn on its own canvas texture
@@ -114,22 +114,22 @@ const COLOR_STATUS = "#b3c2d9"; // matches old COLOR_STATUS = [0.7, 0.76, 0.85]
 // setColor — sidesteps VTK.js texture/colour-modulation ambiguity: the pixels
 // are exactly what Canvas 2D paints. The card is only redrawn when a button's
 // visual state changes (idle/hover/active), dirty-checked in _applyButtonVisuals.
-const CARD_TEX_W = 220; // card canvas resolution (px) — stretched to the cell
-const CARD_TEX_H = 150;
+const CARD_TEX_W = 320; // card canvas resolution (px) — stretched to the cell
+const CARD_TEX_H = 200;
 const CARD_CORNER_RADIUS = 30; // px on the CARD_TEX canvas
 const CARD_BORDER_WIDTH = 5; // px
 // CSS colour strings (canvas paints in CSS colours). Kept visually in step with
 // the COLOR_* RGB triples above but a touch richer, with an alpha so the dark
 // backing panel reads through the edges.
 const CARD_STYLES = {
-  idle: { fill: "rgba(30,35,48,0.94)", border: "rgba(96,110,146,0.55)" },
+  idle: { fill: "rgba(24,29,42,0.98)", border: "rgba(112,130,169,0.78)" },
   hover: { fill: "rgba(52,92,140,0.97)", border: "rgba(150,196,255,0.95)" },
   active: { fill: "rgba(26,110,104,0.97)", border: "rgba(120,232,216,0.98)" },
   // A button that currently cannot do anything: no scalar arrays to threshold
   // on, no volume to isosurface. Without this the card looks identical to a
   // working one and a tap just silently does nothing — the failure mode the
   // Views button's "no-other-views" result was added to avoid.
-  disabled: { fill: "rgba(24,27,36,0.72)", border: "rgba(70,78,100,0.38)" },
+  disabled: { fill: "rgba(24,27,36,0.86)", border: "rgba(90,101,128,0.58)" },
   // The participant who currently holds the data-manipulation token
   // (VRManipulationLock), on their roster cell in the people drawer. Amber
   // rather than the teal "active" so "this person controls the data" never
@@ -162,10 +162,10 @@ const CARD_HOVER_LIFT = 0.01; // metres (physical), before vrScale
 const BACKING_TEX_W = 512;
 const BACKING_TEX_H = 512;
 const BACKING_CORNER_RADIUS = 48; // px on the BACKING_TEX canvas
-const BACKING_STYLE = { fill: "rgba(14,17,26,0.74)", border: "rgba(84,98,132,0.5)" };
-const BACKING_HEADER = { fill: "rgba(44,86,132,0.55)" }; // top header band
+const BACKING_STYLE = { fill: "rgba(10,13,21,0.94)", border: "rgba(112,133,174,0.78)" };
+const BACKING_HEADER = { fill: "rgba(37,75,119,0.94)" }; // top header band
 const BACKING_PAD_M = 0.045; // padding around the grid, metres
-const BACKING_HEADER_M = 0.075; // header band height, metres
+const BACKING_HEADER_M = 0.1; // large grab target above the controls, metres
 const BACKING_BEHIND_M = 0.008; // push behind the button plane, metres
 
 // Text labels: rendered as canvas-texture billboards (see _createTextLabelActor),
@@ -173,18 +173,18 @@ const BACKING_BEHIND_M = 0.008; // push behind the button plane, metres
 // setFont(), which nothing in this codebase (or its dependencies; opentype.js
 // isn't even installed) ever supplies, so every vtkVectorText label silently
 // rendered as empty, invisible geometry. Canvas text has no such dependency.
-const BUTTON_LABEL_WORLD_HEIGHT = 0.03; // label height in meters, before vrScale
+const BUTTON_LABEL_WORLD_HEIGHT = 0.038; // label height in meters, before vrScale
 const LABEL_LIFT = 0.003; // float above the button quad so it never z-fights
 
 // Status line: sits just above the panel's top edge.
-const STATUS_WORLD_HEIGHT = 0.032;
+const STATUS_WORLD_HEIGHT = 0.038;
 const STATUS_MARGIN = 0.03;
 
 // Hint line ("how do I use this"): sits just below the panel's bottom edge —
 // a separate line from the status line above, so the two never get
 // concatenated into one unreadably long piece of text (see
 // VRSpatialMenuModel.getHintLine).
-const HINT_WORLD_HEIGHT = 0.026;
+const HINT_WORLD_HEIGHT = 0.031;
 const HINT_MARGIN = 0.03;
 
 // Status/hint canvas repaint gate: _layoutStatus/_layoutHint already
@@ -207,13 +207,9 @@ function now() {
   return typeof performance !== "undefined" ? performance.now() : Date.now();
 }
 
-// Reshow tab: the tiny always-on quad shown in place of the full panel while
-// it's manually hidden (VR_MENU_BUTTONS "Hide" button). Anchored at the same
-// point the full panel would occupy, just small — so a user instinctively
-// finds it by looking back where the menu used to be. Uses the exact same
-// ray/pinch hit-test machinery as the full panel (see _intersectReshowTab),
-// so it works identically on gamepad and gripless (Vision Pro) input.
-const RESHOW_TAB_SIZE_M = 0.09;
+// Compact wrist-mounted reopen pill shown while the full panel is hidden.
+const RESHOW_TAB_WIDTH_M = 0.2;
+const RESHOW_TAB_HEIGHT_M = 0.075;
 
 /**
  * VRSpatialUI — renders the in-session tool panel and routes ray taps back
@@ -228,8 +224,16 @@ export class VRSpatialUI {
     this._model = null;
     this._buttonActors = new Map(); // buttonId → { actor, labelActor }
     this._panelAnchor = null; // { center:[x,y,z], right:[..], up:[..], normal:[..] }
+    this._reshowAnchor = null;
     this._lastHeadPos = null;
     this._lastSelectPressed = false;
+    this._lastInputState = null;
+    this._lastGripPressed = { left: false, right: false };
+    // Once moved, the panel remains exactly where the user leaves it. It only
+    // follows the head again when explicitly reopened via X or the wrist pill.
+    this._manualPlacement = false;
+    // { kind, hand, rayDistance?, offsetRight?, offsetUp?, lastPosition? }
+    this._dragState = null;
     this._hoverButtonId = null;
     // Panel height in metres, derived per-frame from the model's current row
     // count (ROW_HEIGHT_M * rows) — see _currentRowCount(). Defaults to the 5
@@ -430,10 +434,8 @@ export class VRSpatialUI {
    * itself never changes size (BACKING_TEX_W x BACKING_TEX_H is fixed), only
    * what's drawn on it, so a plain re-upload is enough; no plane/actor rebuild.
    *
-   * "menu" draws the VR_MENU_GROUPS activity legend (TOOLS/MOVE/VIEW/SCENE/
-   * SESSION) that makes sense above the static grid. "keyboard" draws a plain
-   * "Annotation" title instead — the group legend would be actively
-   * misleading above a QWERTY layout that has none of those rows.
+   * "menu" draws a concise title and a visible drag affordance. "keyboard"
+   * draws a plain Annotation title.
    * @param {"menu"|"keyboard"} mode
    * @private
    */
@@ -471,24 +473,18 @@ export class VRSpatialUI {
       return;
     }
 
-    // Activity legend: one accent swatch + name per group, in row order.
-    // This lives in the header (drawn once at a fixed resolution) rather than
-    // as per-row labels, because the backing plane is STRETCHED to a panel
-    // height that changes whenever the contextual row appears — row-aligned
-    // text on this texture would drift out of register with the actual rows.
-    const cellW = (w - 16) / VR_MENU_GROUPS.length;
-    const swatch = Math.round(headerPx * 0.3);
-    ctx.font = `600 ${Math.round(headerPx * 0.32)}px Arial, sans-serif`;
+    ctx.font = `700 ${Math.round(headerPx * 0.36)}px Arial, sans-serif`;
     ctx.textAlign = "left";
     ctx.textBaseline = "middle";
-    VR_MENU_GROUPS.forEach((groupName, i) => {
-      const x = 8 + i * cellW;
-      ctx.fillStyle = GROUP_ACCENTS[groupName] || GROUP_ACCENT_FALLBACK;
-      this._roundRectPath(ctx, x, midY - swatch / 2, swatch, swatch, 3);
-      ctx.fill();
-      ctx.fillStyle = COLOR_LABEL;
-      ctx.fillText(groupName, x + swatch + 6, midY + 1);
-    });
+    ctx.fillStyle = COLOR_LABEL;
+    ctx.fillText("VR CONTROLS", 24, midY + 1);
+
+    // A simple grip mark plus instruction makes the previously invisible
+    // movable region discoverable in-headset.
+    ctx.font = `600 ${Math.round(headerPx * 0.27)}px Arial, sans-serif`;
+    ctx.textAlign = "right";
+    ctx.fillStyle = "#dbe8f8";
+    ctx.fillText("TRIGGER OR GRIP TO MOVE", w - 24, midY + 1);
 
     if (this._backingTexture) this._uploadCanvasTexture(canvas, ctx, this._backingTexture);
   }
@@ -816,8 +812,8 @@ export class VRSpatialUI {
     try {
       const canvas = document.createElement("canvas");
       const ctx = canvas.getContext("2d");
-      const pxHeight = 48;
-      const font = `600 ${Math.round(pxHeight * 0.6)}px Arial, sans-serif`;
+      const pxHeight = 80;
+      const font = `700 ${Math.round(pxHeight * 0.62)}px Arial, sans-serif`;
       ctx.font = font;
       const measured = ctx.measureText(str).width;
       const padding = pxHeight * 0.4;
@@ -883,8 +879,8 @@ export class VRSpatialUI {
     try {
       const canvas = document.createElement("canvas");
       const ctx = canvas.getContext("2d");
-      const pxHeight = 48;
-      const font = `600 ${Math.round(pxHeight * 0.6)}px Arial, sans-serif`;
+      const pxHeight = 80;
+      const font = `700 ${Math.round(pxHeight * 0.62)}px Arial, sans-serif`;
       ctx.font = font;
       const measured = ctx.measureText(str).width;
       const padding = pxHeight * 0.4;
@@ -981,8 +977,8 @@ export class VRSpatialUI {
   _redrawStatusLabel(text) {
     const canvas = this._statusCanvas;
     const ctx = this._statusCtx;
-    const pxHeight = 48;
-    const font = `500 ${Math.round(pxHeight * 0.56)}px Arial, sans-serif`;
+    const pxHeight = 80;
+    const font = `600 ${Math.round(pxHeight * 0.58)}px Arial, sans-serif`;
     ctx.font = font;
     const measured = ctx.measureText(text).width;
     const padding = pxHeight * 0.4;
@@ -1060,8 +1056,8 @@ export class VRSpatialUI {
   _redrawHintLabel(text) {
     const canvas = this._hintCanvas;
     const ctx = this._hintCtx;
-    const pxHeight = 40; // slightly smaller than status/button text — secondary info
-    const font = `400 ${Math.round(pxHeight * 0.5)}px Arial, sans-serif`;
+    const pxHeight = 64; // slightly smaller than status/button text — secondary info
+    const font = `500 ${Math.round(pxHeight * 0.54)}px Arial, sans-serif`;
     ctx.font = font;
     const measured = ctx.measureText(text).width;
     const padding = pxHeight * 0.4;
@@ -1100,7 +1096,7 @@ export class VRSpatialUI {
       this._renderer.addActor(card.actor);
 
       const label = this._createButtonContentActor(
-        "Menu",
+        "OPEN MENU",
         "menu",
         BUTTON_LABEL_WORLD_HEIGHT * 0.85,
         COLOR_LABEL
@@ -1171,6 +1167,7 @@ export class VRSpatialUI {
    */
   hitTest(inputState) {
     if (!this._model || !inputState) return null;
+    this._lastInputState = inputState;
 
     if (!this._model.isVisible()) {
       return this._hitTestReshowTab(inputState);
@@ -1189,19 +1186,86 @@ export class VRSpatialUI {
     this._panelHeight = this._computePanelHeight(this._currentRowCount());
 
     const ray = this._pickRay(inputState);
-    const hit = ray ? this._intersectPanel(ray.origin, ray.direction) : null;
+    const selectPressed = ray ? !!inputState.controllers?.[ray.hand]?.triggerPressed : false;
+    const gripPressed = ray ? !!inputState.controllers?.[ray.hand]?.squeezePressed : false;
+
+    if (this._dragState) {
+      const dragHand = this._dragState.hand;
+      const dragRay = this._rayForHand(inputState, dragHand);
+      const dragController = inputState.controllers?.[dragHand];
+      const stillPressed =
+        this._dragState.kind === "trigger"
+          ? !!dragController?.triggerPressed
+          : !!dragController?.squeezePressed;
+
+      if (stillPressed) {
+        this._updateDrag(dragRay, dragController);
+        this._lastSelectPressed = selectPressed;
+        this._rememberGripState(inputState);
+        return {
+          hovering: true,
+          buttonId: "__header__",
+          hand: dragHand,
+          consumingTrigger: this._dragState.kind === "trigger",
+          consumingGrip: this._dragState.kind === "grip",
+        };
+      }
+      this._dragState = null;
+      this._manualPlacement = true;
+    }
+
+    const headerHit = ray ? this._intersectHeader(ray.origin, ray.direction) : null;
+    const hit = !headerHit && ray ? this._intersectPanel(ray.origin, ray.direction) : null;
     this._hoverButtonId = hit ? this._model.hitTest(hit.u, hit.v)?.id ?? null : null;
 
     // Rising-edge select (trigger on controllers, pinch on transient-pointer).
-    const selectPressed = this._isSelectPressed(inputState);
-    if (selectPressed && !this._lastSelectPressed && this._hoverButtonId) {
+    if (headerHit && selectPressed && !this._lastSelectPressed && ray) {
+      this._beginTriggerDrag(ray, headerHit);
+    } else if (
+      headerHit &&
+      gripPressed &&
+      !this._lastGripPressed[ray.hand] &&
+      ray
+    ) {
+      this._beginGripDrag(ray.hand, inputState.controllers?.[ray.hand]);
+    } else if (selectPressed && !this._lastSelectPressed && this._hoverButtonId) {
       this._model.activate(this._hoverButtonId);
     }
     this._lastSelectPressed = selectPressed;
+    this._rememberGripState(inputState);
 
-    // The picking hand mirrors _pickRay's preference (right, else left).
-    const hand = inputState.controllers?.right ? "right" : "left";
-    return { hovering: !!this._hoverButtonId, buttonId: this._hoverButtonId ?? null, hand };
+    const hand = ray?.hand || (inputState.controllers?.right ? "right" : "left");
+    return {
+      hovering: !!this._hoverButtonId || !!headerHit,
+      buttonId: headerHit ? "__header__" : this._hoverButtonId ?? null,
+      hand,
+      consumingTrigger: !!headerHit,
+      consumingGrip: this._dragState?.kind === "grip",
+    };
+  }
+
+  /** Show the full panel at the user's current gaze direction. */
+  showAtHead(headPose) {
+    if (!this._model) return;
+    this._model.setVisible(true);
+    this._dragState = null;
+    this._manualPlacement = false;
+    this._panelAnchor = null;
+    this._lastHeadPos = null;
+    this._updateAnchor(headPose);
+    this._manualPlacement = !!this._panelAnchor;
+  }
+
+  /** Left-X entry point: close when open; reopen at current gaze when closed. */
+  toggleAtHead(headPose) {
+    if (!this._model) return;
+    if (this._model.isVisible()) {
+      this._model.setVisible(false);
+      this._dragState = null;
+      this._hoverButtonId = null;
+    } else {
+      this.showAtHead(headPose);
+    }
   }
 
   /**
@@ -1234,6 +1298,7 @@ export class VRSpatialUI {
 
     if (!this._model.isVisible()) {
       this._hideFullPanelActors();
+      this._updateReshowAnchor(this._lastInputState || {});
       this._layoutReshowTab();
       return;
     }
@@ -1322,6 +1387,7 @@ export class VRSpatialUI {
    */
   _updateAnchor(headPose) {
     if (!headPose?.position) return;
+    if (this._manualPlacement && this._panelAnchor) return;
     const p = headPose.position;
     const headPos = [p.x, p.y, p.z];
 
@@ -1740,6 +1806,65 @@ export class VRSpatialUI {
   // RAY / INTERSECTION MATH
   // ===========================================================================
 
+  _rememberGripState(inputState) {
+    this._lastGripPressed.left = !!inputState.controllers?.left?.squeezePressed;
+    this._lastGripPressed.right = !!inputState.controllers?.right?.squeezePressed;
+  }
+
+  _controllerPosition(controller) {
+    const p = controller?.pose?.position || controller?.targetRay?.position;
+    return p ? [p.x, p.y, p.z] : null;
+  }
+
+  _beginTriggerDrag(ray, headerHit) {
+    this._manualPlacement = true;
+    this._dragState = {
+      kind: "trigger",
+      hand: ray.hand,
+      rayDistance: headerHit.t,
+      offsetRight: headerHit.mu,
+      offsetUp: headerHit.mv,
+    };
+  }
+
+  _beginGripDrag(hand, controller) {
+    const lastPosition = this._controllerPosition(controller);
+    if (!lastPosition) return;
+    this._manualPlacement = true;
+    this._dragState = { kind: "grip", hand, lastPosition };
+  }
+
+  _updateDrag(ray, controller) {
+    const drag = this._dragState;
+    const a = this._panelAnchor;
+    if (!drag || !a) return;
+
+    if (drag.kind === "trigger" && ray) {
+      const point = [
+        ray.origin[0] + ray.direction[0] * drag.rayDistance,
+        ray.origin[1] + ray.direction[1] * drag.rayDistance,
+        ray.origin[2] + ray.direction[2] * drag.rayDistance,
+      ];
+      a.center = [
+        point[0] - a.right[0] * drag.offsetRight - a.up[0] * drag.offsetUp,
+        point[1] - a.right[1] * drag.offsetRight - a.up[1] * drag.offsetUp,
+        point[2] - a.right[2] * drag.offsetRight - a.up[2] * drag.offsetUp,
+      ];
+    } else if (drag.kind === "grip") {
+      const current = this._controllerPosition(controller);
+      if (!current || !drag.lastPosition) return;
+      a.center = [
+        a.center[0] + current[0] - drag.lastPosition[0],
+        a.center[1] + current[1] - drag.lastPosition[1],
+        a.center[2] + current[2] - drag.lastPosition[2],
+      ];
+      drag.lastPosition = current;
+    }
+
+    const halfHeight = (this._panelHeight || 0) / 2 + BACKING_PAD_M;
+    a.center[1] = Math.max(a.center[1], FLOOR_CLEARANCE_M + halfHeight);
+  }
+
   /**
    * Extract a pickable ray from input. Prefers the right controller's target
    * ray (also the Vision Pro transient-pointer path, which _gatherInputState
@@ -1748,7 +1873,12 @@ export class VRSpatialUI {
    * @private
    */
   _pickRay(inputState) {
-    const ctrl = inputState.controllers?.right || inputState.controllers?.left;
+    const hand = inputState.controllers?.right ? "right" : "left";
+    return this._rayForHand(inputState, hand);
+  }
+
+  _rayForHand(inputState, hand) {
+    const ctrl = inputState.controllers?.[hand];
     const tr = ctrl?.targetRay;
     if (!tr) return null;
     const origin = tr.position;
@@ -1762,7 +1892,7 @@ export class VRSpatialUI {
     } else {
       return null;
     }
-    return { origin: [origin.x, origin.y, origin.z], direction };
+    return { origin: [origin.x, origin.y, origin.z], direction, hand };
   }
 
   _isSelectPressed(inputState) {
@@ -1804,6 +1934,33 @@ export class VRSpatialUI {
     return { u, v, t };
   }
 
+  /** Ray hit against the dedicated header/grab band above the button grid. */
+  _intersectHeader(origin, direction) {
+    const a = this._panelAnchor;
+    if (!a) return null;
+    const { center, right, up, normal } = a;
+    const denom = this._dot(direction, normal);
+    if (Math.abs(denom) < 1e-6) return null;
+    const t = this._dot(
+      [center[0] - origin[0], center[1] - origin[1], center[2] - origin[2]],
+      normal
+    ) / denom;
+    if (t < 0) return null;
+    const point = [
+      origin[0] + direction[0] * t,
+      origin[1] + direction[1] * t,
+      origin[2] + direction[2] * t,
+    ];
+    const local = [point[0] - center[0], point[1] - center[1], point[2] - center[2]];
+    const mu = this._dot(local, right);
+    const mv = this._dot(local, up);
+    const halfWidth = this._panelWidth / 2 + BACKING_PAD_M;
+    const headerBottom = this._panelHeight / 2 + BACKING_PAD_M;
+    const headerTop = headerBottom + BACKING_HEADER_M;
+    if (Math.abs(mu) > halfWidth || mv < headerBottom || mv > headerTop) return null;
+    return { t, mu, mv, point };
+  }
+
   /**
    * Same ray/plane intersection as _intersectPanel, but against the tiny
    * fixed-size reshow-tab region centered on the panel anchor, instead of the
@@ -1812,7 +1969,7 @@ export class VRSpatialUI {
    * @private
    */
   _intersectReshowTab(origin, direction) {
-    const a = this._panelAnchor;
+    const a = this._reshowAnchor;
     if (!a) return false;
     const { center, right, up, normal } = a;
 
@@ -1831,8 +1988,38 @@ export class VRSpatialUI {
     const local = [hit[0] - center[0], hit[1] - center[1], hit[2] - center[2]];
     const mu = this._dot(local, right);
     const mv = this._dot(local, up);
-    const half = RESHOW_TAB_SIZE_M / 2;
-    return Math.abs(mu) <= half && Math.abs(mv) <= half;
+    return (
+      Math.abs(mu) <= RESHOW_TAB_WIDTH_M / 2 &&
+      Math.abs(mv) <= RESHOW_TAB_HEIGHT_M / 2
+    );
+  }
+
+  /** Place the reopen pill just above the left controller, facing the user. */
+  _updateReshowAnchor(inputState) {
+    const head = inputState.headPose?.position;
+    if (!head) return;
+    const left = this._controllerPosition(inputState.controllers?.left);
+    let center;
+    if (left) {
+      center = [left[0], left[1] + 0.11, left[2]];
+    } else {
+      const fwd = this._orientationForward(inputState.headPose?.orientation);
+      const len = Math.hypot(fwd[0], fwd[2]) || 1;
+      center = [head.x + (fwd[0] / len) * 0.6, head.y - 0.24, head.z + (fwd[2] / len) * 0.6];
+    }
+
+    let nx = head.x - center[0];
+    let nz = head.z - center[2];
+    const nlen = Math.hypot(nx, nz) || 1;
+    nx /= nlen;
+    nz /= nlen;
+    const normal = [nx, 0, nz];
+    this._reshowAnchor = {
+      center,
+      right: [nz, 0, -nx],
+      up: [0, 1, 0],
+      normal,
+    };
   }
 
   /**
@@ -1855,8 +2042,8 @@ export class VRSpatialUI {
    */
   _hitTestReshowTab(inputState) {
     if (!this._reshowTabActor) return null;
-    this._updateAnchor(inputState.headPose);
-    const a = this._panelAnchor;
+    this._updateReshowAnchor(inputState);
+    const a = this._reshowAnchor;
     if (!a) {
       this._reshowHovering = false;
       return null;
@@ -1868,12 +2055,19 @@ export class VRSpatialUI {
 
     const selectPressed = this._isSelectPressed(inputState);
     if (selectPressed && !this._lastSelectPressed && hovering) {
-      this._model.setVisible(true);
+      this.showAtHead(inputState.headPose);
     }
     this._lastSelectPressed = selectPressed;
+    this._rememberGripState(inputState);
 
-    const hand = inputState.controllers?.right ? "right" : "left";
-    return { hovering, buttonId: hovering ? "__reshow__" : null, hand };
+    const hand = ray?.hand || (inputState.controllers?.right ? "right" : "left");
+    return {
+      hovering,
+      buttonId: hovering ? "__reshow__" : null,
+      hand,
+      consumingTrigger: hovering,
+      consumingGrip: false,
+    };
   }
 
   /**
@@ -1887,7 +2081,7 @@ export class VRSpatialUI {
    */
   _layoutReshowTab() {
     if (!this._reshowTabActor) return;
-    const a = this._panelAnchor;
+    const a = this._reshowAnchor;
     if (!a) {
       this._reshowTabActor.setVisibility(false);
       if (this._reshowTabLabelActor) this._reshowTabLabelActor.setVisibility(false);
@@ -1900,7 +2094,7 @@ export class VRSpatialUI {
 
     this._reshowTabActor.setPosition(...this._toData(center));
     this._reshowTabActor.setOrientation(0, yawDeg, 0);
-    this._reshowTabActor.setScale(RESHOW_TAB_SIZE_M * inv, RESHOW_TAB_SIZE_M * inv, inv);
+    this._reshowTabActor.setScale(RESHOW_TAB_WIDTH_M * inv, RESHOW_TAB_HEIGHT_M * inv, inv);
     this._reshowTabActor.setVisibility(true);
 
     // Redraw the reshow card only on hover-state change (dirty-checked), same
@@ -1976,9 +2170,14 @@ export class VRSpatialUI {
     this._buttonActors.clear();
     this._parkedActors.clear();
     this._panelAnchor = null;
+    this._reshowAnchor = null;
     this._lastHeadPos = null;
     this._hoverButtonId = null;
     this._lastSelectPressed = false;
+    this._lastInputState = null;
+    this._lastGripPressed = { left: false, right: false };
+    this._manualPlacement = false;
+    this._dragState = null;
     this._panelHeight = this._computePanelHeight(5);
     this._lastActiveToolId = null;
     this._lastOpenDrawerId = null;

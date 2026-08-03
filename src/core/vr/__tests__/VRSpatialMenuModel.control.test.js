@@ -74,11 +74,11 @@ describe("VRSpatialMenuModel — row 4 restructure invariants", () => {
     expect(lastRow[lastRow.length - 1].id).toBe("exit");
   });
 
-  it("row 4 is people / voice / mute / hide / exit", () => {
+  it("row 4 keeps only essential session controls plus the advanced drawer", () => {
     expect(VR_MENU_BUTTONS.filter((b) => b.row === 4).map((b) => b.id)).toEqual([
       "people",
-      "voice-join",
-      "voice-mute",
+      "isolation",
+      "advanced",
       "hide-menu",
       "exit",
     ]);

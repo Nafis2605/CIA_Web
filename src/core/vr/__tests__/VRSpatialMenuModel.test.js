@@ -160,13 +160,13 @@ describe("VRSpatialMenuModel — layout & hit testing", () => {
   });
 
   it("hitTest still maps every cell with a drawer AND a contextual row open", () => {
-    // The densest layout the panel can reach: 5 static + 2 drawer + 1
-    // contextual = 8 rows. Every cell must still round-trip.
+    // The densest layout the compact panel can reach: 4 static + 2 drawer + 1
+    // contextual = 7 rows. Every cell must still round-trip.
     model.activate("filters");
     model.activate("clip"); // adds the contextual row
     const layout = model.getButtonLayout();
 
-    expect(new Set(layout.map((r) => r.row)).size).toBe(8);
+    expect(new Set(layout.map((r) => r.row)).size).toBe(7);
     for (const r of layout) {
       expect(model.hitTest(r.cu, r.cv)?.id).toBe(r.id);
     }
@@ -427,6 +427,7 @@ describe("VRSpatialMenuModel — action dispatch", () => {
   });
 
   it("glyphs button toggles via manager.toggleGlyphs", () => {
+    model.activate("advanced");
     const r1 = model.activate("glyphs");
     expect(manager.toggleGlyphs).toHaveBeenCalledTimes(1);
     expect(r1).toMatchObject({ handled: true, action: "glyphs-toggled", enabled: true });
@@ -437,6 +438,7 @@ describe("VRSpatialMenuModel — action dispatch", () => {
   });
 
   it("walk is a direct nav-mode-set button, same semantics as move", () => {
+    model.activate("advanced");
     manager.getNavigationMode.mockReturnValue("teleport");
     const r = model.activate("walk");
     expect(manager.setNavigationMode).toHaveBeenCalledWith("walk");
@@ -444,6 +446,7 @@ describe("VRSpatialMenuModel — action dispatch", () => {
   });
 
   it("snapshot-save routes through manager.createSnapshot", () => {
+    model.activate("advanced");
     const r = model.activate("snapshot-save");
     expect(manager.createSnapshot).toHaveBeenCalledTimes(1);
     expect(r).toMatchObject({ handled: true, action: "snapshot-saved" });
@@ -452,10 +455,12 @@ describe("VRSpatialMenuModel — action dispatch", () => {
   it("snapshot-save swallows a rejected createSnapshot promise", () => {
     const rejecting = makeManager({ createSnapshot: vi.fn(() => Promise.reject(new Error("x"))) });
     const m = new VRSpatialMenuModel(rejecting);
+    m.activate("advanced");
     expect(() => m.activate("snapshot-save")).not.toThrow();
   });
 
   it("snapshot-load cycles through getSessionSnapshots and calls manager.loadSnapshot", () => {
+    model.activate("advanced");
     manager.getSessionSnapshots.mockReturnValue([{ id: "s1" }, { id: "s2" }]);
     const r1 = model.activate("snapshot-load");
     expect(manager.loadSnapshot).toHaveBeenCalledWith("s1");
@@ -471,6 +476,7 @@ describe("VRSpatialMenuModel — action dispatch", () => {
   });
 
   it("snapshot-load is a safe no-op with nothing saved", () => {
+    model.activate("advanced");
     manager.getSessionSnapshots.mockReturnValue([]);
     const r = model.activate("snapshot-load");
     expect(r).toMatchObject({ handled: true, action: "snapshot-load", ok: false, reason: "no-snapshots" });
@@ -478,12 +484,14 @@ describe("VRSpatialMenuModel — action dispatch", () => {
   });
 
   it("voice-mute toggles via manager.toggleVoiceMute", () => {
+    model.activate("advanced");
     const r = model.activate("voice-mute");
     expect(manager.toggleVoiceMute).toHaveBeenCalledTimes(1);
     expect(r).toMatchObject({ handled: true, action: "voice-mute-toggled", muted: true });
   });
 
   it("voice-join toggles via manager.toggleVoiceConnection", () => {
+    model.activate("advanced");
     const r = model.activate("voice-join");
     expect(manager.toggleVoiceConnection).toHaveBeenCalledTimes(1);
     expect(r).toMatchObject({ handled: true, action: "voice-connection-toggled", connected: true });
@@ -608,7 +616,9 @@ describe("VRSpatialMenuModel — state reflection for render layer", () => {
     expect(states["rep-wireframe"]).toBe(true);
     expect(states["rep-points"]).toBe(false);
     expect(states["rep-surface"]).toBe(false);
-    expect(states.glyphs).toBe(true);
+    model.activate("advanced");
+    const advancedStates = Object.fromEntries(model.getButtonStates().map((s) => [s.id, s.active]));
+    expect(advancedStates.glyphs).toBe(true);
   });
 
   it("getButtonStates leaves representation/glyphs inactive at defaults", () => {
@@ -617,7 +627,9 @@ describe("VRSpatialMenuModel — state reflection for render layer", () => {
     const states = Object.fromEntries(model.getButtonStates().map((s) => [s.id, s.active]));
     expect(states["rep-surface"]).toBe(true); // makeManager reports "surface"
     expect(states["rep-wireframe"]).toBe(false);
-    expect(states.glyphs).toBe(false);
+    model.activate("advanced");
+    const advancedStates = Object.fromEntries(model.getButtonStates().map((s) => [s.id, s.active]));
+    expect(advancedStates.glyphs).toBe(false);
   });
 });
 

@@ -169,8 +169,15 @@ class ApiClient {
       headers["Content-Type"] = "application/json";
     }
 
-    // Token authentication disabled - all API calls work without tokens
-    // This allows the collaborative app to function without Keycloak/JWT validation
+    // Attach the current Keycloak token for authenticated requests. Development
+    // bypass continues to use its identity headers above, and public endpoints
+    // can opt out explicitly with skipAuth.
+    if (!skipAuth) {
+      const token = await authService.getAccessToken();
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
+      }
+    }
 
     // Build request URL
     const url = endpoint.startsWith("http")

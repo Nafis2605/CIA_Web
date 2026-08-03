@@ -112,6 +112,7 @@ if (matrixBridge.config.enabled) {
       // (used for resolving inbound Matrix senders) — reuse it here instead of
       // creating a second resolver/cache for the same Matrix client.
       matrixUserResolver = matrixBridge.userResolver;
+      app.locals.matrixUserResolver = matrixUserResolver;
 
       log.info('Matrix federation is active');
     } catch (error) {

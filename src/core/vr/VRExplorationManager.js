@@ -163,6 +163,7 @@ class VRExplorationManager extends BaseManager {
     // Isolation mode (room-scale inspection)
     this._isolationBackup = null;
     this._lastIsolationButtonState = false;
+    this._lastMenuToggleButtonState = false;
 
     // In-VR "follow a collaborator" — soft positional follow only, never
     // touches head orientation (see followParticipant/_updateParticipantFollow).
@@ -874,6 +875,7 @@ class VRExplorationManager extends BaseManager {
       this._activeContext = null;
       this._isolationBackup = null;
       this._lastIsolationButtonState = false;
+      this._lastMenuToggleButtonState = false;
       this._followTargetUserId = null;
       this._inputProfileDetected = false;
       // The cached hit belongs to the picker on the vrContext just disposed.
@@ -2842,6 +2844,15 @@ class VRExplorationManager extends BaseManager {
       // Get input state
       const inputState = this._gatherInputState(frame);
 
+      // Quest: left X is the fast menu toggle. Reopening deliberately creates
+      // a fresh anchor at the user's current gaze, so a menu left elsewhere
+      // never traps the user into searching for it.
+      const menuTogglePressed = !!inputState.controllers?.left?.buttons?.x;
+      if (menuTogglePressed && !this._lastMenuToggleButtonState) {
+        vrSpatialUI.toggleAtHead(inputState.headPose);
+      }
+      this._lastMenuToggleButtonState = menuTogglePressed;
+
       // Cache the floor point under the head. Menu actions (scale presets) run
       // outside the frame loop and have no inputState of their own, but they
       // need a pivot to resize about — see setVRScale.
@@ -2887,6 +2898,8 @@ class VRExplorationManager extends BaseManager {
       }
       const menuHovering = !!menuResult?.hovering;
       const menuHand = menuResult?.hand || 'right';
+      const menuConsumesTrigger = menuResult?.consumingTrigger ?? menuHovering;
+      const menuConsumesGrip = !!menuResult?.consumingGrip;
       // A pinch used to place/aim an active tool must not ALSO aim teleport.
       const toolActive = !!this._toolManager?.getActiveTool?.();
 
@@ -2896,10 +2909,17 @@ class VRExplorationManager extends BaseManager {
       // convention, e.g. Meta Quest 3 — the hand is never "interrupted" by UI).
       const navStripHands = new Set();
       const toolStripHands = new Set();
-      if (menuHovering) {
-        // Only strip the trigger, not grip (grip is always-on world-grab)
+      const navStripGripHands = new Set();
+      const toolStripGripHands = new Set();
+      if (menuConsumesTrigger) {
         navStripHands.add(menuHand);
         toolStripHands.add(menuHand);
+      }
+      if (menuConsumesGrip) {
+        // Grip normally remains world-grab. While it is actively moving the
+        // menu header, however, that one hand belongs to the menu.
+        navStripGripHands.add(menuHand);
+        toolStripGripHands.add(menuHand);
       }
       if (toolActive) {
         // Strip both hands' triggers from nav/tools so a tool placement never
@@ -2907,8 +2927,8 @@ class VRExplorationManager extends BaseManager {
         navStripHands.add('left');
         navStripHands.add('right');
       }
-      const navInput = this._gateInputState(inputState, navStripHands);
-      const toolInput = this._gateInputState(inputState, toolStripHands);
+      const navInput = this._gateInputState(inputState, navStripHands, navStripGripHands);
+      const toolInput = this._gateInputState(inputState, toolStripHands, toolStripGripHands);
 
       // NOTE: Vision Pro input detection (transient-pointer) used to trigger a
       // mode switch here, but the new layered model handles it transparently:
@@ -3109,27 +3129,32 @@ class VRExplorationManager extends BaseManager {
   }
 
   /**
-   * Return a SHALLOW clone of the frame's input state with the trigger stripped
-   * (triggerPressed:false, triggerValue:0) from the named hands. Used for input
+   * Return a SHALLOW clone of the frame's input state with trigger and/or grip
+   * stripped from the named hands. Used for input
    * arbitration (R2): the object _gatherInputState returned is never mutated —
    * the menu and pose/avatar consumers keep reading the raw triggers/poses —
-   * while nav and tools receive a gated copy so a pinch aimed at a menu button
-   * (or a tool) doesn't also drive locomotion. Only triggers are touched;
-   * thumbstick, poses and buttons pass through unchanged.
+   * while nav and tools receive a gated copy so a menu interaction doesn't
+   * also drive locomotion. Thumbsticks, poses and face buttons pass through.
    *
    * @param {Object} inputState - raw state from _gatherInputState
-   * @param {Set<string>|Array<string>} hands - which hands to strip ('left'/'right')
+   * @param {Set<string>|Array<string>} triggerHands - hands whose trigger is stripped
+   * @param {Set<string>|Array<string>} gripHands - hands whose grip is stripped
    * @returns {Object} the same object if nothing to strip, else a gated clone
    * @private
    */
-  _gateInputState(inputState, hands) {
-    const list = hands instanceof Set ? [...hands] : hands || [];
-    if (!list.length) return inputState;
+  _gateInputState(inputState, triggerHands, gripHands = []) {
+    const triggerList = triggerHands instanceof Set ? [...triggerHands] : triggerHands || [];
+    const gripList = gripHands instanceof Set ? [...gripHands] : gripHands || [];
+    if (!triggerList.length && !gripList.length) return inputState;
     const clone = { ...inputState, controllers: { ...inputState.controllers } };
-    for (const hand of list) {
+    for (const hand of new Set([...triggerList, ...gripList])) {
       const c = clone.controllers?.[hand];
       if (c) {
-        clone.controllers[hand] = { ...c, triggerPressed: false, triggerValue: 0 };
+        clone.controllers[hand] = {
+          ...c,
+          ...(triggerList.includes(hand) ? { triggerPressed: false, triggerValue: 0 } : {}),
+          ...(gripList.includes(hand) ? { squeezePressed: false, squeezeValue: 0 } : {}),
+        };
       }
     }
     return clone;
@@ -3382,8 +3407,10 @@ class VRExplorationManager extends BaseManager {
               y: source.gamepad?.axes?.[3] || 0,
             },
             buttons: {
-              a: source.gamepad?.buttons?.[4]?.pressed || false,
-              b: source.gamepad?.buttons?.[5]?.pressed || false,
+              a: handedness === 'right' && !!source.gamepad?.buttons?.[4]?.pressed,
+              b: handedness === 'right' && !!source.gamepad?.buttons?.[5]?.pressed,
+              x: handedness === 'left' && !!source.gamepad?.buttons?.[4]?.pressed,
+              y: handedness === 'left' && !!source.gamepad?.buttons?.[5]?.pressed,
             },
           };
         } catch (e) {
@@ -3431,7 +3458,7 @@ class VRExplorationManager extends BaseManager {
             squeezePressed: false,
             squeezeValue: 0,
             thumbstick: { x: 0, y: 0 },
-            buttons: { a: false, b: false },
+            buttons: { a: false, b: false, x: false, y: false },
           };
         } catch (e) {
           // Pose not available

@@ -65,6 +65,7 @@ vi.mock("@Core/instances/types/vtk/vr/VTKVRSpatialUI.js", () => ({
   vrSpatialUI: {
     hitTest: (...a) => mockSpatialHitTest(...a),
     layout: (...a) => mockSpatialLayout(...a),
+    toggleAtHead: vi.fn(),
     dispose: vi.fn(),
   },
 }));
@@ -190,6 +191,24 @@ describe("VRExplorationManager._onFrame — input arbitration (R2)", () => {
     // And the gated clone the nav saw is a DIFFERENT object with it stripped.
     expect(navUpdate.mock.calls[0][0]).not.toBe(raw);
     expect(navUpdate.mock.calls[0][0].controllers.right.triggerPressed).toBe(false);
+  });
+
+  it("strips grip only while the menu is grip-dragging", () => {
+    const raw = {
+      controllers: {
+        right: {
+          triggerPressed: true,
+          triggerValue: 1,
+          squeezePressed: true,
+          squeezeValue: 1,
+        },
+      },
+    };
+    const gated = vrExplorationManager._gateInputState(raw, new Set(), new Set(["right"]));
+    expect(gated.controllers.right.squeezePressed).toBe(false);
+    expect(gated.controllers.right.squeezeValue).toBe(0);
+    expect(gated.controllers.right.triggerPressed).toBe(true);
+    expect(raw.controllers.right.squeezePressed).toBe(true);
   });
 
   // A4: hitTest() must run before nav (asserted throughout this file via

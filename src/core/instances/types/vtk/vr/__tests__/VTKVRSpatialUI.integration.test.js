@@ -140,7 +140,10 @@ function makeInputState({ headY = 1.6, triggerPressed = false } = {}) {
  * PANEL_DROP/PANEL_SIDE_OFFSET), so hitting a specific button/tab requires
  * aiming at its actual computed position, not just "forward".
  */
-function makeInputStateAimedAt(target, { headY = 1.6, triggerPressed = false } = {}) {
+function makeInputStateAimedAt(
+  target,
+  { headY = 1.6, triggerPressed = false, squeezePressed = false, controllerPosition = null } = {}
+) {
   const origin = [0, headY, 0];
   const d = [target[0] - origin[0], target[1] - origin[1], target[2] - origin[2]];
   const len = Math.hypot(...d) || 1;
@@ -151,7 +154,16 @@ function makeInputStateAimedAt(target, { headY = 1.6, triggerPressed = false } =
   return {
     headPose: { position: { x: origin[0], y: origin[1], z: origin[2] }, orientation: { x: 0, y: 0, z: 0, w: 1 } },
     controllers: {
-      right: { targetRay: { position: { x: origin[0], y: origin[1], z: origin[2] }, matrix }, triggerPressed },
+      right: {
+        pose: {
+          position: controllerPosition
+            ? { x: controllerPosition[0], y: controllerPosition[1], z: controllerPosition[2] }
+            : { x: origin[0], y: origin[1], z: origin[2] },
+        },
+        targetRay: { position: { x: origin[0], y: origin[1], z: origin[2] }, matrix },
+        triggerPressed,
+        squeezePressed,
+      },
       left: null,
     },
   };
@@ -319,24 +331,95 @@ describe("VRSpatialUI integration — initialize/update/dispose against a fake r
     const ui = new VRSpatialUI();
     ui.initialize(renderer, makeManager());
     ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
-    // The panel sits off dead-ahead (dropped + side-offset), so capture where
-    // it actually landed to aim the reshow-tab ray at it below.
-    const anchorCenter = ui._panelAnchor.center;
-
     ui.getModel().setVisible(false);
-    ui.update(makeInputStateAimedAt(anchorCenter), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+    const hiddenInput = makeInputState();
+    hiddenInput.controllers.left = { pose: { position: { x: -0.3, y: 1.1, z: -0.2 } } };
+    ui.update(hiddenInput, { vrScale: 1.0, vrOrigin: [0, 0, 0] });
 
     for (const { actor } of ui._buttonActors.values()) {
       expect(actor.getVisibility()).toBe(false);
     }
     expect(ui._reshowTabActor.getVisibility()).toBe(true);
+    const wristPillCenter = ui._reshowAnchor.center;
+    expect(wristPillCenter[0]).toBeCloseTo(-0.3, 5);
+    expect(wristPillCenter[1]).toBeCloseTo(1.21, 5);
+    expect(wristPillCenter[2]).toBeCloseTo(-0.2, 5);
 
-    // Rising-edge select while hovering the reshow tab brings the panel back.
-    ui.update(makeInputStateAimedAt(anchorCenter, { triggerPressed: true }), {
+    // Rising-edge select while hovering the wrist pill brings the panel back
+    // at the current gaze, independent of where the old panel was left.
+    const reopenInput = makeInputStateAimedAt(wristPillCenter, { triggerPressed: true });
+    reopenInput.controllers.left = { pose: { position: { x: -0.3, y: 1.1, z: -0.2 } } };
+    ui.update(reopenInput, {
       vrScale: 1.0,
       vrOrigin: [0, 0, 0],
     });
     expect(ui.getModel().isVisible()).toBe(true);
+  });
+
+  it("trigger-drags the header and leaves the menu at its manual position", () => {
+    const ui = new VRSpatialUI();
+    ui.initialize(makeFakeRenderer(), makeManager());
+    ui.update(makeInputState(), { vrScale: 1, vrOrigin: [0, 0, 0] });
+
+    const a = ui._panelAnchor;
+    const headerCenter = [
+      a.center[0] + a.up[0] * (ui._panelHeight / 2 + 0.095),
+      a.center[1] + a.up[1] * (ui._panelHeight / 2 + 0.095),
+      a.center[2] + a.up[2] * (ui._panelHeight / 2 + 0.095),
+    ];
+    const start = [...a.center];
+    const begin = ui.hitTest(makeInputStateAimedAt(headerCenter, { triggerPressed: true }));
+    expect(begin).toMatchObject({ buttonId: "__header__", consumingTrigger: true });
+
+    const movedTarget = [headerCenter[0] - 0.2, headerCenter[1] + 0.08, headerCenter[2]];
+    ui.hitTest(makeInputStateAimedAt(movedTarget, { triggerPressed: true }));
+    expect(ui._panelAnchor.center).not.toEqual(start);
+
+    ui.hitTest(makeInputStateAimedAt(movedTarget));
+    const dropped = [...ui._panelAnchor.center];
+    ui.hitTest(makeInputState({ headY: 2.4 }));
+    expect(ui._panelAnchor.center).toEqual(dropped);
+  });
+
+  it("grip-grabs the header without offering that grip to world navigation", () => {
+    const ui = new VRSpatialUI();
+    ui.initialize(makeFakeRenderer(), makeManager());
+    ui.update(makeInputState(), { vrScale: 1, vrOrigin: [0, 0, 0] });
+
+    const a = ui._panelAnchor;
+    const headerCenter = [a.center[0], a.center[1] + ui._panelHeight / 2 + 0.095, a.center[2]];
+    const startX = a.center[0];
+    const begin = ui.hitTest(
+      makeInputStateAimedAt(headerCenter, {
+        squeezePressed: true,
+        controllerPosition: [0, 1.2, 0],
+      })
+    );
+    expect(begin).toMatchObject({ buttonId: "__header__", consumingGrip: true });
+
+    ui.hitTest(
+      makeInputStateAimedAt(headerCenter, {
+        squeezePressed: true,
+        controllerPosition: [0.25, 1.2, 0],
+      })
+    );
+    expect(ui._panelAnchor.center[0]).toBeCloseTo(startX + 0.25, 5);
+  });
+
+  it("toggleAtHead closes the panel and reopens it at the current gaze", () => {
+    const ui = new VRSpatialUI();
+    ui.initialize(makeFakeRenderer(), makeManager());
+    ui.update(makeInputState(), { vrScale: 1, vrOrigin: [0, 0, 0] });
+    const original = [...ui._panelAnchor.center];
+
+    ui.toggleAtHead(makeInputState().headPose);
+    expect(ui.getModel().isVisible()).toBe(false);
+
+    const newHead = makeInputState({ headY: 2.1 }).headPose;
+    ui.toggleAtHead(newHead);
+    expect(ui.getModel().isVisible()).toBe(true);
+    expect(ui._panelAnchor.center).not.toEqual(original);
+    expect(ui._manualPlacement).toBe(true);
   });
 
   it("dispose() removes every actor it added and leaves no residual state", () => {
