@@ -8,6 +8,7 @@ import vtkMapper from '@kitware/vtk.js/Rendering/Core/Mapper';
 import vtkSphereSource from '@kitware/vtk.js/Filters/Sources/SphereSource';
 import { VRTextBillboard } from '@Core/vr/ui/VRTextBillboard.js';
 import { MAX_ANNOTATION_TEXT } from '@Core/vr/VRKeyboardModel.js';
+import { getUserName } from '@Collaboration/presence/userManagement.js';
 
 // Apparent radius (metres) of a placed-annotation marker sphere, kept constant
 // as the world scales via VRToolInterface._apparentScale.
@@ -35,6 +36,20 @@ export const ANNOTATION_COLORS = Object.freeze([
   { name: 'Blue', rgb: [0.35, 0.6, 1] },
   { name: 'Violet', rgb: [0.72, 0.45, 0.95] },
 ]);
+
+/**
+ * Compose a marker's billboard text with its author, so a pin says who left
+ * it as well as what it says. VRTextBillboard is single-line (Canvas2D
+ * fillText, no wrapping — see its header comment), hence one line with an
+ * em-dash rather than a second line.
+ * @param {string} text
+ * @param {string|null|undefined} authorName
+ * @returns {string}
+ */
+function _formatLabelText(text, authorName) {
+  if (!text) return authorName ? `— ${authorName}` : '';
+  return authorName ? `${text} — ${authorName}` : text;
+}
 
 // Historically the only text-entry mechanism available in VR (a fixed set of
 // preset labels cycled by the spatial menu's "Label" button —
@@ -195,10 +210,11 @@ export class VRAnnotationTool extends VRToolInterface {
 
       // The annotation's text is what makes it say something rather than
       // just mark a spot.
+      const labelText = _formatLabelText(annotation.text, annotation.authorName);
       let label = null;
-      if (annotation.text) {
+      if (labelText) {
         label = new VRTextBillboard({
-          text: annotation.text,
+          text: labelText,
           worldHeight: LABEL_APPARENT_HEIGHT_M,
           color: LABEL_TEXT_COLOR,
           background: LABEL_BACKGROUND,
@@ -234,7 +250,8 @@ export class VRAnnotationTool extends VRToolInterface {
         renderer.addActor(actor);
 
         const label = new VRTextBillboard({
-          text: draft.text || draft.fallbackText,
+          // A draft is always the LOCAL user's own in-progress note.
+          text: _formatLabelText(draft.text || draft.fallbackText, getUserName()),
           worldHeight: LABEL_APPARENT_HEIGHT_M,
           color: LABEL_TEXT_COLOR,
           background: LABEL_BACKGROUND,
@@ -255,7 +272,7 @@ export class VRAnnotationTool extends VRToolInterface {
     const lift = (draftRadius * 2) / this._getVrScale();
     const p = draft.position || {};
     this._draftMarker.label
-      ?.setText(draft.text || draft.fallbackText)
+      ?.setText(_formatLabelText(draft.text || draft.fallbackText, getUserName()))
       .setPosition(p.x || 0, (p.y || 0) + lift, p.z || 0)
       .setScale(labelScale)
       .faceCamera(renderer)
@@ -326,8 +343,6 @@ export class VRAnnotationTool extends VRToolInterface {
     const { controllers } = inputState;
     const rightCtrl = controllers.right;
 
-    if (!rightCtrl) return null;
-
     // Rising-edge detection: update _lastTriggerState unconditionally,
     // BEFORE acting on it, so a held trigger places exactly once per pull
     // rather than once per frame (~90Hz) — the previous version updated
@@ -335,11 +350,19 @@ export class VRAnnotationTool extends VRToolInterface {
     // placement's early return skipped the update and re-armed itself
     // every single frame the trigger stayed down. Same discipline now
     // applies to the A-button edge below, for the same reason.
-    const triggerPressed = !!rightCtrl.triggerPressed;
+    //
+    // Read via optional chaining and update the latch even when rightCtrl
+    // is absent — a gripless/transient-pointer source (Vision Pro) is only
+    // present in inputState while a pinch is physically held, so it
+    // vanishes on every release. Bailing out on `!rightCtrl` BEFORE this
+    // update (the previous bug) left the latch permanently stuck at `true`
+    // from the last pinch that did reach it, so no later pinch could ever
+    // read as a fresh rising edge again.
+    const triggerPressed = !!rightCtrl?.triggerPressed;
     const triggerRisingEdge = triggerPressed && !this._lastTriggerState;
     this._lastTriggerState = triggerPressed;
 
-    const aPressed = !!rightCtrl.buttons?.a;
+    const aPressed = !!rightCtrl?.buttons?.a;
     const aRisingEdge = aPressed && !this._lastAButtonState;
     this._lastAButtonState = aPressed;
 
@@ -358,6 +381,13 @@ export class VRAnnotationTool extends VRToolInterface {
     // _suppressUntilRelease field comment in the constructor). Skip exactly
     // one more trigger-held window so that consumed pinch can't be misread as
     // a fresh placement the instant the pointer leaves the panel.
+    //
+    // Gated on `triggerPressed`, not on `rightCtrl` directly, so a
+    // gripless/transient-pointer release — which makes rightCtrl disappear
+    // entirely rather than merely flip triggerPressed to false — still
+    // clears this flag. Missing that on the disappearance frame would leave
+    // it stuck `true` forever, identically to the _lastTriggerState bug this
+    // same fix addresses.
     if (this._suppressUntilRelease) {
       if (triggerPressed) return null;
       this._suppressUntilRelease = false;
@@ -368,7 +398,9 @@ export class VRAnnotationTool extends VRToolInterface {
       // Checked on PLACEMENT, not on tool selection: a non-holder can still
       // pick Annotate, aim, and find out on the first pull that they need the
       // token — which is far clearer than a greyed-out button. Fails open when
-      // no predicate was injected.
+      // no predicate was injected. rightCtrl is guaranteed non-null here:
+      // triggerRisingEdge can only be true when triggerPressed was, which
+      // requires rightCtrl to have been truthy this frame.
       if (this._context?.canManipulate?.('Annotation') === false) return null;
       const hit = this._performRaycast(rightCtrl, frame);
       if (hit) return this._openDraft(hit);
@@ -568,6 +600,10 @@ export class VRAnnotationTool extends VRToolInterface {
       normal: draft.normal,
       timestamp: draft.timestamp,
       text,
+      // Who placed this pin. Threaded through _persistVRAnnotation's metadata
+      // and back out via parsePointAnnotation so OTHER participants — not
+      // just the author — see whose note this is on the persisted marker.
+      authorName: getUserName(),
       color: draft.color,
       size: draft.size,
     };

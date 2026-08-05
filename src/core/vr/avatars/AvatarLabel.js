@@ -41,6 +41,10 @@ export class AvatarLabel {
     // SimpleAvatarFallback.setActivity.
     this._activity = null;
     this._renderer = null;
+    // Local viewer's 1/vrScale. The plane is authored in physical metres but
+    // lives in scene units, so without this the name tag grows and shrinks
+    // with the viewer's zoom. See setScale.
+    this._scale = 1;
   }
 
   /**
@@ -91,13 +95,31 @@ export class AvatarLabel {
   }
 
   /**
+   * Hold a constant apparent size regardless of the local viewer's zoom.
+   *
+   * LABEL_WORLD_WIDTH/HEIGHT/Y_OFFSET are authored in physical metres, but the
+   * actor lives in scene units, which are physical metres divided by the local
+   * viewer's vrScale. Without this the peer's name tag balloons when you zoom
+   * into a detail and shrinks to nothing at room scale.
+   *
+   * @param {number} scale - the local viewer's 1/vrScale
+   */
+  setScale(scale) {
+    const s = scale || 1;
+    this._scale = s;
+    this._actor?.setScale(s, s, s);
+  }
+
+  /**
    * Position the label above the head.
    * @param {number} x
    * @param {number} y - head Y in scene space
    * @param {number} z
    */
   setPosition(x, y, z) {
-    this._actor?.setPosition(x, y + LABEL_Y_OFFSET, z);
+    // The vertical offset is a physical-metre quantity too, so it has to track
+    // the same scale as the plane or the tag drifts off the head when zoomed.
+    this._actor?.setPosition(x, y + LABEL_Y_OFFSET * this._scale, z);
   }
 
   /** Face the label toward a world-space point (local user's head). */

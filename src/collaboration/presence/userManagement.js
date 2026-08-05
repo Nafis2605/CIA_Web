@@ -43,6 +43,29 @@ function useDeviceFallback() {
   return config.identity?.deviceFallback !== false;
 }
 
+// ONE-TIME MIGRATION: Bootstrap's dev-bypass path used to call setUserName()
+// with authService's mock dev user, which persisted the shared name
+// "CIA Admin" into cia_username on every device's first launch. That value
+// then poisoned identity resolution permanently — getUserName() and
+// deviceIdentity.getDeviceName() both prefer it over the per-device name, and
+// hasUserName() true short-circuits needsDisplayNamePrompt(), so already
+// affected browsers could never recover on their own. Clear it here, once,
+// so previously provisioned headsets fall back to the per-device name (or get
+// re-prompted) without a manual localStorage/site-data wipe. Scoped tightly —
+// only the exact known shared mock name, only where the device-fallback path
+// would otherwise apply — so a name a user actually typed is never touched.
+// Safe to run eagerly at module init: this module already imports `config`
+// and `@Config/mockUsers.js` unconditionally above, and neither has an import
+// path back to this module, so both are fully resolved before this line runs.
+if (
+  userName === getDefaultMockUser().name &&
+  isDevBypassMode() &&
+  useDeviceFallback()
+) {
+  localStorage.removeItem("cia_username");
+  userName = null;
+}
+
 export function getUserId() {
   const isDevMode = isDevBypassMode();
   if (isDevMode) {

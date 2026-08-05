@@ -24,6 +24,10 @@ vi.mock("@kitware/vtk.js/Rendering/Core/CellPicker", () => {
     setTolerance: vi.fn(),
     setPickFromList: vi.fn(),
     setPickList: vi.fn(),
+    // Real vtkCellPicker overrides publicAPI.initialize to reset cellId
+    // (CellPicker.js:113-116). raycastVR must call it explicitly because
+    // pick3DPoint does not — see the note at its call site.
+    initialize: vi.fn(),
     pick: vi.fn(),
     pick3DPoint: vi.fn(),
     getCellId: vi.fn(() => 42),
@@ -44,10 +48,25 @@ function makeActor({ pickable = true, visible = true, mapper = {} } = {}) {
   };
 }
 
-function makeVrContext({ actors = null, dataBounds = [0, 1, 0, 1, 0, 1] } = {}) {
+// vrScale/vrOrigin default to NON-IDENTITY on purpose. VR here remaps the
+// CAMERA and leaves actors in data space, so a pick ray given in XR metres
+// must be mapped through `dataPos = xrPos / vrScale + vrOrigin` first. With
+// the identity transform these tests used to imply (scale 1, origin at zero),
+// that mapping is a no-op and a missing conversion is mathematically
+// invisible — which is exactly how raycastVR shipped picking in the wrong
+// space. A real session never has identity here: _applyInitialPlacement
+// auto-fits the dataset on entry.
+function makeVrContext({
+  actors = null,
+  dataBounds = [0, 1, 0, 1, 0, 1],
+  vrScale = 2,
+  vrOrigin = [10, 20, 30],
+} = {}) {
   const dataActor = makeActor();
   return {
     dataBounds,
+    vrScale,
+    vrOrigin,
     sceneObjects: {
       renderer: { getActors: () => actors ?? [dataActor] },
       actor: dataActor,
@@ -56,6 +75,19 @@ function makeVrContext({ actors = null, dataBounds = [0, 1, 0, 1, 0, 1] } = {}) 
 }
 
 const RAY = { origin: { x: 0, y: 0, z: 0 }, direction: { x: 0, y: 0, z: -1 } };
+
+// Data-space image of RAY's origin under makeVrContext's default transform.
+// FOUR components: vtkPicker.pick3DPoint does not append a homogeneous w of
+// its own (Picker.js:268-284, unlike publicAPI.pick at :263-264), and
+// pick3DInternal divides by p[3] (:105-106) — a 3-element array yields NaN and
+// silently kills every VR pick.
+const RAY_ORIGIN_IN_DATA_SPACE = [10, 20, 30, 1.0];
+
+/** Length of the ray handed to the picker, i.e. |p2 - p1|. */
+function pickRayLength(picker) {
+  const [p1, p2] = picker.pick3DPoint.mock.calls[0];
+  return Math.hypot(p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]);
+}
 
 describe("VTKInstanceHandler.raycastVR", () => {
   let handler;
@@ -76,7 +108,7 @@ describe("VTKInstanceHandler.raycastVR", () => {
     // (p1World, p2World, renderer) — the renderer must be the 3rd arg, not the
     // 2nd (the old signature passed the far point where the renderer belonged).
     const [p1, p2, renderer] = picker.pick3DPoint.mock.calls[0];
-    expect(p1).toEqual([0, 0, 0]);
+    expect(p1).toEqual(RAY_ORIGIN_IN_DATA_SPACE);
     expect(Array.isArray(p2)).toBe(true);
     expect(renderer).toBe(ctx.sceneObjects.renderer);
   });
@@ -98,7 +130,10 @@ describe("VTKInstanceHandler.raycastVR", () => {
       normal: { x: 0, y: 1, z: 0 },
       cellId: 42,
     });
-    expect(result.distance).toBeCloseTo(Math.hypot(1, 2, 3));
+    // Distance is measured from the ray origin to the hit IN DATA SPACE — both
+    // endpoints must be in the same space or this number is meaningless.
+    const [ox, oy, oz] = RAY_ORIGIN_IN_DATA_SPACE; // w is not part of the metric
+    expect(result.distance).toBeCloseTo(Math.hypot(1 - ox, 2 - oy, 3 - oz));
   });
 
   it("does not branch on pick3DPoint's return value (it always returns undefined)", () => {
@@ -130,20 +165,22 @@ describe("VTKInstanceHandler.raycastVR", () => {
       const large = makeVrContext({ dataBounds: [0, 100, 0, 100, 0, 100] });
 
       handler.raycastVR(small, RAY);
-      const smallFar = small._vrPicker.pick3DPoint.mock.calls[0][1];
       handler.raycastVR(large, RAY);
-      const largeFar = large._vrPicker.pick3DPoint.mock.calls[0][1];
 
-      expect(Math.abs(largeFar[2])).toBeGreaterThan(Math.abs(smallFar[2]));
-      expect(Math.abs(smallFar[2])).not.toBe(1000);
+      // Measured as |p2 - p1| rather than a raw coordinate: the ray no longer
+      // starts at the origin (it starts at the data-space image of the
+      // controller), so a bare component is a position, not a length.
+      expect(pickRayLength(large._vrPicker)).toBeGreaterThan(
+        pickRayLength(small._vrPicker)
+      );
+      expect(pickRayLength(small._vrPicker)).not.toBe(1000);
     });
 
     it("clamps to a usable minimum for degenerate (point-like) bounds", () => {
       const ctx = makeVrContext({ dataBounds: [0, 0, 0, 0, 0, 0] });
       handler.raycastVR(ctx, RAY);
 
-      const far = ctx._vrPicker.pick3DPoint.mock.calls[0][1];
-      expect(Math.abs(far[2])).toBeGreaterThanOrEqual(1);
+      expect(pickRayLength(ctx._vrPicker)).toBeGreaterThanOrEqual(1);
     });
   });
 
@@ -204,8 +241,76 @@ describe("VTKInstanceHandler.raycastVR", () => {
       });
 
       expect(result).not.toBeNull();
-      const far = ctx._vrPicker.pick3DPoint.mock.calls[0][1];
-      expect(far[2]).toBeLessThan(0); // travelled along -Z
+      const [near, far] = ctx._vrPicker.pick3DPoint.mock.calls[0];
+      expect(far[2]).toBeLessThan(near[2]); // travelled along -Z from the origin
+    });
+
+    it("maps the XR-space ray origin into data space before picking", () => {
+      // THE regression this file most needs. VR remaps the camera and leaves
+      // actors in data space, so the controller's XR-metre origin has to go
+      // through `dataPos = xrPos / vrScale + vrOrigin` (vrPlaneMath's
+      // mapXRPointToData, the same helper VRClipBoxTool already uses) before
+      // it can be intersected against geometry. Picking with the raw XR point
+      // starts the ray nowhere near the dataset, so getCellId() reports -1 and
+      // EVERY VR tool — annotate, measure, probe, and the pointer reticle —
+      // silently does nothing, with no error to show for it.
+      const ctx = makeVrContext({ vrScale: 2, vrOrigin: [10, 20, 30] });
+      handler.raycastVR(ctx, {
+        origin: { x: 2, y: 4, z: -6 },
+        direction: { x: 0, y: 0, z: -1 },
+      });
+
+      const [p1] = ctx._vrPicker.pick3DPoint.mock.calls[0];
+      expect(p1).toEqual([11, 22, 27, 1.0]); // NOT the raw [2, 4, -6]
+    });
+
+    it("passes 4-component homogeneous endpoints (w = 1) to the picker", () => {
+      // vtkPicker.pick3DPoint forwards these arrays to pick3DInternal WITHOUT
+      // appending w (Picker.js:268-284), and pick3DInternal then does
+      // vec4.transformMat4 followed by vec3.scale(p, p, 1 / p[3])
+      // (Picker.js:103-106). A 3-element array makes w undefined -> NaN
+      // everywhere -> getCellId() never leaves -1 -> raycastVR returns null on
+      // every call. See the sibling integration test for the end-to-end proof.
+      const ctx = makeVrContext();
+      handler.raycastVR(ctx, RAY);
+
+      const [p1, p2] = ctx._vrPicker.pick3DPoint.mock.calls[0];
+      expect(p1).toHaveLength(4);
+      expect(p2).toHaveLength(4);
+      expect(p1[3]).toBe(1.0);
+      expect(p2[3]).toBe(1.0);
+    });
+
+    it("resets picker state before each pick so a miss cannot report a stale cell", () => {
+      const ctx = makeVrContext();
+      handler.raycastVR(ctx, RAY);
+      expect(ctx._vrPicker.initialize).toHaveBeenCalled();
+    });
+
+    it("leaves the ray DIRECTION unscaled — only the origin is transformed", () => {
+      // The XR->data map is a uniform scale plus a translation, so a direction
+      // maps to d/vrScale, which is the same unit vector. Dividing the
+      // direction as well would be a plausible-looking over-correction that
+      // silently shortens the ray by a factor of vrScale.
+      const ctx = makeVrContext({ vrScale: 4, vrOrigin: [1, 2, 3] });
+      handler.raycastVR(ctx, {
+        origin: { x: 0, y: 0, z: 0 },
+        direction: { x: 0, y: 0, z: -1 },
+      });
+
+      const [p1, p2] = ctx._vrPicker.pick3DPoint.mock.calls[0];
+      const len = pickRayLength(ctx._vrPicker);
+      const unit = [
+        (p2[0] - p1[0]) / len,
+        (p2[1] - p1[1]) / len,
+        (p2[2] - p1[2]) / len,
+      ];
+      expect(unit[0]).toBeCloseTo(0);
+      expect(unit[1]).toBeCloseTo(0);
+      expect(unit[2]).toBeCloseTo(-1);
+
+      // And the length still comes from the dataset's own bounds, undivided.
+      expect(len).toBeCloseTo(Math.hypot(1, 1, 1) * 4);
     });
 
     it("returns null for an unusable ray or missing sceneObjects", () => {

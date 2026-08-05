@@ -356,6 +356,29 @@ describe("VRSpatialUI integration — initialize/update/dispose against a fake r
     expect(ui.getModel().isVisible()).toBe(true);
   });
 
+  it("places the reshow tab off the forward aim axis when there is no left-hand pose", () => {
+    // Gripless/transient-pointer input (Apple Vision Pro) never reports a
+    // left-hand pose during one-handed aiming — makeInputState()'s default
+    // `controllers.left: null` models exactly that. A dead-ahead fallback
+    // used to sit right in the aim cone every tool's raycast uses, silently
+    // eating the trigger pull meant for Annotate/Measure.
+    const renderer = makeFakeRenderer();
+    const ui = new VRSpatialUI();
+    ui.initialize(renderer, makeManager());
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+    ui.getModel().setVisible(false);
+
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+
+    expect(ui._reshowTabActor.getVisibility()).toBe(true);
+    const center = ui._reshowAnchor.center;
+    // Facing -Z (identity orientation): the old dead-ahead fallback put the
+    // tab at x === 0 (straight down the aim axis). It must now sit off to
+    // the side instead.
+    expect(center[0]).not.toBeCloseTo(0, 5);
+    expect(Math.abs(center[0])).toBeGreaterThan(0.1);
+  });
+
   it("trigger-drags the header and leaves the menu at its manual position", () => {
     const ui = new VRSpatialUI();
     ui.initialize(makeFakeRenderer(), makeManager());
@@ -404,6 +427,35 @@ describe("VRSpatialUI integration — initialize/update/dispose against a fake r
       })
     );
     expect(ui._panelAnchor.center[0]).toBeCloseTo(startX + 0.25, 5);
+  });
+
+  it("consumingTrigger is true for a plain button hover+tap, not just the header drag-bar", () => {
+    // Regression: hitTest() used to return `consumingTrigger: !!headerHit` —
+    // explicitly FALSE for an ordinary button tap (only true for the header
+    // drag-bar). VRExplorationManager reads this as
+    // `menuResult?.consumingTrigger ?? menuHovering`, and `??` only falls
+    // through on null/undefined — an explicit `false` defeated that intended
+    // fallback. Net effect: the SAME trigger pull that activated a button
+    // (Undo, New Path, a tool switch, ...) was NOT stripped from the active
+    // tool's input, so it also registered there as a fresh rising edge — e.g.
+    // tapping "New Path" while Measure was active also placed a phantom
+    // measurement point wherever the controller happened to be aimed.
+    const manager = makeManager();
+    const ui = new VRSpatialUI();
+    ui.initialize(makeFakeRenderer(), manager);
+    ui.update(makeInputState(), { vrScale: 1, vrOrigin: [0, 0, 0] });
+
+    const undoActor = ui._buttonActors.get("undo").actor;
+    const target = undoActor.getPosition();
+
+    const result = ui.hitTest(makeInputStateAimedAt(target, { triggerPressed: true }));
+
+    expect(result.buttonId).toBe("undo");
+    expect(result.hovering).toBe(true);
+    // THE assertion this test exists for.
+    expect(result.consumingTrigger).toBe(true);
+    // And the tap actually reached the menu, not just the flag.
+    expect(manager.undoLastToolAction).toHaveBeenCalled();
   });
 
   it("toggleAtHead closes the panel and reopens it at the current gaze", () => {
@@ -618,6 +670,110 @@ describe("VRSpatialUI hitTest()/layout() frame-order split (A4)", () => {
       expect(actor.getVisibility()).toBe(false);
     }
     expect(ui._reshowTabActor.getVisibility()).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Opening-frame panel placement — the panel must not sit on the forward axis
+//
+// This is a TRIGGER-LOSS bug, not a cosmetic one. _updateAnchor() runs from
+// hitTest() (phase 1), but _dataBounds was only ever assigned in layout()
+// (phase 2), and dispose() resets it to null every session. So the opening
+// anchor was always computed blind, _adaptiveSideOffset fell back to the bare
+// PANEL_SIDE_OFFSET (0.24 m) — smaller than the panel's own half-width
+// (0.45 m) — and the panel's hit region straddled dead-ahead. Aiming at a
+// centred dataset then reported a menu hover, and hitTest()'s consumingTrigger
+// stripped that trigger from the tools, so Annotate/Measure/Probe placed
+// nothing. The pointer reticle kept working throughout (it reads targetRay,
+// which is never gated), which is what made this so hard to see.
+//
+// _updateAnchor's lazy re-anchor gate (REANCHOR_DISTANCE) then held that bad
+// placement for as long as the user stood still — i.e. the whole session.
+// ---------------------------------------------------------------------------
+describe("VRSpatialUI opening-frame panel placement", () => {
+  let getContextSpy;
+
+  beforeEach(() => {
+    getContextSpy = vi
+      .spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockImplementation(() => createFakeCtx());
+    vi.stubGlobal(
+      "Path2D",
+      class FakePath2D {
+        constructor(_pathData) {}
+      }
+    );
+  });
+
+  afterEach(() => {
+    getContextSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  // A dataset as _applyInitialPlacement actually leaves it: standing on a
+  // PEDESTAL_HEIGHT_M (0.5 m) pedestal, ~1.4 m ahead — i.e. BELOW eye line, so
+  // the user aims DOWNWARD at it. That matters: the panel is dropped
+  // PANEL_DROP (0.42 m) below eye line too, so it is precisely this downward
+  // aim that the mis-anchored panel intercepts. A horizontal ray at head
+  // height passes harmlessly over the panel and would NOT reproduce the bug.
+  // vrScale 1 / vrOrigin origin keeps data space == XR space so the geometry
+  // stays readable here.
+  const SESSION_TRANSFORM = {
+    vrScale: 1.0,
+    vrOrigin: [0, 0, 0],
+    dataBounds: [-0.5, 0.5, 0.5, 1.5, -1.9, -0.9],
+  };
+  const DATA_CENTER = [0, 1.0, -1.4];
+
+  it("does not consume the trigger on the very FIRST hitTest when aiming at the data", () => {
+    const ui = new VRSpatialUI();
+    ui.initialize(makeFakeRenderer(), makeManager(), SESSION_TRANSFORM);
+
+    // The first frame of the session: no layout() has run yet, exactly as in
+    // VRExplorationManager._onFrame where hitTest() precedes layout().
+    const result = ui.hitTest(
+      makeInputStateAimedAt(DATA_CENTER, { triggerPressed: true })
+    );
+
+    // Aiming at the dataset is not aiming at the menu.
+    expect(result.buttonId).toBeNull();
+    expect(result.hovering).toBe(false);
+    // The assertion that actually matters: the trigger stays with the tools,
+    // so Annotate/Measure/Probe still see their rising edge.
+    expect(result.consumingTrigger).toBe(false);
+  });
+
+  it("places the panel clear of the forward axis on the opening frame", () => {
+    const ui = new VRSpatialUI();
+    ui.initialize(makeFakeRenderer(), makeManager(), SESSION_TRANSFORM);
+    ui.hitTest(makeInputState());
+
+    // Facing -Z from the origin, so lateral displacement is |x|. The panel's
+    // near edge must clear dead-ahead by its own half-width.
+    const center = ui._panelAnchor.center;
+    expect(Math.abs(center[0])).toBeGreaterThan(ui._panelWidth / 2);
+  });
+
+  it("_adaptiveSideOffset never returns less than the panel half-width, even with no bounds", () => {
+    const ui = new VRSpatialUI();
+    ui.initialize(makeFakeRenderer(), makeManager());
+    ui._dataBounds = null; // the pre-layout() state dispose() leaves behind
+
+    const offset = ui._adaptiveSideOffset([0, 1.6, 0], [0, 0, -1], [1, 0, 0]);
+
+    expect(Math.abs(offset)).toBeGreaterThanOrEqual(ui._panelWidth / 2);
+  });
+
+  it("still resolves a genuine button hover, so the fix does not disable the menu", () => {
+    const ui = new VRSpatialUI();
+    ui.initialize(makeFakeRenderer(), makeManager(), SESSION_TRANSFORM);
+    ui.update(makeInputState(), SESSION_TRANSFORM);
+
+    const undoPos = ui._buttonActors.get("undo").actor.getPosition();
+    const result = ui.hitTest(makeInputStateAimedAt(undoPos));
+
+    expect(result.buttonId).toBe("undo");
+    expect(result.consumingTrigger).toBe(true);
   });
 });
 

@@ -135,6 +135,92 @@ describe("userManagement identity — revert flag", () => {
   });
 });
 
+describe("userManagement identity — two devices, two identities", () => {
+  // These need module-fresh instances (not the shared top-level import) so
+  // each can see its own deviceIdentity mock and its own empty localStorage.
+  beforeEach(() => {
+    vi.resetModules();
+    localStorage.clear();
+    sessionStorage.clear();
+    mockConfig.devBypassAuth = true;
+    mockConfig.identity = { deviceFallback: true };
+  });
+
+  it("gives two different device ids two different getUserName() values", async () => {
+    vi.doMock("@Core/identity/deviceIdentity.js", () => ({
+      getDeviceId: () => "device-one-id",
+      getDeviceName: () => "Quest 2 dev1",
+      getDeviceEmail: () => "device-one-id@cia-web.local",
+      hasDeviceName: () => false,
+    }));
+    const deviceOne = await import("@Collaboration/presence/userManagement.js");
+    const nameOne = deviceOne.getUserName();
+
+    vi.resetModules();
+    vi.doMock("@Core/identity/deviceIdentity.js", () => ({
+      getDeviceId: () => "device-two-id",
+      getDeviceName: () => "Quest 2 dev2",
+      getDeviceEmail: () => "device-two-id@cia-web.local",
+      hasDeviceName: () => false,
+    }));
+    const deviceTwo = await import("@Collaboration/presence/userManagement.js");
+    const nameTwo = deviceTwo.getUserName();
+
+    expect(nameOne).toBe("Quest 2 dev1");
+    expect(nameTwo).toBe("Quest 2 dev2");
+    expect(nameOne).not.toBe(nameTwo);
+  });
+});
+
+describe("userManagement identity — one-time migration of the poisoned shared name", () => {
+  // The migration runs once, at module top-level init, so each scenario needs
+  // its own fresh module instance with localStorage seeded beforehand.
+  beforeEach(() => {
+    // Re-pin the deviceIdentity mock to the file's default ("Quest 3 aaaa").
+    // vi.doMock persists past resetModules, so without this the leftover
+    // per-test override from the "two devices" block above would leak in.
+    vi.doMock("@Core/identity/deviceIdentity.js", () => ({
+      getDeviceId: () => DEVICE_ID,
+      getDeviceName: () => "Quest 3 aaaa",
+      getDeviceEmail: () => `device-${DEVICE_ID}@cia-web.local`,
+      hasDeviceName: () => mockHasDeviceName(),
+    }));
+    vi.resetModules();
+    localStorage.clear();
+    mockConfig.devBypassAuth = true;
+    mockConfig.identity = { deviceFallback: true };
+  });
+
+  it('clears a persisted "CIA Admin" and falls back to the device name', async () => {
+    localStorage.setItem("cia_username", "CIA Admin");
+
+    const fresh = await import("@Collaboration/presence/userManagement.js");
+
+    expect(localStorage.getItem("cia_username")).toBeNull();
+    expect(fresh.getUserName()).toBe("Quest 3 aaaa");
+  });
+
+  it("leaves a genuinely chosen name intact", async () => {
+    localStorage.setItem("cia_username", "Fahim");
+
+    const fresh = await import("@Collaboration/presence/userManagement.js");
+
+    expect(localStorage.getItem("cia_username")).toBe("Fahim");
+    expect(fresh.getUserName()).toBe("Fahim");
+  });
+
+  it("does not touch a persisted name outside dev bypass", async () => {
+    mockConfig.devBypassAuth = false;
+    localStorage.setItem("cia_username", "CIA Admin");
+
+    await import("@Collaboration/presence/userManagement.js");
+
+    // Not dev bypass, so the migration guard must not fire even though the
+    // stored value matches the shared mock name.
+    expect(localStorage.getItem("cia_username")).toBe("CIA Admin");
+  });
+});
+
 describe("userManagement identity — production path unchanged", () => {
   beforeEach(() => {
     mockConfig.devBypassAuth = false;

@@ -125,27 +125,40 @@ export class SimpleAvatarFallback {
    * Update positions from a scene-space pose (already coordinate-transformed).
    *
    * @param {import('./AvatarTypes.js').AvatarPose} pose - Positions in VTK scene space
-   * @param {number} [localVrScale=1] - the LOCAL viewer's vrScale. Only the hit
-   *   marker uses it, to hold a constant apparent size; every position on
-   *   `pose` is already in scene space and must not be rescaled here.
+   * @param {number} [localVrScale=1] - the LOCAL viewer's vrScale, used to hold
+   *   the avatar at a constant apparent size. Every POSITION on `pose` is
+   *   already in scene space and must not be rescaled here — only actor sizes.
    */
   updatePose(pose, localVrScale = 1) {
     if (!pose) return;
 
+    // Constant apparent size for the whole avatar. Every source below is
+    // authored in PHYSICAL metres (HEAD_RADIUS, HAND_RADIUS, the halo, the
+    // label plane), but scene units are physical metres divided by the local
+    // viewer's vrScale. Previously only the hit marker compensated, so a peer's
+    // body silently disagreed with their own pointer dot: at detail zoom the
+    // head ballooned to cover the dataset, and at room scale it shrank away.
+    // Two headsets at different scales saw each other at different sizes.
+    const s = 1 / (localVrScale || 1);
+
     if (pose.head?.position) {
       const { x, y, z } = pose.head.position;
       this._headActor.setPosition(x, y, z);
+      this._headActor.setScale(s, s, s);
       this._headActor.setVisibility(true);
+      this._label.setScale(s);
       this._label.setPosition(x, y, z);
       this._label.setVisible(true);
       // The halo rides the head; whether it is SHOWN is owned by setActivity.
       this._activityHaloActor?.setPosition(x, y, z);
+      this._activityHaloActor?.setScale(s, s, s);
       this._activityHaloActor?.setVisibility(!!this._activity);
     }
 
     if (pose.leftHand?.visible && pose.leftHand?.position) {
       const { x, y, z } = pose.leftHand.position;
       this._leftHandActor.setPosition(x, y, z);
+      this._leftHandActor.setScale(s, s, s);
       this._leftHandActor.setVisibility(true);
     } else {
       this._leftHandActor.setVisibility(false);
@@ -154,6 +167,7 @@ export class SimpleAvatarFallback {
     if (pose.rightHand?.visible && pose.rightHand?.position) {
       const { x, y, z } = pose.rightHand.position;
       this._rightHandActor.setPosition(x, y, z);
+      this._rightHandActor.setScale(s, s, s);
       this._rightHandActor.setVisibility(true);
     } else {
       this._rightHandActor.setVisibility(false);
@@ -181,8 +195,8 @@ export class SimpleAvatarFallback {
         this._hitMarkerActor.setPosition(hit.x, hit.y, hit.z);
         // Constant apparent size: the sphere source is authored at
         // HIT_MARKER_RADIUS_M physical metres, and scene units are physical
-        // metres divided by the local viewer's vrScale.
-        const s = 1 / (localVrScale || 1);
+        // metres divided by the local viewer's vrScale. Same `s` as the body
+        // above — they must agree or the dot detaches from the pointing hand.
         this._hitMarkerActor.setScale(s, s, s);
         this._hitMarkerActor.setVisibility(true);
       } else {

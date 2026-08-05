@@ -19,6 +19,10 @@ import { VRNavigationController } from '@Core/vr/navigation/VRNavigationControll
 import { workspaceManager } from '@Core/instances/workspaceManager.js';
 import { getViewConfigurationManager } from '@Init/appInitializer.js';
 import { getUserId, getUserName, getUserColor } from '@Collaboration/presence/userManagement.js';
+// Room id for the collaboration diagnostic — it is the Y.Doc room every peer
+// must share, and the first thing to compare when two headsets cannot see
+// each other. See getCollaborationDiagnostics().
+import { sessionManager } from '@Core/session/sessionManager.js';
 import { apiClient } from '@Services/apiClient.js';
 import { BaseManager } from '@Core/data/managers/BaseManager.js';
 import { vrAvatarSystem } from '@Core/instances/types/vtk/vr/VTKVRAvatars.js';
@@ -31,7 +35,7 @@ import {
   vtkIsosurfaceFeature,
 } from '@Core/instances/types/vtk/features/index.js';
 import { VRValueEditorModel } from '@Core/vr/VRValueEditorModel.js';
-import { vtkGlyphFeature, isGlyphFeatureAvailable } from '@Core/instances/types/vtk/features/VTKGlyphFeature.js';
+import { vtkGlyphFeature, isGlyphFeatureAvailable, getDisabledGlyphTypes } from '@Core/instances/types/vtk/features/VTKGlyphFeature.js';
 import { instanceTools } from '@VTK/vtkInstanceTools.js';
 import { pushSharedVisualizationUpdate } from '@Services/visualizationSyncService.js';
 import { vrCursorSync } from '@Core/vr/VRCursorSync.js';
@@ -290,10 +294,11 @@ class VRExplorationManager extends BaseManager {
     //     claim the registry slot; someone racing us for the SAME slot may
     //     still beat us to it (Y.js Map is last-writer-wins), so adopt
     //     whatever claimVRSession() returns rather than assuming we won it.
+    const sessionKey = this._resolveSessionKey(instance);
     if (serverSession?.id) {
       // Path 1 — nothing to adopt, id is already canonical.
     } else {
-      const liveRecord = getVRSessionForView(instance.viewConfigId);
+      const liveRecord = getVRSessionForView(sessionKey);
       if (liveRecord) {
         // Path 2
         session.id = liveRecord.sessionId;
@@ -305,7 +310,7 @@ class VRExplorationManager extends BaseManager {
         if (serverRow?.id) {
           session.id = serverRow.id;
         }
-        const claimed = claimVRSession(instance.viewConfigId, {
+        const claimed = claimVRSession(sessionKey, {
           sessionId: session.id,
           hostUserId: getUserId(),
           hostUserName: getUserName(),
@@ -464,7 +469,7 @@ class VRExplorationManager extends BaseManager {
     // slot for this view — a claim race can resolve AFTER our own synchronous
     // claimVRSession() call returns, once a competing write propagates over
     // the network (see claimVRSession's docstring).
-    this._watchVRSessionConvergence(instance.viewConfigId, session);
+    this._watchVRSessionConvergence(sessionKey, session);
 
     // Initialize avatar system
     const avatarRenderer = vrContext.sceneObjects?.renderer;
@@ -488,12 +493,29 @@ class VRExplorationManager extends BaseManager {
       vrCursorSync.initialize(getUserId(), getUserName(), getUserColor(getUserId()))
     );
 
+    // Print the room/session/view triple every peer must agree on. Cheap, once
+    // per session, and it is the first thing to check when two headsets cannot
+    // see each other.
+    this._logCollaborationDiagnostics('session-start');
+
     // Initialize the in-scene spatial tool menu. WebXR immersive sessions do
     // not render the DOM, so this VTK panel — not the React VRWristMenu — is
     // the guaranteed in-headset UI. It shares this manager as its source of
     // truth (tool select / undo / isolation toggle / exit all route back here).
     if (avatarRenderer) {
-      this._safeInitStep('vrSpatialUI.initialize', () => vrSpatialUI.initialize(avatarRenderer, this));
+      // Pass the transform up front. The panel commits its opening anchor from
+      // the FIRST hitTest(), which runs a phase before the first layout() —
+      // without bounds it cannot compute its clearance from the dataset and
+      // parks itself across the forward axis, where it then swallows the
+      // trigger aimed at the data (see VTKVRSpatialUI._latchTransform).
+      // _applyInitialPlacement has already populated these above.
+      this._safeInitStep('vrSpatialUI.initialize', () =>
+        vrSpatialUI.initialize(avatarRenderer, this, {
+          vrScale: vrContext.vrScale,
+          vrOrigin: vrContext.vrOrigin,
+          dataBounds: vrContext.dataBounds,
+        })
+      );
     }
 
     // Tell the ROOM (not just the session) that this user is now in a headset.
@@ -543,6 +565,39 @@ class VRExplorationManager extends BaseManager {
   }
 
   /**
+   * Resolve the key this instance's VR exploration converges on in the
+   * shared `vr-sessions` registry (yVRSessions).
+   *
+   * WHY dataset id, not view id: every client that opens a dataset mints its
+   * OWN ViewConfiguration via createView()/POST /views, so two headsets
+   * looking at the SAME dataset in the SAME room hold two different, both
+   * individually valid, viewConfigIds. Keying convergence on viewConfigId
+   * (the old behaviour) meant each headset looked up — and claimed — a
+   * DIFFERENT registry slot; neither could ever observe the other's claim,
+   * so avatars/poses were permanently split across two sessions with no way
+   * to recover. yVRSessions is already room-scoped (see yjsSetup.js), so
+   * "same datasetId" is exactly "same dataset, same room" — the actual
+   * semantics a shared VR exploration needs.
+   *
+   * Falls back to viewConfigId when there is no dataset id (e.g. a handler
+   * that hasn't attached dataset metadata to the instance yet); returns
+   * undefined when neither is available so callers preserve the existing
+   * "no key, do nothing" behaviour instead of claiming/watching garbage.
+   *
+   * @param {object} instance - workspaceManager instance (see startExploration)
+   * @returns {string|undefined}
+   * @private
+   */
+  _resolveSessionKey(instance) {
+    return (
+      instance?.instanceData?.dataset?.id ||
+      instance?.datasetId ||
+      instance?.viewConfigId ||
+      undefined
+    );
+  }
+
+  /**
    * Register a locally started session with the server, bounded by a short
    * timeout so a slow network never delays VR entry (WebXR requestSession
    * must run while user activation is still fresh). The server generates
@@ -580,7 +635,8 @@ class VRExplorationManager extends BaseManager {
 
   /**
    * Watch the shared `vr-sessions` registry for VR_SESSION_CONVERGE_WATCH_MS
-   * after claiming/adopting the slot for this view. Two clients can claim
+   * after claiming/adopting the slot for this session key (see
+   * _resolveSessionKey). Two clients can claim
    * "simultaneously" (see claimVRSession's docstring) — each wins its own
    * synchronous local claim, but once the competing write propagates over the
    * network, Y.js's last-writer-wins resolution can silently overwrite our
@@ -591,21 +647,21 @@ class VRExplorationManager extends BaseManager {
    * Self-unsubscribes after the window; also torn down early by leaveSession
    * via _offVRSessionObserver.
    *
-   * @param {string} viewConfigId
+   * @param {string} sessionKey - see _resolveSessionKey()
    * @param {VRExplorationSession} session
    * @private
    */
-  _watchVRSessionConvergence(viewConfigId, session) {
-    if (!viewConfigId) return;
+  _watchVRSessionConvergence(sessionKey, session) {
+    if (!sessionKey) return;
 
     // A previous call (shouldn't normally overlap, but startExploration can
     // in principle run again before this window elapses) must not leak.
     this._offVRSessionObserver?.();
 
     const observer = (event) => {
-      if (!event.changes.keys.has(viewConfigId)) return;
+      if (!event.changes.keys.has(sessionKey)) return;
 
-      const record = getVRSessionForView(viewConfigId);
+      const record = getVRSessionForView(sessionKey);
       if (!record || record.sessionId === session.id) return;
 
       log.info(`VR session claim race resolved against us — re-keying ${session.id} -> ${record.sessionId}`);
@@ -640,17 +696,22 @@ class VRExplorationManager extends BaseManager {
    *    the live VR participant with the lowest joinedAt — instead of running
    *    a voting protocol. Every remaining client runs this same computation;
    *    only the one that agrees it is the winner writes the claim.
+   * Must key on the same value startExploration claimed/watched under (see
+   * _resolveSessionKey) — otherwise this heartbeats/promotes against a
+   * DIFFERENT registry slot than the one the session actually lives at,
+   * which looks exactly like the record having gone stale (host-promotion
+   * fires spuriously) even though nothing is actually wrong.
    *
-   * @param {string|undefined} viewConfigId
+   * @param {string|undefined} sessionKey - see _resolveSessionKey()
    * @param {VRExplorationSession|null} session
    * @private
    */
-  _tickVRSessionRegistry(viewConfigId, session) {
-    if (!viewConfigId || !session) return;
+  _tickVRSessionRegistry(sessionKey, session) {
+    if (!sessionKey || !session) return;
 
-    heartbeatVRSession(viewConfigId, getUserId());
+    heartbeatVRSession(sessionKey, getUserId());
 
-    if (getVRSessionForView(viewConfigId)) return; // host's slot is still live
+    if (getVRSessionForView(sessionKey)) return; // host's slot is still live
 
     const vrParticipants = session.getVRParticipants?.() || [];
     if (!vrParticipants.length) return;
@@ -661,7 +722,7 @@ class VRExplorationManager extends BaseManager {
     );
     if (!winner || winner.odUserId !== getUserId()) return; // not our turn
 
-    const claimed = claimVRSession(viewConfigId, {
+    const claimed = claimVRSession(sessionKey, {
       sessionId: session.id,
       hostUserId: getUserId(),
       hostUserName: getUserName(),
@@ -671,7 +732,7 @@ class VRExplorationManager extends BaseManager {
     session.ownerUserId = claimed.hostUserId;
     session.ownerUserName = claimed.hostUserName;
     if (claimed.hostUserId === getUserId()) {
-      log.info(`VR session host promoted: ${getUserId()} claimed ${viewConfigId}`);
+      log.info(`VR session host promoted: ${getUserId()} claimed ${sessionKey}`);
     }
   }
 
@@ -801,7 +862,9 @@ class VRExplorationManager extends BaseManager {
     const session = this._activeSession;
     // Captured before _activeContext is nulled out in `finally` — the
     // registry release below needs it after every other cleanup step runs.
-    const viewConfigId = this._activeContext?.instance?.viewConfigId;
+    // Must match the key startExploration claimed under (see
+    // _resolveSessionKey), or this releases the wrong registry slot entirely.
+    const sessionKey = this._resolveSessionKey(this._activeContext?.instance);
 
     log.info('Leaving VR session...', { sessionId: session.id });
 
@@ -827,8 +890,8 @@ class VRExplorationManager extends BaseManager {
       // non-host (releaseVRSession itself also guards this, but checking
       // here avoids a pointless Y.js write from every leaving participant).
       await this._safeCleanupStep('vrSessionRegistry.release', () => {
-        if (viewConfigId && session.ownerUserId === getUserId()) {
-          releaseVRSession(viewConfigId, getUserId());
+        if (sessionKey && session.ownerUserId === getUserId()) {
+          releaseVRSession(sessionKey, getUserId());
         }
       });
 
@@ -1260,6 +1323,79 @@ class VRExplorationManager extends BaseManager {
    * @returns {{holderUserId:string, holderUserName:string, grantedBy:string,
    *   grantedAt:number, heartbeat:number}|null} null when nobody live holds it
    */
+  /**
+   * One-shot snapshot of everything that has to MATCH between two headsets for
+   * them to share a world. Logged on session start and callable from the
+   * console (remote-debug a Quest via chrome://inspect).
+   *
+   * This exists because the overwhelmingly common multi-headset failure — the
+   * two devices being in different sessions — is invisible in-headset. Each
+   * user sees a working VR scene and an empty People list, with nothing to say
+   * whether the problem is the room, the view, the network, or the token. BOTH
+   * `roomId` and `sessionKey` must be identical on the two devices — sessionKey
+   * is what convergence actually keys on (see _resolveSessionKey; usually the
+   * dataset id, NOT viewConfigId — each client mints its own ViewConfiguration,
+   * so comparing viewConfigId across headsets is meaningless and was the
+   * original bug here). A null sessionKey means neither a dataset id nor a
+   * viewConfigId was available, which silently defeats convergence entirely.
+   *
+   * @returns {object} plain, loggable snapshot
+   */
+  getCollaborationDiagnostics() {
+    let roster = [];
+    try {
+      roster = this.getSessionRoster() || [];
+    } catch {
+      roster = [];
+    }
+    const holder = (() => {
+      try {
+        return this.getManipulationHolder();
+      } catch {
+        return null;
+      }
+    })();
+
+    return {
+      roomId: sessionManager.getRoomId?.() ?? null,
+      vrSessionId: this._activeContext?.session?.id ?? null,
+      sessionKey: this._resolveSessionKey(this._activeContext?.instance) ?? null,
+      viewConfigId: this._activeContext?.instance?.viewConfigId ?? null,
+      userId: getUserId(),
+      userName: getUserName(),
+      participants: roster.length,
+      peers: roster.filter((r) => !r.isSelf).map((r) => r.userName || r.odUserId),
+      controlHolder: holder?.holderUserName || holder?.holderUserId || '(unheld)',
+      voiceConnected: (() => {
+        try {
+          return this.isVoiceConnected();
+        } catch {
+          return false;
+        }
+      })(),
+    };
+  }
+
+  /** @private */
+  _logCollaborationDiagnostics(reason) {
+    try {
+      const d = this.getCollaborationDiagnostics();
+      log.info(
+        `VR collab [${reason}] room=${d.roomId} session=${d.vrSessionId} ` +
+          `key=${d.sessionKey} view=${d.viewConfigId} as=${d.userName} participants=${d.participants} ` +
+          `peers=[${d.peers.join(', ')}] control=${d.controlHolder} voice=${d.voiceConnected}`
+      );
+      if (!d.sessionKey) {
+        log.warn(
+          'VR collab: sessionKey is null (no dataset id or viewConfigId) — ' +
+            'VR session convergence cannot match it against the other headset.'
+        );
+      }
+    } catch (err) {
+      log.warn(`VR collab diagnostics failed: ${err?.message}`);
+    }
+  }
+
   getManipulationHolder() {
     return this._manipulationLock?.getHolder() ?? null;
   }
@@ -2306,6 +2442,124 @@ class VRExplorationManager extends BaseManager {
     return !!vtkGlyphFeature.getState(instanceId)?.enabled;
   }
 
+  /**
+   * Select a specific glyph type (or disable glyphs with typeId === null).
+   * Unlike toggleGlyphs above (on/off only — it always auto-picks arrow-or-
+   * sphere with no user choice, which is why VR glyphs looked "random": the
+   * dataset's first vector array may not be a meaningful direction, and the
+   * user had no way to pick a different array or a non-oriented shape
+   * instead), this exposes the full type set the desktop glyph menu already
+   * offers (VTKInstanceHandler.js glyph-menu options) — every VTKGlyphFeature
+   * GLYPH_TYPES id, each backed by a real vtk.js source (vtkArrowSource,
+   * vtkConeSource, vtkSphereSource, vtkCubeSource, vtkCylinderSource; 'dot' is
+   * a small vtkSphereSource). No new glyph rendering code — this only adds a
+   * VR menu surface for the API toggleGlyphs and the desktop menu both
+   * already call.
+   * @param {string|null} typeId - a VTKGlyphFeature GLYPH_TYPES id, or null to disable
+   * @returns {boolean} true if the request was accepted
+   */
+  setGlyphType(typeId) {
+    const instanceId = this._activeContext?.instance?.instanceId;
+    if (!instanceId) return false;
+
+    if (typeId === null) {
+      this._deferHeavy('Removing glyphs…', () => {
+        vtkGlyphFeature.disableGlyphs(instanceId);
+        this._pushVisualizationPatch({ glyph: vtkGlyphFeature.getConfigForSync(instanceId) });
+      });
+      this._emit('glyphsToggled', { enabled: false });
+      return true;
+    }
+
+    const state = vtkGlyphFeature.getState(instanceId);
+    if (!state) return false;
+
+    // Same guards toggleGlyphs uses, but reported (a disabled-type tap fails
+    // loud via a notice, not silently — see the plan's notice-visibility fix).
+    const { vectorArrays = [], scalarArrays = [] } = state;
+    if (getDisabledGlyphTypes(vectorArrays).includes(typeId)) {
+      this._flashVRNotice(`${typeId} needs a vector array — this dataset has none`);
+      return false;
+    }
+    if (!isGlyphFeatureAvailable(vectorArrays, scalarArrays)) {
+      this._flashVRNotice('No vector or scalar data on this dataset for glyphs');
+      return false;
+    }
+
+    if (state.enabled) {
+      // Already running — just swap the shape. VTKGlyphFeature.setGlyphType
+      // only rebuilds the glyph SOURCE, not the mapper/subsample (see its
+      // definition), so this is cheap enough to run synchronously, unlike
+      // the initial enable below.
+      vtkGlyphFeature.setGlyphType(instanceId, typeId);
+      this._pushVisualizationPatch({ glyph: vtkGlyphFeature.getConfigForSync(instanceId) });
+      this._emit('glyphsToggled', { enabled: true });
+      return true;
+    }
+
+    // Not yet enabled: bring it up WITH the requested type, using the same
+    // array-driven options toggleGlyphs derives (see its comment for why
+    // scalingMode:'scalar' rather than 'vector' matters) — just parameterized
+    // on the user's chosen type instead of always picking arrow-or-sphere.
+    const polydata = this._activeContext?.instance?.instanceData?.polydata;
+    if (!polydata) return false;
+
+    const vectorName = vectorArrays?.[0]?.name;
+    const scalarName = scalarArrays?.[0]?.name;
+    const options = vectorName
+      ? {
+          glyphType: typeId,
+          scalingMode: 'scalar',
+          orientationArray: vectorName,
+          scaleArray: vectorName,
+        }
+      : {
+          glyphType: typeId,
+          scalingMode: 'off',
+          orientationArray: null,
+          colorMode: scalarName ? 'scalar' : 'solid',
+          colorArray: scalarName || null,
+        };
+    options.scaleFactor = this._autoGlyphScaleFactor(polydata);
+
+    this._deferHeavy('Building glyphs…', () => {
+      vtkGlyphFeature.enableGlyphs(instanceId, polydata, options);
+      this._pushVisualizationPatch({ glyph: vtkGlyphFeature.getConfigForSync(instanceId) });
+    });
+    this._emit('glyphsToggled', { enabled: true });
+    return true;
+  }
+
+  /** @returns {string|null} the current glyph type, or null if disabled/unavailable */
+  getGlyphType() {
+    const instanceId = this._activeContext?.instance?.instanceId;
+    if (!instanceId) return null;
+    const state = vtkGlyphFeature.getState(instanceId);
+    return state?.enabled ? state.glyphType : null;
+  }
+
+  /** @returns {string[]} glyph type ids disabled on the active dataset (no vector array) */
+  getDisabledGlyphTypeIds() {
+    const instanceId = this._activeContext?.instance?.instanceId;
+    if (!instanceId) return [];
+    const state = vtkGlyphFeature.getState(instanceId);
+    return getDisabledGlyphTypes(state?.vectorArrays || []);
+  }
+
+  /**
+   * @returns {string|null} the point-data array name currently driving glyph
+   *   orientation, or null. Surfaced in the VR status line specifically to
+   *   close the "why do these arrows look random" gap — the array is picked
+   *   automatically (the dataset's first vector array) and was previously
+   *   never shown to the user anywhere in VR.
+   */
+  getGlyphOrientationArray() {
+    const instanceId = this._activeContext?.instance?.instanceId;
+    if (!instanceId) return null;
+    const state = vtkGlyphFeature.getState(instanceId);
+    return state?.enabled ? state.orientationArray || null : null;
+  }
+
   // ===========================================================================
   // ISOLATION MODE (room-scale inspection)
   // ===========================================================================
@@ -3099,7 +3353,10 @@ class VRExplorationManager extends BaseManager {
       const nowForVRSessionRegistry = Date.now();
       if (nowForVRSessionRegistry - this._lastVRSessionHeartbeat >= VR_SESSION_HEARTBEAT_MS) {
         this._lastVRSessionHeartbeat = nowForVRSessionRegistry;
-        this._tickVRSessionRegistry(this._activeContext?.instance?.viewConfigId, this._activeSession);
+        this._tickVRSessionRegistry(
+          this._resolveSessionKey(this._activeContext?.instance),
+          this._activeSession
+        );
         // Same 1 Hz budget: refresh our hold on the data-control token, or (as
         // host) reclaim one whose holder went stale. Internally throttled too,
         // so sharing this tick is belt-and-braces rather than load-bearing.
@@ -3159,7 +3416,20 @@ class VRExplorationManager extends BaseManager {
       this._emit('frame', { time, inputState, deltaTime });
 
     } catch (error) {
-      log.error('Error in VR frame loop:', error);
+      // This catch spans ~9 unguarded calls (pose correction, input gathering,
+      // menu hit-test, navigation, tools, follow, isolation). A throw in ANY of
+      // them silently skips everything downstream — including the tool update —
+      // and then repeats at headset frame rate. Log the stack, and dedupe on
+      // message so a per-frame throw produces one readable entry instead of
+      // thousands that bury it.
+      const signature = error?.message || String(error);
+      if (this._lastFrameErrorSignature !== signature) {
+        this._lastFrameErrorSignature = signature;
+        log.error(
+          `Error in VR frame loop: ${signature}`,
+          error?.stack || error
+        );
+      }
     } finally {
       // Drain one deferred heavy task, now that both eyes for THIS frame have
       // been drawn.
@@ -3621,19 +3891,42 @@ class VRExplorationManager extends BaseManager {
    */
   _pushVisualizationPatch(patch) {
     try {
-      const viewId = this._activeContext?.instance?.viewConfigId;
-      if (!viewId || !patch) return;
-
+      if (!patch) return;
       const key = Object.keys(patch)[0];
-      if (!this._requireManipulationControl(PATCH_LABELS[key] || 'That change')) return;
+      const label = PATCH_LABELS[key] || 'That change';
+
+      const viewId = this._activeContext?.instance?.viewConfigId;
+      if (!viewId) {
+        // A view opened without a server-side ViewConfiguration has a null
+        // viewConfigId. The local change still applies, but there is nothing
+        // to broadcast it against, so the peer never sees it. Silent until
+        // now — and indistinguishable in-headset from a working sync.
+        this._flashVRNotice(`${label} is local only — this view isn't shared`);
+        return;
+      }
+
+      if (!this._requireManipulationControl(label)) return;
 
       // Filters (threshold/isosurface/glyph/clip) read as "filtering" work to
       // desktop observers; everything else is a change to the dataset itself.
       this._signalManipulation(FILTER_PATCH_KEYS.has(key) ? 'filter' : 'dataset');
 
-      Promise.resolve(
-        pushSharedVisualizationUpdate(viewId, patch)
-      ).catch((err) => log.warn(`VR visualization sync failed: ${err?.message}`));
+      Promise.resolve(pushSharedVisualizationUpdate(viewId, patch))
+        .then((result) => {
+          // The service REFUSES by RETURNING { persisted: false, reason },
+          // it does not throw — so the .catch() below never fires for the
+          // most common failure. That made a refused sync completely silent
+          // in VR: the local view changed, the other headset never saw it,
+          // and nothing explained why.
+          if (result && result.persisted === false) {
+            this._flashVRNotice(
+              result.reason === 'permission-denied'
+                ? `${label} not shared — view is read-only for your role`
+                : `${label} not shared — no active collaboration workspace`
+            );
+          }
+        })
+        .catch((err) => log.warn(`VR visualization sync failed: ${err?.message}`));
     } catch (err) {
       log.warn(`VR visualization sync failed: ${err?.message}`);
     }
@@ -3704,7 +3997,14 @@ class VRExplorationManager extends BaseManager {
 
   _persistVRAnnotation(data) {
     const { datasetId, projectId } = this._getPersistenceScope();
-    if (!datasetId || !data?.position) return;
+    if (!datasetId || !data?.position) {
+      // Marker still renders locally (the tool's own optimistic state) so
+      // this looks like success in-headset unless we say otherwise — a
+      // dataset with no server id (e.g. loaded locally, never saved) would
+      // otherwise silently vanish on reload with no explanation.
+      this._flashVRNotice('Annotation not saved — dataset has no server id');
+      return;
+    }
 
     // Fire-and-forget: never block the XR frame loop on network I/O
     this._getAnnotationManager()
@@ -3719,7 +4019,17 @@ class VRExplorationManager extends BaseManager {
               : null,
             text: data.text || 'VR marker',
             type: 'point',
-            metadata: { source: 'vr', vrMode: data.type, color: data.color },
+            // authorName rides in metadata (not a first-class annotation
+            // field) because AnnotationManager already writes the raw
+            // createdBy user id separately — this is purely the DISPLAY name
+            // so VTKAnnotationLinesFeature can render "who placed this" on
+            // the pin without a separate user-id -> display-name lookup.
+            metadata: {
+              source: 'vr',
+              vrMode: data.type,
+              color: data.color,
+              authorName: data.authorName || getUserName(),
+            },
           },
           { projectId }
         );
@@ -3740,7 +4050,10 @@ class VRExplorationManager extends BaseManager {
           if (data._deleted) this._deletePersistedVRAnnotation(data);
         }
       })
-      .catch((err) => log.warn('Failed to persist VR annotation:', err.message));
+      .catch((err) => {
+        log.warn('Failed to persist VR annotation:', err.message);
+        this._flashVRNotice('Annotation failed to save');
+      });
   }
 
   _deletePersistedVRAnnotation(data) {
@@ -3756,7 +4069,10 @@ class VRExplorationManager extends BaseManager {
 
   _persistVRMeasurement(data) {
     const { datasetId, projectId } = this._getPersistenceScope();
-    if (!datasetId || !data?.startPoint || !data?.endPoint) return;
+    if (!datasetId || !data?.startPoint || !data?.endPoint) {
+      this._flashVRNotice('Measurement not saved — dataset has no server id');
+      return;
+    }
 
     const mid = {
       x: (data.startPoint.x + data.endPoint.x) / 2,
@@ -3790,7 +4106,10 @@ class VRExplorationManager extends BaseManager {
           log.debug(`VR measurement persisted as ${annotation.id}`);
         }
       })
-      .catch((err) => log.warn('Failed to persist VR measurement:', err.message));
+      .catch((err) => {
+        log.warn('Failed to persist VR measurement:', err.message);
+        this._flashVRNotice('Measurement failed to save');
+      });
   }
 
   // ===========================================================================

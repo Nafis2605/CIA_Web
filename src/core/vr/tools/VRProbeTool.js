@@ -173,10 +173,8 @@ export class VRProbeTool extends VRToolInterface {
     const { controllers } = inputState;
     const rightCtrl = controllers.right;
 
-    if (!rightCtrl) return null;
-
     // Continuous probing while trigger held
-    if (this._continuousMode && rightCtrl.triggerValue > 0.5) {
+    if (rightCtrl && this._continuousMode && rightCtrl.triggerValue > 0.5) {
       const hit = this._performRaycast(rightCtrl, frame);
       if (hit) {
         const probeData = this._probeAtPosition(hit.position);
@@ -198,9 +196,18 @@ export class VRProbeTool extends VRToolInterface {
     // placement below returns early on success, so updating this after the
     // if-block never ran and re-armed itself every frame the trigger
     // stayed down (same bug fixed in VRAnnotationTool/VRMeasureTool).
-    const triggerPressed = !!rightCtrl.triggerPressed;
+    //
+    // Read via optional chaining and update the latch even when rightCtrl is
+    // absent — a gripless/transient-pointer source (Vision Pro) only exists
+    // in inputState while a pinch is physically held, so it vanishes on
+    // every release. Bailing out before this update left the latch stuck at
+    // `true` from the last pinch that reached it, so no later pinch could
+    // ever read as a fresh rising edge again.
+    const triggerPressed = !!rightCtrl?.triggerPressed;
     const triggerRisingEdge = triggerPressed && !this._lastTriggerState;
     this._lastTriggerState = triggerPressed;
+
+    if (!rightCtrl) return null;
 
     if (triggerRisingEdge) {
       const hit = this._performRaycast(rightCtrl, frame);

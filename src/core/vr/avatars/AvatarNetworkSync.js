@@ -61,7 +61,37 @@ export class AvatarNetworkSync {
     yAvatars.observe(observer);
     this._yjsObserverCleanup = () => yAvatars.unobserve(observer);
 
+    // Replay whatever is ALREADY in the map. Y.Map.observe fires only on
+    // CHANGES, so a peer who joined before us and has no reason to rewrite
+    // their entry would never deliver their displayName/color — and
+    // AvatarManager._onRemotePose then falls back to a truncated hex user id
+    // in default grey. Whoever enters the session second is exactly the case
+    // that hits this, i.e. it shows up the moment a second headset joins.
+    this._replayPresenceSnapshot();
+
     log.debug('AvatarNetworkSync initialized');
+  }
+
+  /**
+   * Deliver the current yAvatars contents to the presence callback, as though
+   * each entry had just changed. Called once at initialize().
+   * @private
+   */
+  _replayPresenceSnapshot() {
+    const myId = this._localUserId;
+    let replayed = 0;
+    yAvatars.forEach((data, userId) => {
+      if (!data || userId === myId) return;
+      try {
+        this._remotePresenceCb?.(userId, data);
+        replayed += 1;
+      } catch (err) {
+        log.error('AvatarNetworkSync presence snapshot error:', err);
+      }
+    });
+    if (replayed > 0) {
+      log.debug(`AvatarNetworkSync: replayed ${replayed} existing avatar presence entries`);
+    }
   }
 
   /**

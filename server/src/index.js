@@ -128,6 +128,10 @@ if (matrixBridge.config.enabled) {
 // MIDDLEWARE
 // ============================================================================
 
+// Dev tunnel origins already logged, so a 20 Hz collaboration session does not
+// reprint the same line on every preflight.
+const loggedTunnelOrigins = new Set();
+
 // CORS configuration - must specify origin when credentials are used
 const corsOptions = {
   origin: function (origin, callback) {
@@ -147,6 +151,26 @@ const corsOptions = {
 
     // Allow 192.168.x.x for LAN/Vision Pro
     if (origin.match(/^https?:\/\/192\.168\.\d+\.\d+(:\d+)?$/)) {
+      return callback(null, true);
+    }
+
+    // Allow dev tunnel origins (cloudflared / ngrok). A headset cannot reach
+    // `localhost`, and a self-signed LAN cert is not installable on Quest, so
+    // a tunnel is the practical way to get an HTTPS origin onto the device.
+    // The hostname is randomly generated on every tunnel start, so it cannot
+    // be pinned in ALLOWED_ORIGINS ahead of time — hence a pattern.
+    // DEVELOPMENT ONLY: gated on NODE_ENV so a production deployment can never
+    // be reached from an arbitrary attacker-controlled *.ngrok-free.app page.
+    if (
+      process.env.NODE_ENV !== "production" &&
+      origin.match(
+        /^https:\/\/[a-z0-9-]+(\.[a-z0-9-]+)*\.(trycloudflare\.com|ngrok-free\.app|ngrok\.io|ngrok\.app)$/i
+      )
+    ) {
+      if (!loggedTunnelOrigins.has(origin)) {
+        loggedTunnelOrigins.add(origin);
+        console.log(`[CORS] Allowing dev tunnel origin: ${origin}`);
+      }
       return callback(null, true);
     }
 

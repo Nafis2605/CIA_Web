@@ -9,6 +9,13 @@ vi.mock("@Utils/logger.js", () => {
   return { vr: mkLog(), app: mkLog(), sync: mkLog(), view: mkLog(), createLogger: () => mkLog() };
 });
 
+// VRAnnotationTool now reads the local user's display name for a placed
+// pin's label — mock the whole module rather than adding a "presence" logger
+// channel, matching the pattern in AvatarNetworkSync.pointer.test.js.
+vi.mock("@Collaboration/presence/userManagement.js", () => ({
+  getUserName: vi.fn(() => "Alice"),
+}));
+
 import { createFakeCtx } from "@/test/fakeCanvas.js";
 import {
   VRAnnotationTool,

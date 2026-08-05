@@ -9,6 +9,13 @@ vi.mock("@Utils/logger.js", () => {
   return { vr: mkLog(), app: mkLog(), sync: mkLog(), view: mkLog(), createLogger: () => mkLog() };
 });
 
+// VRAnnotationTool now reads the local user's display name for a placed
+// pin's label — mock the whole module rather than adding a "presence" logger
+// channel, matching the pattern in AvatarNetworkSync.pointer.test.js.
+vi.mock("@Collaboration/presence/userManagement.js", () => ({
+  getUserName: vi.fn(() => "Alice"),
+}));
+
 import { VRAnnotationTool, ANNOTATION_LABEL_PRESETS } from "../VRAnnotationTool.js";
 
 function makeInputState({ triggerPressed = false, thumbstickX = 0 } = {}) {
@@ -92,6 +99,29 @@ describe("VRAnnotationTool — preset label", () => {
     expect(first).not.toBeNull();
     expect(second).toBeNull();
   });
+
+  it("recognizes a second pinch as a fresh rising edge when the controller disappears between presses (Vision Pro release)", () => {
+    // Gripless/transient-pointer input (Apple Vision Pro) only reports a
+    // controller in inputState.controllers.right while a pinch is physically
+    // held — release makes it vanish entirely, unlike a tracked controller
+    // (Quest) whose object persists with triggerPressed: false. handleInput
+    // must treat that disappearance as "released" and reset its rising-edge
+    // latch, not stay stuck from the last press it saw.
+    const pending = tool.handleInput(makeInputState({ triggerPressed: true }), {});
+    expect(pending).toMatchObject({ type: "annotation-pending" });
+    tool.confirmDraft();
+
+    // Release: the transient-pointer source disappears (not merely
+    // triggerPressed: false) — simulate a couple of frames of this, and also
+    // let the tool's own _suppressUntilRelease window (set by confirmDraft)
+    // observe the release the same way.
+    tool.handleInput({ controllers: {} }, {});
+    tool.handleInput({ controllers: {} }, {});
+
+    // A fresh pinch must be recognized as a new rising edge.
+    const secondPending = tool.handleInput(makeInputState({ triggerPressed: true }), {});
+    expect(secondPending).toMatchObject({ type: "annotation-pending" });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -162,13 +192,16 @@ describe("VRAnnotationTool — marker rendering", () => {
     }
   });
 
-  it("renders the preset label text on the billboard", () => {
+  it("renders the preset label text, plus the local user's name, on the billboard", () => {
     tool.cycleLabel(); // -> "Anomaly"
     place();
     tool.render(renderer);
 
     const entry = [...tool._markerActors.values()][0];
-    expect(entry.label.getText()).toBe(tool.getPendingLabel());
+    // Own-echo/local-optimistic marker: authorName came from getUserName()
+    // (mocked to "Alice" in this file), matching what confirmDraft's
+    // _createAnnotation() actually stores.
+    expect(entry.label.getText()).toBe(`${tool.getPendingLabel()} — Alice`);
   });
 
   it("does not rebuild actors when the annotation count is unchanged", () => {

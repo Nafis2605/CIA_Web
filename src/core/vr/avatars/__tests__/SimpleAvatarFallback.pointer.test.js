@@ -17,6 +17,9 @@ vi.mock("../AvatarLabel.js", () => ({
     setPosition() {}
     setVisible() {}
     setSpeaking() {}
+    // Keeps the name tag at a constant apparent size against the local
+    // viewer's vrScale, the same way the body and hit marker do.
+    setScale() {}
     faceToward() {}
     dispose() {}
   },
@@ -68,6 +71,39 @@ describe("SimpleAvatarFallback — pointer ray + surface hit marker", () => {
       // hsl on purpose: this is exactly what getUserColor() emits.
       color: "hsl(210, 70%, 60%)",
     });
+  });
+
+  it("scales the BODY by the local viewer's 1/vrScale, not just the hit marker", () => {
+    // The head/hand sources are authored in physical metres but live in scene
+    // units, which are metres / vrScale. Only the hit marker used to
+    // compensate, so a peer's body disagreed with their own pointer dot: at
+    // detail zoom the head ballooned over the dataset, at room scale it shrank
+    // away, and two headsets at different scales saw each other at different
+    // sizes.
+    avatar.updatePose(
+      makePose({
+        leftHand: { position: { x: -0.2, y: 1.2, z: 0 }, visible: true },
+        rightHand: { position: { x: 0.2, y: 1.2, z: 0 }, visible: true },
+      }),
+      4
+    );
+
+    expect(avatar._headActor.getScale()[0]).toBeCloseTo(0.25);
+    expect(avatar._leftHandActor.getScale()[0]).toBeCloseTo(0.25);
+    expect(avatar._rightHandActor.getScale()[0]).toBeCloseTo(0.25);
+  });
+
+  it("keeps body and hit marker at the SAME scale so the dot stays on the hand", () => {
+    avatar.updatePose(makePose({ pointerHit: { x: 0, y: 1, z: -2 } }), 4);
+
+    expect(avatar._hitMarkerActor.getScale()[0]).toBeCloseTo(
+      avatar._headActor.getScale()[0]
+    );
+  });
+
+  it("defaults to unit scale when no vrScale is supplied", () => {
+    avatar.updatePose(makePose());
+    expect(avatar._headActor.getScale()[0]).toBeCloseTo(1);
   });
 
   it("adds every actor to the renderer (vtk.js freezes actors — stashing state on one aborts create)", () => {

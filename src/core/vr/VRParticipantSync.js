@@ -21,11 +21,29 @@ import { getUserId } from '@Collaboration/presence/userManagement.js';
 export const POSE_THROTTLE_MS = 50;
 
 /**
- * A participant whose last write is older than this is treated as gone.
- * Deliberately >2x the 5 s staleness the renderers use to fade an avatar, so
- * a brief network stall greys someone out before it evicts them.
+ * A participant whose last write is older than this is treated as STALE:
+ * greyed out in the roster and faded by the renderers, but still present.
+ * Deliberately >2x the 5 s staleness the renderers use to fade an avatar.
  */
 export const PARTICIPANT_STALE_MS = 10000;
+
+/**
+ * How long a participant may stay silent before we drop them entirely.
+ *
+ * A graceful exit does NOT wait for this: leaving VR deletes the peer's own
+ * key (see stop()/rekey()), which every other client sees as a Y.js 'delete'
+ * and handles immediately. This timeout is only the backstop for an UNGRACEFUL
+ * departure — crash, headset sleep, browser killed — which leaves the key
+ * behind with nobody to remove it.
+ *
+ * It used to be PARTICIPANT_STALE_MS, i.e. a peer was destroyed after 10 s of
+ * silence. That is well within a normal hiccup once traffic runs over a tunnel
+ * or a congested LAN: the avatar's actors were torn down and the roster row
+ * vanished, then both were rebuilt from scratch when the next pose packet
+ * landed. Generous here because the cost of waiting is one greyed row, while
+ * the cost of being wrong is a peer visibly popping out of the world.
+ */
+export const PARTICIPANT_GONE_MS = 60000;
 
 /** How often the stale sweep may run (it walks the whole map). */
 const STALE_SWEEP_INTERVAL_MS = 1000;
@@ -221,7 +239,15 @@ export class VRParticipantSync {
   }
 
   /**
-   * Evict participants whose last write is older than PARTICIPANT_STALE_MS.
+   * Drop participants who have been silent longer than PARTICIPANT_GONE_MS.
+   *
+   * Silence between PARTICIPANT_STALE_MS and PARTICIPANT_GONE_MS is NOT a
+   * removal: getRemoteParticipants() already reports isStale from the same
+   * timestamps, so the roster greys the row (VRSpatialMenuModel disables stale
+   * entries) and the avatar controller fades the body on its own timer. Both
+   * recover instantly when packets resume, with no actor churn. Only a peer
+   * that has gone quiet for a full minute — i.e. crashed rather than stalled —
+   * is actually removed.
    *
    * LOCAL ONLY — deliberately does NOT delete the Y.js key. Every client runs
    * this sweep on the same shared map, so writing the delete here would have N
@@ -239,8 +265,9 @@ export class VRParticipantSync {
       if (odUserId === this._localUserId) return;
 
       const timestamp = data?.timestamp || 0;
-      if (nowMs - timestamp <= PARTICIPANT_STALE_MS) {
-        // Alive again (or never stale) — re-arm the one-shot notification.
+      if (nowMs - timestamp <= PARTICIPANT_GONE_MS) {
+        // Present, or merely stale — either way still a participant. Re-arm
+        // the one-shot notification.
         this._staleNotified.delete(odUserId);
         return;
       }

@@ -37,6 +37,7 @@ import {
   VRParticipantSync,
   POSE_THROTTLE_MS,
   PARTICIPANT_STALE_MS,
+  PARTICIPANT_GONE_MS,
 } from "../VRParticipantSync.js";
 import {
   VRExplorationSession,
@@ -180,51 +181,73 @@ describe("VRParticipantSync", () => {
     expect(p.vrScale).toBe(5);
   });
 
-  it("dispatches cia:vr-participant-left for entries older than PARTICIPANT_STALE_MS", () => {
+  it("KEEPS a merely-stale peer — a network stall must not evict them", () => {
+    // The regression this whole group exists for. A peer silent for longer than
+    // PARTICIPANT_STALE_MS used to be removed outright: their avatar actors were
+    // torn down and their roster row vanished, then both were rebuilt when the
+    // next pose packet arrived. Over a tunnel a 10 s gap is an ordinary hiccup,
+    // so peers visibly popped in and out of the world. Staleness is now a
+    // DISPLAY state (getRemoteParticipants reports isStale; the roster greys the
+    // row) and only a full PARTICIPANT_GONE_MS silence actually removes anyone.
     const now = Date.now();
-    const map = sync._yParticipants;
-    map.set("fresh-user", { odUserId: "fresh-user", timestamp: now - 1000 });
-    map.set("stale-user", { odUserId: "stale-user", timestamp: now - PARTICIPANT_STALE_MS - 1 });
-    session.addParticipant("stale-user", "Ghost", "#333");
+    sync._yParticipants.set("stalled-user", {
+      odUserId: "stalled-user",
+      timestamp: now - PARTICIPANT_STALE_MS - 1,
+    });
+    session.addParticipant("stalled-user", "Stalled", "#333");
 
     const evicted = sync.sweepStaleParticipants(now);
 
-    expect(evicted).toEqual(["stale-user"]);
-    expect(leaveEvents).toEqual(["stale-user"]);
-    expect(session.getParticipant("stale-user")).toBeUndefined();
+    expect(evicted).toEqual([]);
+    expect(leaveEvents).toEqual([]);
+    expect(session.getParticipant("stalled-user")).toBeDefined();
+  });
+
+  it("dispatches cia:vr-participant-left for entries older than PARTICIPANT_GONE_MS", () => {
+    const now = Date.now();
+    const map = sync._yParticipants;
+    map.set("fresh-user", { odUserId: "fresh-user", timestamp: now - 1000 });
+    map.set("gone-user", { odUserId: "gone-user", timestamp: now - PARTICIPANT_GONE_MS - 1 });
+    session.addParticipant("gone-user", "Ghost", "#333");
+
+    const evicted = sync.sweepStaleParticipants(now);
+
+    expect(evicted).toEqual(["gone-user"]);
+    expect(leaveEvents).toEqual(["gone-user"]);
+    expect(session.getParticipant("gone-user")).toBeUndefined();
     expect(session.getParticipant("local-user")).toBeDefined();
   });
 
   it("does NOT delete the Y.js key — N clients would race on the same delete", () => {
     const now = Date.now();
-    sync._yParticipants.set("stale-user", {
-      odUserId: "stale-user",
-      timestamp: now - PARTICIPANT_STALE_MS - 1,
+    sync._yParticipants.set("gone-user", {
+      odUserId: "gone-user",
+      timestamp: now - PARTICIPANT_GONE_MS - 1,
     });
 
     sync.sweepStaleParticipants(now);
 
     // Present locally-evicted, still in the shared map: pruning is the host's job.
-    expect(sync._yParticipants.get("stale-user")).toBeDefined();
+    expect(sync._yParticipants.get("gone-user")).toBeDefined();
   });
 
-  it("announces a stale peer only once, and re-arms if they come back", () => {
+  it("announces a departed peer only once, and re-arms if they come back", () => {
     const now = Date.now();
-    sync._yParticipants.set("stale-user", {
-      odUserId: "stale-user",
-      timestamp: now - PARTICIPANT_STALE_MS - 1,
+    sync._yParticipants.set("gone-user", {
+      odUserId: "gone-user",
+      timestamp: now - PARTICIPANT_GONE_MS - 1,
     });
 
     sync.sweepStaleParticipants(now);
     sync.sweepStaleParticipants(now + 1000);
     sync.sweepStaleParticipants(now + 2000);
-    expect(leaveEvents).toEqual(["stale-user"]);
+    expect(leaveEvents).toEqual(["gone-user"]);
 
     // They write again → the latch clears and a later absence re-announces.
-    sync._yParticipants.set("stale-user", { odUserId: "stale-user", timestamp: now + 3000 });
+    sync._yParticipants.set("gone-user", { odUserId: "gone-user", timestamp: now + 3000 });
     sync.sweepStaleParticipants(now + 3000);
-    sync.sweepStaleParticipants(now + 3000 + PARTICIPANT_STALE_MS + 1);
-    expect(leaveEvents).toEqual(["stale-user", "stale-user"]);
+    sync.sweepStaleParticipants(now + 3000 + PARTICIPANT_GONE_MS + 1);
+    expect(leaveEvents).toEqual(["gone-user", "gone-user"]);
   });
 
   it("never evicts the local user, however old their own last write is", () => {

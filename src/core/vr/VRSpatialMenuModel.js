@@ -47,7 +47,9 @@ import {
  *   - "nav-mode-set":      toggles a specific locomotion mode on/off (grab/walk)
  *   - "scale":             jumps to a fixed vrScale preset
  *   - "representation":    cycles surface→wireframe→points (same as desktop menu)
- *   - "glyph-toggle":      toggles vector/scalar glyphs (same as desktop menu)
+ *   - "glyph-type-set":    selects a specific glyph type, or disables glyphs
+ *                          (mode === null) — same VTKGlyphFeature API + type
+ *                          set as the desktop glyph menu
  *   - "snapshot-save":     quick-saves a session snapshot
  *   - "snapshot-load":     cycles to the next saved snapshot and loads it
  *   - "voice-mute":        toggles the local participant's voice mute state
@@ -94,6 +96,13 @@ export const VR_MENU_BUTTONS = Object.freeze([
   // there was nowhere to put threshold/isosurface at all. See VR_MENU_DRAWERS.
   { id: "appearance", label: "Style", icon: "cube", kind: "drawer", drawerId: "appearance", row: 2, group: "VIEW" },
   { id: "filters", label: "Filters", icon: "filter", kind: "drawer", drawerId: "filters", row: 2, group: "VIEW" },
+  // Promoted to a top-level button (was a buried on/off toggle inside the
+  // "advanced" drawer, "glyph-toggle" — see VR_MENU_DRAWERS.glyphTypes) so
+  // glyph TYPE selection is directly reachable, matching Style/Filters.
+  // id matches drawerId exactly, same convention as appearance/filters/
+  // people/advanced above — several tests/call sites open a drawer via
+  // model.activate(drawerId), which only works when the two agree.
+  { id: "glyphTypes", label: "Glyphs", icon: "arrowUpRight", kind: "drawer", drawerId: "glyphTypes", row: 2, group: "VIEW" },
   // ---- Row 4 — SESSION: the essential session controls ---------------------
   // Less-frequent scene, snapshot, voice and alternate-navigation actions
   // live in the Advanced drawer. Keeping the default surface to four rows
@@ -172,12 +181,26 @@ export const VR_MENU_DRAWERS = Object.freeze({
     { id: "control-grant", label: "Give", icon: "share", kind: "control-grant", drawerRow: 0, group: "SESSION" },
     { id: "control-release", label: "Release", icon: "unlock", kind: "control-release", drawerRow: 0, group: "SESSION" },
   ]),
+  // The 6 real vtk.js glyph shapes desktop's glyph menu already offers
+  // (VTKInstanceHandler.js glyph-menu options — vtkArrowSource/ConeSource/
+  // SphereSource/CubeSource/CylinderSource; "dot" is a small vtkSphereSource),
+  // plus one explicit "Off" cell replacing the old bare on/off toggle. A
+  // single kind ("glyph-type-set") for everything here, so type-selection and
+  // enable/disable can't fall out of sync with each other.
+  glyphTypes: Object.freeze([
+    { id: "glyph-arrow", label: "Arrow", icon: "arrowUpRight", kind: "glyph-type-set", mode: "arrow", drawerRow: 0, group: "VIEW" },
+    { id: "glyph-cone", label: "Cone", icon: "triangle", kind: "glyph-type-set", mode: "cone", drawerRow: 0, group: "VIEW" },
+    { id: "glyph-sphere", label: "Sphere", icon: "circle", kind: "glyph-type-set", mode: "sphere", drawerRow: 0, group: "VIEW" },
+    { id: "glyph-cube", label: "Cube", icon: "square", kind: "glyph-type-set", mode: "cube", drawerRow: 0, group: "VIEW" },
+    { id: "glyph-cylinder", label: "Cylinder", icon: "database", kind: "glyph-type-set", mode: "cylinder", drawerRow: 1, group: "VIEW" },
+    { id: "glyph-dot", label: "Dot", icon: "dotsHorizontal", kind: "glyph-type-set", mode: "dot", drawerRow: 1, group: "VIEW" },
+    { id: "glyph-off", label: "Off", icon: "eyeOff", kind: "glyph-type-set", mode: null, drawerRow: 1, group: "VIEW" },
+  ]),
   // Controls intentionally kept off the default surface so the core menu is
   // readable on Quest 2. Nothing is removed; the existing dispatch paths are
   // reused unchanged when this drawer is open.
   advanced: Object.freeze([
     { id: "walk", label: "Walk", icon: "footprints", kind: "nav-mode-set", mode: "walk", drawerRow: 0, group: "MOVE" },
-    { id: "glyphs", label: "Glyphs", icon: "arrowUpRight", kind: "glyph-toggle", drawerRow: 0, group: "VIEW" },
     { id: "voice-join", label: "Voice", icon: "headsetMic", kind: "voice-join", drawerRow: 0, group: "SESSION" },
     { id: "voice-mute", label: "Mute", icon: "mic", kind: "voice-mute", drawerRow: 0, group: "SESSION" },
     { id: "grid", label: "Views", icon: "layoutGrid", kind: "toggle", drawerRow: 1, group: "SCENE" },
@@ -623,8 +646,8 @@ export class VRSpatialMenuModel {
         return this._cycleRepresentation();
       case "representation-set":
         return this._setRepresentation(btn.mode);
-      case "glyph-toggle":
-        return this._toggleGlyphs();
+      case "glyph-type-set":
+        return this._setGlyphType(btn.mode);
       // --- Scene chrome (data reference grid + labelled axes) ---------------
       case "scene-grid":
         return this._toggleReferenceGrid();
@@ -1005,11 +1028,19 @@ export class VRSpatialMenuModel {
     return { handled: true, action: "measure-new-path", path: path ?? null };
   }
 
-  /** Toggles glyphs via the same desktop VTKGlyphFeature (VRExplorationManager.toggleGlyphs). */
-  _toggleGlyphs() {
-    const enabled = !!this._call("toggleGlyphs");
-    this._holdDeferred("glyphs", enabled);
-    return { handled: true, action: "glyphs-toggled", enabled };
+  /**
+   * Select a glyph type (or disable with mode === null) via the same desktop
+   * VTKGlyphFeature API (VRExplorationManager.setGlyphType). The "glyphs"
+   * deferred-hold key is shared with the type-set buttons' active-state read
+   * in getButtonStates() — held as the TYPE ID (or null), not a boolean, so
+   * the just-tapped shape lights immediately instead of waiting out
+   * _deferHeavy's async enable/rebuild.
+   * @private
+   */
+  _setGlyphType(typeId) {
+    const accepted = !!this._call("setGlyphType", typeId);
+    if (accepted) this._holdDeferred("glyphs", typeId);
+    return { handled: true, action: "glyph-type-set", typeId, accepted };
   }
 
   /** Inverts the active Clip tool's plane direction (VRExplorationManager.invertClipPlane). */
@@ -1303,7 +1334,14 @@ export class VRSpatialMenuModel {
    */
   isVisible() {
     if (this._visible) return true;
-    return !!this._call("getAnnotationDraft")?.active;
+    if (this._call("getAnnotationDraft")?.active) return true;
+    // A manipulation-lock block or a persistence failure (see
+    // VRExplorationManager._flashVRNotice) used to only ever appear if the
+    // panel already happened to be open — a user who had closed it (or never
+    // opened it) got no indication their action was silently refused. The
+    // notice is inherently transient (VR_NOTICE_MS), so force-showing the
+    // panel while one is live costs nothing once it expires.
+    return !!this._call("getVRNotice");
   }
 
   /**
@@ -1510,8 +1548,16 @@ export class VRSpatialMenuModel {
       else if (btn.kind === "threshold-mode" || btn.kind === "threshold-array") {
         disabled = !this._call("isThresholdEnabled");
       }
-      else if (btn.kind === "glyph-toggle") {
-        active = this._readDeferredHold("glyphs", !!this._call("isGlyphsEnabled"));
+      // Exact match against the LIVE type, same convention as
+      // representation-set: only the cell matching the current shape lights,
+      // "Off" lights when glyphs are disabled (currentType is null/undefined).
+      else if (btn.kind === "glyph-type-set") {
+        const currentType = this._readDeferredHold("glyphs", this._call("getGlyphType"));
+        active = btn.mode === null ? currentType == null : currentType === btn.mode;
+        if (btn.mode !== null) {
+          const disabledTypes = this._call("getDisabledGlyphTypeIds") || [];
+          disabled = disabledTypes.includes(btn.mode);
+        }
       }
       else if (btn.kind === "probe-continuous") active = !!this._call("isProbeContinuous");
       // Only meaningful once connected: voiceRoomService.isMuted initialises to
@@ -1572,6 +1618,21 @@ export class VRSpatialMenuModel {
     const notice = this._call("getVRNotice");
     if (typeof notice === "string" && notice.length) {
       return notice;
+    }
+
+    // Which array is driving glyph orientation is otherwise invisible in VR —
+    // it's auto-picked (the dataset's first vector array) and desktop's
+    // equivalent label (`Glyphs: ${glyphType}`, VTKInstanceHandler.js) never
+    // had a VR counterpart. That silence is why VR glyphs read as "random":
+    // arrows point along whatever array happened to be first, with no way to
+    // tell which one or that you're looking at a default rather than a choice.
+    if (this._openDrawerId === "glyphTypes") {
+      const glyphType = this._call("getGlyphType");
+      const orientationArray = this._call("getGlyphOrientationArray");
+      if (!glyphType) return "Glyphs: off";
+      return orientationArray
+        ? `Glyphs: ${glyphType} — oriented by "${orientationArray}"`
+        : `Glyphs: ${glyphType}`;
     }
 
     const name = this._call("getActiveDatasetName") || "Dataset";

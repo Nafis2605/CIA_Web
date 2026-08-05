@@ -111,6 +111,38 @@ describe("VRMeasureTool — measurement rendering", () => {
     // ENDPOINT_APPARENT_RADIUS_M (0.012) / vrScale (2) = 0.006
     expect(tool._pointActors[0].getScale()[0]).toBeCloseTo(0.006);
   });
+
+  it("recognizes a second pinch as a fresh rising edge when the controller disappears between presses (Vision Pro release)", () => {
+    // Gripless/transient-pointer input (Apple Vision Pro) only reports a
+    // controller in inputState.controllers.right while a pinch is physically
+    // held — release makes it vanish entirely, unlike a tracked controller
+    // (Quest) whose object persists with triggerPressed: false. Deliberately
+    // does NOT manually reset _lastTriggerState (unlike placeStart/placeEnd
+    // above) so the release itself is what has to clear the latch.
+    const startAction = tool.handleInput(makeInputState({ triggerPressed: true }), {});
+    expect(startAction).toMatchObject({ type: "measurement-start-placed" });
+
+    // Release: the transient-pointer source disappears entirely.
+    tool.handleInput({ controllers: {} }, {});
+
+    const endAction = tool.handleInput(makeInputState({ triggerPressed: true }), {});
+    expect(endAction).toMatchObject({ type: "measurement-created" });
+  });
+
+  it("getMeasurementState reports idle when the tool is not active", async () => {
+    // `if (!this.isActive)` (no call) is a bound-method reference, always
+    // truthy, so this branch never took — the status line reported
+    // 'placing-start' even for a deactivated tool with no points. `isActive()`
+    // is the real check (VRToolInterface.js).
+    await tool.deactivate();
+    expect(tool.getMeasurementState()).toBe("idle");
+  });
+
+  it("getMeasurementState reflects point count once active", () => {
+    expect(tool.getMeasurementState()).toBe("placing-start");
+    placeStart();
+    expect(tool.getMeasurementState()).toBe("placing-end");
+  });
 });
 
 describe("VRMeasureTool — chained polyline", () => {

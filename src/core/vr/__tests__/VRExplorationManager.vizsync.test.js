@@ -66,9 +66,11 @@ vi.mock("@Core/instances/types/vtk/features/VTKGlyphFeature.js", () => ({
     getState: vi.fn(() => mockGlyphState),
     enableGlyphs: vi.fn(),
     disableGlyphs: vi.fn(),
+    setGlyphType: vi.fn(),
     getConfigForSync: vi.fn(() => mockGlyphConfig),
   },
   isGlyphFeatureAvailable: vi.fn(() => true),
+  getDisabledGlyphTypes: vi.fn(() => []),
 }));
 
 vi.mock("@VTK/vtkInstanceTools.js", () => ({
@@ -85,14 +87,22 @@ vi.mock("@Services/visualizationSyncService.js", () => ({
 
 import { vrExplorationManager } from "../VRExplorationManager.js";
 import { instanceTools } from "@VTK/vtkInstanceTools.js";
-import { vtkGlyphFeature } from "@Core/instances/types/vtk/features/VTKGlyphFeature.js";
+import {
+  vtkGlyphFeature,
+  getDisabledGlyphTypes,
+} from "@Core/instances/types/vtk/features/VTKGlyphFeature.js";
 
 describe("VRExplorationManager — VR visualization sync (clip/representation/glyphs)", () => {
   beforeEach(() => {
     mockPush.mockClear();
     vi.mocked(instanceTools.setRepresentation).mockClear();
     vi.mocked(vtkGlyphFeature.enableGlyphs).mockClear();
+    vi.mocked(vtkGlyphFeature.disableGlyphs).mockClear();
+    vi.mocked(vtkGlyphFeature.setGlyphType).mockClear();
+    vi.mocked(getDisabledGlyphTypes).mockReturnValue([]);
     mockGlyphState.enabled = false;
+    mockGlyphState.vectorArrays = [{ name: "velocity" }];
+    mockGlyphState.scalarArrays = [];
     // cycleRepresentation/toggleGlyphs now defer their expensive call to the
     // end of the next XR frame (see VRExplorationManager._deferHeavy) —
     // start each test with an empty queue so one test's leftover deferred
@@ -182,6 +192,70 @@ describe("VRExplorationManager — VR visualization sync (clip/representation/gl
 
     expect(vtkGlyphFeature.disableGlyphs).toHaveBeenCalledWith("inst-1");
     expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig });
+  });
+
+  // setGlyphType exposes the SAME desktop VTKGlyphFeature API as toggleGlyphs
+  // above (mirrors VTKGlyphFeature.test.js's own setGlyphType coverage at the
+  // manager layer) — but lets the caller pick a shape rather than always
+  // auto-picking arrow-or-sphere, which is what made VR glyphs look "random".
+  describe("setGlyphType", () => {
+    it("enables WITH the requested type when not yet enabled, deferred", () => {
+      const accepted = vrExplorationManager.setGlyphType("cone");
+      expect(accepted).toBe(true);
+
+      expect(vtkGlyphFeature.enableGlyphs).not.toHaveBeenCalled();
+      expect(mockPush).not.toHaveBeenCalled();
+
+      vrExplorationManager._drainDeferredWork();
+
+      expect(vtkGlyphFeature.enableGlyphs).toHaveBeenCalledWith(
+        "inst-1",
+        { fake: true },
+        expect.objectContaining({ glyphType: "cone", orientationArray: "velocity" })
+      );
+      expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig });
+    });
+
+    it("swaps the shape synchronously (not deferred) when glyphs are already enabled", () => {
+      mockGlyphState.enabled = true;
+      const accepted = vrExplorationManager.setGlyphType("sphere");
+      expect(accepted).toBe(true);
+
+      // Cheap — setGlyphType only rebuilds the glyph source, not the mapper —
+      // so unlike the initial enable above it runs immediately, no drain needed.
+      expect(vtkGlyphFeature.setGlyphType).toHaveBeenCalledWith("inst-1", "sphere");
+      expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig });
+    });
+
+    it("disables with typeId === null, same as toggleGlyphs' disable branch", () => {
+      mockGlyphState.enabled = true;
+      const accepted = vrExplorationManager.setGlyphType(null);
+      expect(accepted).toBe(true);
+      expect(vtkGlyphFeature.disableGlyphs).not.toHaveBeenCalled();
+
+      vrExplorationManager._drainDeferredWork();
+
+      expect(vtkGlyphFeature.disableGlyphs).toHaveBeenCalledWith("inst-1");
+      expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig });
+    });
+
+    it("refuses a type requiring orientation when the dataset has no vector array", () => {
+      vi.mocked(getDisabledGlyphTypes).mockReturnValue(["arrow"]);
+      const accepted = vrExplorationManager.setGlyphType("arrow");
+
+      expect(accepted).toBe(false);
+      expect(vtkGlyphFeature.enableGlyphs).not.toHaveBeenCalled();
+      expect(vtkGlyphFeature.setGlyphType).not.toHaveBeenCalled();
+      // Refusal is reported, not silent — see the notice-visibility fix.
+      expect(vrExplorationManager.getVRNotice()).toMatch(/vector array/i);
+    });
+
+    it("returns false without an active context and never throws", () => {
+      vrExplorationManager._activeContext = null;
+      expect(() => vrExplorationManager.setGlyphType("arrow")).not.toThrow();
+      expect(vrExplorationManager.setGlyphType("arrow")).toBe(false);
+      expect(mockPush).not.toHaveBeenCalled();
+    });
   });
 
   it("no-ops without an active context and never throws", () => {

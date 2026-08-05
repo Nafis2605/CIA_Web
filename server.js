@@ -8,6 +8,19 @@
 // - PostgreSQL stores snapshots (fast hydration), updates (recording), chat (audit)
 // - Datasets, views, annotations use REST API (not Y.js)
 
+// MUST precede the auth middleware require below, which computes
+// DEV_BYPASS_AUTH once at import time from NODE_ENV + DEV_BYPASS_AUTH.
+// Started as a bare `node server.js` (package.json "websocket"), nothing else
+// loaded .env for it, so both read as unset and DEV_BYPASS_AUTH was false —
+// meaning authenticateSocket() closed EVERY Y.js connection with 1008
+// "Missing access token". Y.js carries all collaboration state (avatar poses,
+// participant roster, visualization sync), so multi-user collaboration was
+// entirely dead in dev while the app otherwise looked healthy.
+//
+// NOTE the PORT handling further down: .env defines PORT for the API server,
+// so this file deliberately reads YJS_PORT instead of inheriting it.
+require("dotenv").config();
+
 const WebSocket = require("ws");
 const http = require("http");
 const Y = require("yjs");
@@ -1127,7 +1140,11 @@ wss.on("connection", async (socket, req) => {
 // Listen for awareness changes to broadcast
 // This is done per-room when clients join
 
-const PORT = process.env.PORT || 9001;
+// Deliberately NOT process.env.PORT. Now that this file loads .env (see the
+// note at the top), the generic PORT there belongs to the API server on 3001 —
+// inheriting it would make the Y.js server fight the API for the same port and
+// fail to bind. Use YJS_PORT to override.
+const PORT = process.env.YJS_PORT || 9001;
 
 // Refresh active recordings cache on startup
 refreshActiveRecordings();

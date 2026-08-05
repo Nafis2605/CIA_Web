@@ -87,14 +87,22 @@ export class VRMeasureTool extends VRToolInterface {
 
   handleInput(inputState, frame) {
     const rightCtrl = inputState.controllers?.right;
-    if (!rightCtrl) return null;
 
     // Rising-edge detection, updated BEFORE acting on it: the placement branch
     // returns early, so updating afterwards never ran on a successful
     // placement and re-armed every frame the trigger stayed down.
-    const triggerPressed = !!rightCtrl.triggerPressed;
+    //
+    // Update the latch even when rightCtrl is absent — a gripless/
+    // transient-pointer source (Vision Pro) only exists in inputState while
+    // a pinch is physically held, so it vanishes on every release. Bailing
+    // out before this update left the latch stuck at `true` from the last
+    // pinch that reached it, so no later pinch could ever read as a fresh
+    // rising edge again.
+    const triggerPressed = !!rightCtrl?.triggerPressed;
     const triggerRisingEdge = triggerPressed && !this._lastTriggerState;
     this._lastTriggerState = triggerPressed;
+
+    if (!rightCtrl) return null;
 
     if (triggerRisingEdge) {
       // Data-control gate — see the identical check in VRAnnotationTool:
@@ -465,7 +473,9 @@ export class VRMeasureTool extends VRToolInterface {
    * @returns {'idle'|'placing-start'|'placing-end'}
    */
   getMeasurementState() {
-    if (!this.isActive) return 'idle';
+    // `this.isActive` (no call) is a bound-method reference, always truthy —
+    // this branch never took. `isActive()` is the real check (VRToolInterface.js).
+    if (!this.isActive()) return 'idle';
     return this._points.length ? 'placing-end' : 'placing-start';
   }
 }

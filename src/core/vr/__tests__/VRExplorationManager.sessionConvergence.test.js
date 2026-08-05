@@ -131,7 +131,10 @@ import { workspaceManager } from "@Core/instances/workspaceManager.js";
 import { apiClient } from "@Services/apiClient.js";
 import { yVRSessions, getVRSessionForView } from "@Collaboration/yjs/yjsSetup.js";
 
-function makeInstance(viewConfigId, instanceId) {
+// datasetId defaults to "ds-1" (matching most tests below); pass null to
+// simulate an instance with no dataset metadata attached yet, which is what
+// exercises the viewConfigId fallback in _resolveSessionKey.
+function makeInstance(viewConfigId, instanceId, datasetId = "ds-1") {
   const handler = {
     supportsVRExploration: vi.fn(() => true),
     getWebGLContext: vi.fn(() => ({})),
@@ -142,7 +145,7 @@ function makeInstance(viewConfigId, instanceId) {
     handler,
     viewConfigId,
     instanceData: {
-      dataset: { id: "ds-1" },
+      dataset: datasetId ? { id: datasetId } : null,
       projectId: null,
       hasData: true,
     },
@@ -179,7 +182,9 @@ describe("VRExplorationManager — session convergence (Y.js vr-sessions registr
       "/vr/sessions",
       expect.objectContaining({ viewConfigurationId: "view-1" })
     );
-    expect(getVRSessionForView("view-1")?.sessionId).toBe("server-session-1");
+    // Registry key is the resolved session key (datasetId, since it's present
+    // here) — see _resolveSessionKey — not the raw viewConfigId.
+    expect(getVRSessionForView("ds-1")?.sessionId).toBe("server-session-1");
 
     apiClient.post.mockClear();
 
@@ -191,6 +196,52 @@ describe("VRExplorationManager — session convergence (Y.js vr-sessions registr
 
     expect(second.id).toBe("server-session-1"); // adopted, not minted fresh
     expect(second.ownerUserId).toBe("user-1"); // host from the registry record
+    expect(apiClient.post).not.toHaveBeenCalled();
+  });
+
+  // Regression test for the multi-headset bug: each client's ViewConfiguration
+  // UUID is minted independently by its own createView()/POST /views call, so
+  // two Quest headsets opening the SAME dataset in the SAME room never share a
+  // viewConfigId — only datasetId is common between them. Keying convergence
+  // on viewConfigId (the old behaviour) meant they'd claim two different
+  // registry slots and could never see each other's avatars/poses.
+  it("two clients with the same datasetId but different viewConfigId converge on one sessionId", async () => {
+    workspaceManager.getInstance.mockReturnValueOnce(makeInstance("view-A", "inst-1", "ds-shared"));
+
+    const first = await vrExplorationManager.startExploration("inst-1", {});
+    expect(first.id).toBe("server-session-1");
+    expect(getVRSessionForView("ds-shared")?.sessionId).toBe("server-session-1");
+
+    apiClient.post.mockClear();
+
+    // Second headset: DIFFERENT viewConfigId (its own local ViewConfiguration),
+    // SAME datasetId — the actual real-world shape of the bug.
+    workspaceManager.getInstance.mockReturnValueOnce(makeInstance("view-B", "inst-2", "ds-shared"));
+
+    const second = await vrExplorationManager.startExploration("inst-2", {});
+
+    expect(second.id).toBe("server-session-1"); // adopted the first client's session
+    expect(second.ownerUserId).toBe("user-1"); // host from the registry record
+    expect(apiClient.post).not.toHaveBeenCalled(); // no second server registration
+  });
+
+  // The other half of _resolveSessionKey: an instance with no dataset id yet
+  // (e.g. handler hasn't attached dataset metadata) must still converge —
+  // via the viewConfigId fallback — rather than claiming a garbage/undefined
+  // key.
+  it("falls back to viewConfigId when the instance has no datasetId", async () => {
+    workspaceManager.getInstance.mockReturnValueOnce(makeInstance("view-1", "inst-1", null));
+
+    const first = await vrExplorationManager.startExploration("inst-1", {});
+    expect(first.id).toBe("server-session-1");
+    expect(getVRSessionForView("view-1")?.sessionId).toBe("server-session-1");
+
+    apiClient.post.mockClear();
+
+    workspaceManager.getInstance.mockReturnValueOnce(makeInstance("view-1", "inst-2", null));
+
+    const second = await vrExplorationManager.startExploration("inst-2", {});
+    expect(second.id).toBe("server-session-1");
     expect(apiClient.post).not.toHaveBeenCalled();
   });
 
@@ -206,7 +257,7 @@ describe("VRExplorationManager — session convergence (Y.js vr-sessions registr
     // this point (its ~3s window hasn't elapsed).
     const winningRecord = {
       sessionId: "vrsession_winner",
-      viewConfigurationId: "view-1",
+      viewConfigurationId: "ds-1",
       hostUserId: "user-2",
       hostUserName: "Other User",
       datasetId: "ds-1",
@@ -215,7 +266,8 @@ describe("VRExplorationManager — session convergence (Y.js vr-sessions registr
       lastHeartbeat: Date.now(),
       participantCount: 1,
     };
-    yVRSessions.set("view-1", winningRecord);
+    // Registry key is the resolved session key ("ds-1"), not "view-1".
+    yVRSessions.set("ds-1", winningRecord);
 
     expect(session.id).toBe("vrsession_winner");
     expect(session.id).not.toBe(ourId);

@@ -234,16 +234,20 @@ export class VRControllerRenderer {
   }
 
   /**
-   * Show a small dot where the transient-pointer's gaze ray hits the data;
-   * hidden for regular tracked-pointer controllers (their persistent ray is
-   * feedback enough) and on miss.
+   * Show a small dot where the controller's ray currently hits the data, on
+   * either input type. This used to be Vision Pro-only, on the assumption
+   * that a tracked controller's persistent ray line was "feedback enough" —
+   * it isn't: the ray line (_rayLength, below) is drawn at a fixed length
+   * regardless of whether raycastVR is actually hitting anything, so a Quest
+   * user had no way to tell "will my trigger register here" before pulling
+   * it, and no way to distinguish a genuine miss from a broken picker. Hidden
+   * on miss for both input types.
    */
   _updateReticle(inputState) {
     const ctrl =
       inputState.controllers?.right || inputState.controllers?.left;
 
-    const isTransient = ctrl?.targetRayMode === "transient-pointer";
-    if (!isTransient || !ctrl?.targetRay || !this._raycast) {
+    if (!ctrl?.targetRay || !this._raycast) {
       this._reticle?.setVisibility(false);
       return;
     }

@@ -63,6 +63,10 @@ function makeManager(overrides = {}) {
     getRepresentation: vi.fn(() => "surface"),
     toggleGlyphs: vi.fn(() => true),
     isGlyphsEnabled: vi.fn(() => false),
+    setGlyphType: vi.fn(() => true),
+    getGlyphType: vi.fn(() => null),
+    getDisabledGlyphTypeIds: vi.fn(() => []),
+    getGlyphOrientationArray: vi.fn(() => null),
     invertClipPlane: vi.fn(),
     resetClipPlane: vi.fn(),
     cycleAnnotationColor: vi.fn(() => "Red"),
@@ -426,15 +430,41 @@ describe("VRSpatialMenuModel — action dispatch", () => {
     expect(manager.setRepresentation).not.toHaveBeenCalled();
   });
 
-  it("glyphs button toggles via manager.toggleGlyphs", () => {
-    model.activate("advanced");
-    const r1 = model.activate("glyphs");
-    expect(manager.toggleGlyphs).toHaveBeenCalledTimes(1);
-    expect(r1).toMatchObject({ handled: true, action: "glyphs-toggled", enabled: true });
+  it("glyph-types drawer opens from the top-level Glyphs button, not from 'advanced'", () => {
+    // Promoted out of the "advanced"/More drawer to a top-level button next
+    // to Style/Filters — see VR_MENU_BUTTONS. "glyphs" is no longer a valid
+    // button id at all (replaced by one id per shape, e.g. "glyph-arrow").
+    const opened = model.activate("glyphTypes");
+    expect(opened).toMatchObject({ handled: true, action: "drawer-toggled", drawerId: "glyphTypes", open: true });
 
-    manager.toggleGlyphs.mockReturnValue(false);
-    const r2 = model.activate("glyphs");
-    expect(r2).toMatchObject({ handled: true, action: "glyphs-toggled", enabled: false });
+    const r = model.activate("glyph-arrow");
+    expect(manager.setGlyphType).toHaveBeenCalledWith("arrow");
+    expect(r).toMatchObject({ handled: true, action: "glyph-type-set", typeId: "arrow" });
+  });
+
+  it("each glyph-type-set button selects its own shape via manager.setGlyphType", () => {
+    model.activate("glyphTypes");
+
+    for (const typeId of ["arrow", "cone", "sphere", "cube", "cylinder", "dot"]) {
+      manager.setGlyphType.mockClear();
+      const r = model.activate(`glyph-${typeId}`);
+      expect(manager.setGlyphType).toHaveBeenCalledWith(typeId);
+      expect(r).toMatchObject({ handled: true, action: "glyph-type-set", typeId });
+    }
+  });
+
+  it("the Off cell disables glyphs with typeId null, distinct from any real shape", () => {
+    model.activate("glyphTypes");
+    const r = model.activate("glyph-off");
+    expect(manager.setGlyphType).toHaveBeenCalledWith(null);
+    expect(r).toMatchObject({ handled: true, action: "glyph-type-set", typeId: null });
+  });
+
+  it("reports accepted:false without holding the optimistic state when the manager refuses", () => {
+    manager.setGlyphType.mockReturnValue(false);
+    model.activate("glyphTypes");
+    const r = model.activate("glyph-arrow");
+    expect(r).toMatchObject({ handled: true, action: "glyph-type-set", typeId: "arrow", accepted: false });
   });
 
   it("walk is a direct nav-mode-set button, same semantics as move", () => {
@@ -607,7 +637,7 @@ describe("VRSpatialMenuModel — state reflection for render layer", () => {
     const model = new VRSpatialMenuModel(
       makeManager({
         getRepresentation: vi.fn(() => "wireframe"),
-        isGlyphsEnabled: vi.fn(() => true),
+        getGlyphType: vi.fn(() => "arrow"),
       })
     );
     model.activate("appearance");
@@ -616,20 +646,42 @@ describe("VRSpatialMenuModel — state reflection for render layer", () => {
     expect(states["rep-wireframe"]).toBe(true);
     expect(states["rep-points"]).toBe(false);
     expect(states["rep-surface"]).toBe(false);
-    model.activate("advanced");
-    const advancedStates = Object.fromEntries(model.getButtonStates().map((s) => [s.id, s.active]));
-    expect(advancedStates.glyphs).toBe(true);
+
+    // Same exact-match principle as representation, applied to glyph type:
+    // ONLY the live shape lights, not every non-off cell.
+    model.activate("glyphTypes");
+    const glyphStates = Object.fromEntries(model.getButtonStates().map((s) => [s.id, s.active]));
+    expect(glyphStates["glyph-arrow"]).toBe(true);
+    expect(glyphStates["glyph-cone"]).toBe(false);
+    expect(glyphStates["glyph-sphere"]).toBe(false);
+    expect(glyphStates["glyph-off"]).toBe(false);
   });
 
-  it("getButtonStates leaves representation/glyphs inactive at defaults", () => {
+  it("getButtonStates leaves representation/glyphs inactive at defaults, and lights Off when disabled", () => {
     const model = new VRSpatialMenuModel(makeManager());
     model.activate("appearance");
     const states = Object.fromEntries(model.getButtonStates().map((s) => [s.id, s.active]));
     expect(states["rep-surface"]).toBe(true); // makeManager reports "surface"
     expect(states["rep-wireframe"]).toBe(false);
-    model.activate("advanced");
-    const advancedStates = Object.fromEntries(model.getButtonStates().map((s) => [s.id, s.active]));
-    expect(advancedStates.glyphs).toBe(false);
+
+    // makeManager's default getGlyphType() is null (disabled) — Off lights,
+    // no shape does.
+    model.activate("glyphTypes");
+    const glyphStates = Object.fromEntries(model.getButtonStates().map((s) => [s.id, s.active]));
+    expect(glyphStates["glyph-off"]).toBe(true);
+    expect(glyphStates["glyph-arrow"]).toBe(false);
+    expect(glyphStates["glyph-sphere"]).toBe(false);
+  });
+
+  it("getButtonStates disables a shape requiring orientation when the dataset has no vector array", () => {
+    const model = new VRSpatialMenuModel(
+      makeManager({ getDisabledGlyphTypeIds: vi.fn(() => ["arrow"]) })
+    );
+    model.activate("glyphTypes");
+    const states = Object.fromEntries(model.getButtonStates().map((s) => [s.id, s.disabled]));
+    expect(states["glyph-arrow"]).toBe(true);
+    expect(states["glyph-sphere"]).toBe(false);
+    expect(states["glyph-off"]).toBe(false); // disabling is always available
   });
 });
 

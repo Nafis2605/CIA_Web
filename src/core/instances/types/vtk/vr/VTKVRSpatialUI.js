@@ -210,6 +210,13 @@ function now() {
 // Compact wrist-mounted reopen pill shown while the full panel is hidden.
 const RESHOW_TAB_WIDTH_M = 0.2;
 const RESHOW_TAB_HEIGHT_M = 0.075;
+// Lateral offset for the reshow tab's no-left-hand fallback placement (see
+// _updateReshowAnchor). Gripless/transient-pointer input (Apple Vision Pro)
+// never reports a left-hand pose during one-handed aiming, which is the
+// common case, not an edge case — a dead-ahead fallback would sit right in
+// the "look at the dataset and point at it" cone every active tool's
+// raycast uses, silently eating the trigger pull meant for the tool.
+const RESHOW_TAB_FALLBACK_SIDE_OFFSET_M = 0.3;
 
 /**
  * VRSpatialUI — renders the in-session tool panel and routes ray taps back
@@ -334,7 +341,15 @@ export class VRSpatialUI {
    * @param {object} renderer - VTK.js renderer (vrContext.sceneObjects.renderer)
    * @param {object} manager  - VRExplorationManager (source of truth)
    */
-  initialize(renderer, manager) {
+  /**
+   * @param {object} renderer - the shared VTK renderer
+   * @param {object} manager - VRExplorationManager (the model's command surface)
+   * @param {{vrScale?:number, vrOrigin?:number[], dataBounds?:number[]}} [transform]
+   *   The session's XR→data transform. Pass it: the first hitTest() commits a
+   *   panel anchor BEFORE the first layout() ever runs, and without bounds
+   *   that anchor lands across the forward axis (see _latchTransform).
+   */
+  initialize(renderer, manager, transform) {
     // Idempotency guard: if a previous VR session's teardown ever failed to
     // call dispose() (e.g. an earlier sub-manager's dispose() threw before
     // leaveSession() reached this one), stale button/label actors would
@@ -352,10 +367,37 @@ export class VRSpatialUI {
     } catch {
       this._panelSideSign = 1;
     }
+    // Seed the transform BEFORE the first frame. dispose() resets _dataBounds
+    // to null every session, so without this the session's opening anchor is
+    // always computed blind — and _updateAnchor's lazy re-anchor gate then
+    // keeps that bad placement for as long as the user stands still.
+    this._latchTransform(transform);
     this._model = new VRSpatialMenuModel(manager);
     this._model.onSessionStart();
     this._buildActors();
     log.info("VR spatial UI initialized");
+  }
+
+  /**
+   * Latch the current XR→data transform so _updateAnchor/_layoutButtons can
+   * place the panel in the data-space renderer at a fixed physical size.
+   *
+   * Shared by initialize() and layout() deliberately. It used to live only in
+   * layout(), which is PHASE 2 of the frame — but _updateAnchor() runs from
+   * hitTest(), PHASE 1, so on the very first frame the anchor was committed
+   * with _dataBounds still null. _adaptiveSideOffset then fell back to the
+   * bare PANEL_SIDE_OFFSET, which is smaller than the panel's own half-width,
+   * putting the panel across the user's forward axis — exactly where they aim
+   * to reach a centred dataset. See _adaptiveSideOffset for the consequence.
+   * @private
+   */
+  _latchTransform(transform) {
+    if (!transform) return;
+    this._vrScale = transform.vrScale || 1.0;
+    this._vrOrigin = transform.vrOrigin || [0, 0, 0];
+    // Keep the last known bounds when a frame omits them, so the panel's
+    // placement doesn't snap around on a transient null.
+    this._dataBounds = transform.dataBounds ?? this._dataBounds;
   }
 
   /** The pure model, exposed for wiring/inspection. */
@@ -1235,11 +1277,21 @@ export class VRSpatialUI {
     this._rememberGripState(inputState);
 
     const hand = ray?.hand || (inputState.controllers?.right ? "right" : "left");
+    const hovering = !!this._hoverButtonId || !!headerHit;
     return {
-      hovering: !!this._hoverButtonId || !!headerHit,
+      hovering,
       buttonId: headerHit ? "__header__" : this._hoverButtonId ?? null,
       hand,
-      consumingTrigger: !!headerHit,
+      // MUST equal `hovering`, not just `!!headerHit`. VRExplorationManager
+      // reads this as `menuResult?.consumingTrigger ?? menuHovering` — `??`
+      // only falls through on null/undefined, so an explicit `false` here
+      // (as this used to be for every ordinary button tap, header drag being
+      // the only case it covered) defeats that fallback. The trigger pull
+      // that activates a button via `_model.activate()` two lines above
+      // still reached the active tool's handleInput() as a live rising edge,
+      // e.g. tapping "New Path" while Measure was active also placed a
+      // phantom measurement point wherever the controller was aimed.
+      consumingTrigger: hovering,
       consumingGrip: this._dragState?.kind === "grip",
     };
   }
@@ -1313,15 +1365,7 @@ export class VRSpatialUI {
   layout(transform) {
     if (!this._model) return;
 
-    // Latch the current XR→data transform so _layoutButtons/_layoutStatus can
-    // place the panel in the data-space renderer at a fixed physical size.
-    if (transform) {
-      this._vrScale = transform.vrScale || 1.0;
-      this._vrOrigin = transform.vrOrigin || [0, 0, 0];
-      // Keep the last known bounds when a frame omits them, so the panel's
-      // placement doesn't snap around on a transient null.
-      this._dataBounds = transform.dataBounds ?? this._dataBounds;
-    }
+    this._latchTransform(transform);
 
     if (!this._model.isVisible()) {
       this._hideFullPanelActors();
@@ -1494,10 +1538,23 @@ export class VRSpatialUI {
    * Required azimuth = (bearing to the data) + (its angular radius) + margin +
    * (the panel's own half-angle), clamped so the panel never ends up somewhere
    * the user has to crane to reach.
+   *
+   * The no-bounds fallback is clamped to clear the forward axis on its own.
+   * The configured PANEL_SIDE_OFFSET is only a MINIMUM PREFERENCE and is
+   * smaller than the panel's half-width, so returning it bare put the panel's
+   * hit region across dead-ahead. That is not merely a cosmetic overlap: a
+   * ray aimed at a centred dataset then reports a menu-button hover, and
+   * hitTest()'s `consumingTrigger` strips that trigger from the tools — so
+   * Annotate/Measure/Probe silently stopped placing anything while the
+   * pointer reticle kept working, because the reticle reads targetRay (never
+   * gated) rather than triggerPressed (gated).
    * @private
    */
   _adaptiveSideOffset(headPos, fwd, right) {
-    const base = this._panelSideOffset;
+    // Never less than the panel's own half-width plus its backing pad, or the
+    // panel straddles the axis the user aims along.
+    const minClear = this._panelWidth / 2 + BACKING_PAD_M;
+    const base = Math.max(this._panelSideOffset, minClear);
     const b = this._dataBounds;
     if (!Array.isArray(b) || b.length !== 6) return base;
 
@@ -2021,7 +2078,20 @@ export class VRSpatialUI {
     );
   }
 
-  /** Place the reopen pill just above the left controller, facing the user. */
+  /**
+   * Place the reopen pill just above the left controller, facing the user.
+   *
+   * Fallback (no left-hand pose this frame): this used to plant the tab
+   * dead-ahead of the face. That's not a rare corner case — gripless/
+   * transient-pointer input (Apple Vision Pro) never reports a left-hand
+   * pose while the user is one-handed pinch-aiming, which is the ordinary
+   * way to use an active tool. A dead-ahead tab sat right in that aim cone
+   * and its hit-test's `consumingTrigger` silently stole the pinch meant for
+   * Annotate/Measure (see VRExplorationManager._onFrame's menuConsumesTrigger
+   * gating). Offset it to the side instead, using the same forward/right
+   * basis convention _updateAnchor() uses to keep the full panel beside the
+   * dataset rather than in front of it.
+   */
   _updateReshowAnchor(inputState) {
     const head = inputState.headPose?.position;
     if (!head) return;
@@ -2031,8 +2101,17 @@ export class VRSpatialUI {
       center = [left[0], left[1] + 0.11, left[2]];
     } else {
       const fwd = this._orientationForward(inputState.headPose?.orientation);
-      const len = Math.hypot(fwd[0], fwd[2]) || 1;
-      center = [head.x + (fwd[0] / len) * 0.6, head.y - 0.24, head.z + (fwd[2] / len) * 0.6];
+      let fx = fwd[0];
+      let fz = fwd[2];
+      const len = Math.hypot(fx, fz) || 1;
+      fx /= len;
+      fz /= len;
+      const right = [-fz, 0, fx]; // same basis as _updateAnchor's PANEL_SIDE_OFFSET
+      center = [
+        head.x + fx * 0.5 + right[0] * RESHOW_TAB_FALLBACK_SIDE_OFFSET_M,
+        head.y - 0.24,
+        head.z + fz * 0.5 + right[2] * RESHOW_TAB_FALLBACK_SIDE_OFFSET_M,
+      ];
     }
 
     let nx = head.x - center[0];

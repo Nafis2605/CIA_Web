@@ -10,7 +10,15 @@ vi.mock("@Utils/logger.js", () => {
 
 const { mockSyncAvatar, mockYAvatars } = vi.hoisted(() => ({
   mockSyncAvatar: vi.fn(),
-  mockYAvatars: { observe: vi.fn(), unobserve: vi.fn(), get: vi.fn() },
+  // forEach mirrors the real Y.Map API — AvatarNetworkSync.initialize replays
+  // the existing map so a peer who joined first still delivers their
+  // name/colour (observe alone fires only on CHANGES).
+  mockYAvatars: {
+    observe: vi.fn(),
+    unobserve: vi.fn(),
+    get: vi.fn(),
+    forEach: vi.fn(),
+  },
 }));
 vi.mock("@Collaboration/yjs/yjsSetup.js", () => ({
   yAvatars: mockYAvatars,
@@ -147,5 +155,69 @@ describe("AvatarNetworkSync.sendLocalPresence — session scoping", () => {
       "local-user",
       expect.objectContaining({ sessionId: null })
     );
+  });
+});
+
+describe("AvatarNetworkSync.initialize — existing-peer presence snapshot", () => {
+  beforeEach(() => {
+    mockYAvatars.forEach.mockReset();
+  });
+
+  /** Drive the mocked Y.Map forEach from a plain object. */
+  function seedMap(entries) {
+    mockYAvatars.forEach.mockImplementation((cb) => {
+      for (const [userId, data] of Object.entries(entries)) cb(data, userId);
+    });
+  }
+
+  it("delivers peers who were ALREADY in the map before we joined", () => {
+    // Y.Map.observe fires only on CHANGES. A peer who joined first and has no
+    // reason to rewrite their entry therefore never triggered the observer, so
+    // their displayName/color never arrived and AvatarManager fell back to a
+    // truncated hex user id in default grey. Whoever enters second hit this —
+    // i.e. it appeared the moment a second headset joined.
+    seedMap({
+      "remote-1": { displayName: "Alice", color: "#ff0000" },
+      "remote-2": { displayName: "Bob", color: "#00ff00" },
+    });
+
+    const sync = new AvatarNetworkSync();
+    const seen = [];
+    sync.onRemotePresence((userId, state) => seen.push([userId, state.displayName]));
+    sync.initialize();
+
+    expect(seen).toEqual([
+      ["remote-1", "Alice"],
+      ["remote-2", "Bob"],
+    ]);
+  });
+
+  it("skips our own entry in the snapshot", () => {
+    seedMap({
+      "local-user": { displayName: "Me", color: "#ffffff" },
+      "remote-1": { displayName: "Alice", color: "#ff0000" },
+    });
+
+    const sync = new AvatarNetworkSync();
+    const seen = [];
+    sync.onRemotePresence((userId) => seen.push(userId));
+    sync.initialize();
+
+    expect(seen).toEqual(["remote-1"]);
+  });
+
+  it("survives an empty map and a throwing callback", () => {
+    seedMap({});
+    const empty = new AvatarNetworkSync();
+    expect(() => empty.initialize()).not.toThrow();
+
+    seedMap({ "remote-1": { displayName: "Alice", color: "#ff0000" } });
+    const throwing = new AvatarNetworkSync();
+    throwing.onRemotePresence(() => {
+      throw new Error("renderer blew up");
+    });
+    // One bad peer must not abort initialize and leave the observer unregistered.
+    expect(() => throwing.initialize()).not.toThrow();
+    expect(mockYAvatars.observe).toHaveBeenCalled();
   });
 });

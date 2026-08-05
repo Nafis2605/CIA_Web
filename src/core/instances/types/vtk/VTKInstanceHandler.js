@@ -90,7 +90,7 @@ import { vrManager } from "@Core/vr/VRManager.js";
 import { vrExplorationManager } from "@Core/vr/VRExplorationManager.js";
 import { VRControllerRenderer } from "@Core/vr/VRControllerRenderer.js";
 import { VR_CLEAR_COLOR } from "@Core/vr/environment/VREnvironment.js";
-import { buildYawPivotMatrix } from "@Core/vr/tools/vrPlaneMath.js";
+import { buildYawPivotMatrix, mapXRPointToData } from "@Core/vr/tools/vrPlaneMath.js";
 import {
   updateCursorWorldPosition,
   clearCursorWorldPosition,
@@ -134,13 +134,14 @@ if (!DataAccessHelper.has("zip")) {
   );
 }
 
-// VR raycast pick tolerance (world units). vtkCellPicker.pick3DPoint derives
-// its tolerance from selectionPoint[2] treated as a display-space depth
-// (Picker.js), which is meaningless for a world-space ray — so raycastVR
-// sets it explicitly instead of letting pick3DPoint invent one. Start small;
-// step toward the desktop default (vtkRaycaster.js DEFAULT_TOLERANCE = 0.01)
-// if thin surfaces are missed in-headset.
-const VR_PICK_TOLERANCE = 1e-6;
+// VR raycast pick tolerance. NOT world units — this is a MULTIPLIER. vtk.js
+// computes a world-space tolerance from the window diagonal and then scales it
+// by this value: `computeTolerance(...) * model.tolerance` (Picker.js:265,
+// :282). The previous 1e-6 was set believing it was an absolute world
+// distance, which collapsed the effective tolerance to ~zero and made thin or
+// edge-on surfaces unhittable. vtk.js's own default is 0.025 (Picker.js:292);
+// the desktop raycaster uses 0.01 (vtkRaycaster.js DEFAULT_TOLERANCE).
+const VR_PICK_TOLERANCE = 0.01;
 
 /**
  * VTKInstanceHandler
@@ -5063,20 +5064,61 @@ console.log('Tools:', tools);
     // Cached, pick-list-scoped, world-space cell picker. See the three
     // helpers below for why each of these matters.
     const picker = this._getVRPicker(vrContext);
+    const pickTargets = this._getVRPickTargets(vrContext);
     picker.setTolerance(VR_PICK_TOLERANCE);
     picker.setPickFromList(true);
-    picker.setPickList(this._getVRPickTargets(vrContext));
+    picker.setPickList(pickTargets);
 
-    // World-space ray endpoints. Length is derived from the dataset, not a
-    // fixed magic number — see _vrPickRayLength for why a mismatched ray
-    // length silently returns the WRONG cell instead of no cell.
+    // XR -> DATA SPACE. `origin` arrives in physical headset metres (it comes
+    // from controller.targetRay), but VR here remaps the CAMERA and leaves
+    // the actors in data space — so the picker, which intersects those actors,
+    // must be given the ray in data space too. Same mapping the camera itself
+    // uses (dataPos = xrPos / vrScale + vrOrigin) via the shared helper
+    // VRClipBoxTool already relies on for exactly this reason.
+    //
+    // Omitting this made every pick start at a point unrelated to the
+    // geometry, so getCellId() returned -1 and annotate/measure/probe and the
+    // pointer reticle all silently did nothing. It was invisible in tests
+    // because vrScale=1/vrOrigin=[0,0,0] makes the mapping an identity, and a
+    // real session is never at identity (_applyInitialPlacement auto-fits on
+    // entry).
+    // NOTE THE TRAILING 1.0 — it is load-bearing, not decoration.
+    // vtkPicker.pick3DPoint hands these arrays straight to pick3DInternal
+    // WITHOUT appending a homogeneous w (Picker.js:268-284), unlike
+    // publicAPI.pick which sets p1World[3] = p2World[3] = 1.0 itself
+    // (Picker.js:263-264). pick3DInternal then runs
+    // vec4.transformMat4(...) followed by vec3.scale(p, p, 1 / p[3])
+    // (Picker.js:103-106), so a 3-element array leaves w undefined and turns
+    // every transformed coordinate into NaN. No cell can then be intersected,
+    // getCellId() stays at its -1 default, and raycastVR returns null on every
+    // call — which is exactly how VR annotate/measure/probe silently did
+    // nothing on both Quest and Vision Pro.
+    const [dataX, dataY, dataZ] = mapXRPointToData(
+      origin,
+      vrContext.vrScale,
+      vrContext.vrOrigin
+    );
+    const p1 = [dataX, dataY, dataZ, 1.0];
+
+    // The direction needs NO scaling: the XR->data map is a uniform scale plus
+    // a translation, so a direction maps to d/vrScale — the same unit vector.
+    // It is normalized only because rayLength below is a data-space length and
+    // a non-unit direction would silently scale it (the matrix branch above
+    // already yields a unit vector; a caller-supplied {origin, direction} may
+    // not).
+    const dirLen = Math.hypot(dir.x, dir.y, dir.z) || 1;
+    const direction = [dir.x / dirLen, dir.y / dirLen, dir.z / dirLen];
+
+    // Ray length is derived from the dataset, not a fixed magic number — see
+    // _vrPickRayLength for why a mismatched ray length silently returns the
+    // WRONG cell instead of no cell. Already a data-space quantity (it comes
+    // from dataBounds), which is why p1 above has to be data-space as well.
     const rayLength = this._vrPickRayLength(vrContext);
-    const p1 = [origin.x, origin.y, origin.z];
-    const direction = [dir.x, dir.y, dir.z];
     const p2 = [
       p1[0] + direction[0] * rayLength,
       p1[1] + direction[1] * rayLength,
       p1[2] + direction[2] * rayLength,
+      1.0, // homogeneous w — see the note on p1 above
     ];
 
     // pick3DPoint is the WORLD-space counterpart of pick() (which takes a
@@ -5090,9 +5132,32 @@ console.log('Tools:', tools);
     // intersects against prop.getMatrix(), which already includes the
     // UserMatrix written by _applyVRDataRotation (:5222-ish), so the picker
     // sees the actor exactly as rendered, twist and all.
+    // Reset pick state EXPLICITLY. pick3DPoint calls the module-local
+    // initialize() (Picker.js:272), not publicAPI.initialize — and
+    // vtkCellPicker only overrides the latter (CellPicker.js:113-116 ->
+    // resetPickInfo -> model.cellId = -1). publicAPI.pick calls it for us
+    // (CellPicker.js:137); pick3DPoint does not. Without this, a miss reports
+    // the PREVIOUS pick's cellId/position and markers stick to a stale point.
+    picker.initialize();
     picker.pick3DPoint(p1, p2, renderer);
 
     const cellId = picker.getCellId();
+
+    // Diagnostic for on-headset debugging (remote console via chrome://inspect).
+    // Logged only when the hit/miss state FLIPS, never per frame — raycastVR
+    // runs at headset frame rate. Distinguishes the three ways VR picking can
+    // fail: no pick targets at all, a ray placed wrong, or a genuine miss.
+    const nowHit = cellId >= 0;
+    if (vrContext._lastPickWasHit !== nowHit) {
+      vrContext._lastPickWasHit = nowHit;
+      log.debug(
+        `VR pick ${nowHit ? "HIT" : "MISS"} — cellId=${cellId}, ` +
+          `targets=${pickTargets.length}, ` +
+          `rayOrigin(data)=[${p1[0].toFixed(3)}, ${p1[1].toFixed(3)}, ${p1[2].toFixed(3)}], ` +
+          `vrScale=${vrContext.vrScale}, rayLength=${rayLength.toFixed(3)}`
+      );
+    }
+
     if (cellId < 0) return null;
 
     const position = picker.getPickPosition();

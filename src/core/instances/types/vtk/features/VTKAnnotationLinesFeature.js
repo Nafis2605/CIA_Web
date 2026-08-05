@@ -105,7 +105,7 @@ export function parseMeasurementAnnotation(annotation) {
  * type 'point', position [x,y,z] in data space, text, metadata.color).
  *
  * @param {object} annotation - Annotation model instance or server row
- * @returns {{ id: string, position: number[], text: string, color: number[]|null } | null}
+ * @returns {{ id: string, position: number[], text: string, color: number[]|null, authorName: string|null } | null}
  */
 export function parsePointAnnotation(annotation) {
   try {
@@ -117,6 +117,13 @@ export function parsePointAnnotation(annotation) {
       position: [annotation.position[0], annotation.position[1], annotation.position[2]],
       text: typeof annotation.text === "string" ? annotation.text : "",
       color: normalizeColor(annotation.metadata?.color),
+      // Display name only (see VRExplorationManager._persistVRAnnotation) —
+      // lets a persisted pin say who placed it without a separate user-id
+      // lookup. Absent on annotations created before this field existed.
+      authorName:
+        typeof annotation.metadata?.authorName === "string"
+          ? annotation.metadata.authorName
+          : null,
     };
   } catch (err) {
     log.warn(`Failed to parse point annotation: ${err.message}`);
@@ -551,7 +558,10 @@ export class VTKAnnotationLinesFeature extends FeatureInterface {
       const worldHeight = Math.max(radius, 1e-6);
 
       const labelBillboard = new VRTextBillboard({
-        text: parsed.text,
+        // Author name, when the pin carries one, so OTHER participants see
+        // who left it — not just the note text. VRTextBillboard is
+        // single-line (Canvas2D fillText, no wrapping), hence one line.
+        text: parsed.authorName ? `${parsed.text} — ${parsed.authorName}` : parsed.text,
         worldHeight,
         color: rgbToHex(state.labelColor),
       });

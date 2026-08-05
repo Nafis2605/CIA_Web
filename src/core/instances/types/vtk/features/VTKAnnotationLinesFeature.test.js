@@ -198,7 +198,29 @@ describe("parsePointAnnotation", () => {
       position: [1, 2, 3],
       text: "VR marker",
       color: [1, 0, 0],
+      authorName: null,
     });
+  });
+
+  it("extracts authorName from metadata so a persisted pin can say who placed it", () => {
+    const parsed = parsePointAnnotation(
+      makePointAnnotation({ metadata: { authorName: "Alice" } })
+    );
+    expect(parsed.authorName).toBe("Alice");
+  });
+
+  it("defaults authorName to null for an annotation created before the field existed", () => {
+    const parsed = parsePointAnnotation(
+      makePointAnnotation({ metadata: { color: [1, 0, 0] } }) // no authorName key at all
+    );
+    expect(parsed.authorName).toBeNull();
+  });
+
+  it("ignores a non-string authorName rather than propagating garbage", () => {
+    const parsed = parsePointAnnotation(
+      makePointAnnotation({ metadata: { authorName: 42 } })
+    );
+    expect(parsed.authorName).toBeNull();
   });
 
   it("normalizes a hex color string to an [r,g,b] array", () => {
@@ -631,6 +653,46 @@ describe("VTKAnnotationLinesFeature label billboards", () => {
 
     const entry = feature.instanceStates.get("inst-1").points.get("pt-1");
     expect(entry.labelBillboard).toBeTruthy();
+    expect(entry.labelBillboard.getText()).toBe("Anomaly here");
+
+    await feature.cleanup("inst-1");
+  });
+
+  it("appends the author's name to the billboard text so OTHER participants see who placed it", async () => {
+    mockAnnotationManager = makeFakeAnnotationManager();
+
+    const feature = new VTKAnnotationLinesFeature();
+    const sceneObjects = makeMockSceneObjects();
+    await feature.initialize("inst-1", { sceneObjects, datasetId: "ds-1" });
+
+    mockAnnotationManager._emit("annotationAdded", {
+      datasetId: "ds-1",
+      annotation: makePointAnnotation({
+        id: "pt-1",
+        text: "Anomaly here",
+        metadata: { authorName: "Bob" },
+      }),
+    });
+
+    const entry = feature.instanceStates.get("inst-1").points.get("pt-1");
+    expect(entry.labelBillboard.getText()).toBe("Anomaly here — Bob");
+
+    await feature.cleanup("inst-1");
+  });
+
+  it("omits the author suffix when the pin carries no authorName (pre-existing annotations)", async () => {
+    mockAnnotationManager = makeFakeAnnotationManager();
+
+    const feature = new VTKAnnotationLinesFeature();
+    const sceneObjects = makeMockSceneObjects();
+    await feature.initialize("inst-1", { sceneObjects, datasetId: "ds-1" });
+
+    mockAnnotationManager._emit("annotationAdded", {
+      datasetId: "ds-1",
+      annotation: makePointAnnotation({ id: "pt-1", text: "Anomaly here" }),
+    });
+
+    const entry = feature.instanceStates.get("inst-1").points.get("pt-1");
     expect(entry.labelBillboard.getText()).toBe("Anomaly here");
 
     await feature.cleanup("inst-1");
