@@ -56,6 +56,12 @@ module.exports = {
     filename: "[name].bundle.js",
     path: path.resolve(__dirname, "dist"),
     clean: true,
+    // Without this, webpack 5's 'auto' publicPath makes HtmlWebpackPlugin
+    // emit a relative <script src="main.bundle.js">, which a browser
+    // resolves against the CURRENT URL path — so hard-navigating to a deep
+    // link like /rooms/<uuid> 404s on /rooms/main.bundle.js instead of
+    // loading /main.bundle.js from site root.
+    publicPath: "/",
   },
   mode: "development",
   // eval-cheap-module-source-map is much faster than source-map for dev

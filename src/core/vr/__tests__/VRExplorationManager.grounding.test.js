@@ -4,7 +4,7 @@
 // Why this matters: the XR->data map is `dataPos = xrPos/vrScale + vrOrigin`,
 // so a data point's PHYSICAL position is `xr(P) = (P - vrOrigin) * vrScale`.
 // Changing vrScale with vrOrigin fixed is therefore a homothety about the XR
-// origin — which, in local-floor space, is the floor point under the user. Any
+// origin â€” which, in local-floor space, is the floor point under the user. Any
 // point NOT on that plane moves away from it in proportion to the scale
 // change, including vertically. The dataset used to start ~0.6 m off the
 // ground, so a two-hand zoom lifted it 1.2 m, then 2.4 m, until it was
@@ -15,13 +15,13 @@
 // (see VRExplorationManager.js's PEDESTAL_HEIGHT_M) grounds the dataset on a
 // fixed-height pedestal rather than directly on the floor, at every scale
 // established through a DISCRETE placement (initial entry, isolation, going
-// to a participant, a menu scale preset) — each of these re-derives vrOrigin[1]
+// to a participant, a menu scale preset) â€” each of these re-derives vrOrigin[1]
 // from the CURRENT vrScale via _groundY, so the pedestal reads correctly at
 // whatever scale is active when they run. A live two-hand zoom is the one
 // exception: VRScaleController deliberately holds vrOrigin[1] fixed for the
 // gesture's duration (see its _pivotedOrigin), so the pedestal's apparent
 // height scales right along with the rest of the (intentionally, interactively
-// resizing) scene for that gesture — the same proportional change a zoom
+// resizing) scene for that gesture â€” the same proportional change a zoom
 // gives everything else, not a runaway drift. These tests pin the invariant
 // for the discrete-placement case.
 const PEDESTAL_HEIGHT_M = 0.5; // must match VRExplorationManager.js
@@ -54,6 +54,9 @@ vi.mock("@Collaboration/presence/userManagement.js", () => ({
   getUserId: vi.fn(() => "user-1"),
   getUserName: vi.fn(() => "Tester"),
   getUserColor: vi.fn(() => "#ff0000"),
+  getParticipantId: vi.fn(() => "user-1"),
+  getParticipantName: vi.fn(() => "Tester"),
+  isSelfIdentity: vi.fn((id) => id === "user-1"),
 }));
 vi.mock("@Core/instances/types/vtk/vr/VTKVRAvatars.js", () => ({
   vrAvatarSystem: { initialize: vi.fn() },
@@ -107,9 +110,9 @@ describe("VR dataset grounding", () => {
     // vrOrigin[1] is a FIXED data-space value once placed (same mechanism as
     // the original bounds[2]-only grounding). A raw vrScale mutation with
     // nothing re-deriving vrOrigin[1] (i.e. a live two-hand zoom gesture,
-    // which deliberately holds Y fixed for its duration — see
+    // which deliberately holds Y fixed for its duration â€” see
     // VRScaleController._pivotedOrigin) makes the pedestal's PHYSICAL height
-    // scale proportionally with the total zoom — exactly like the dataset's
+    // scale proportionally with the total zoom â€” exactly like the dataset's
     // own apparent size does. That's expected, bounded, single-value drift,
     // NOT the original bug: the original bug was UNBOUNDED compounding across
     // REPEATED gestures, because each fresh grip re-anchored to an
@@ -150,7 +153,7 @@ describe("VR dataset grounding", () => {
     expect(diagonal * ctx.vrScale).toBeCloseTo(1.36, 1);
   });
 
-  it("ignores head pitch when placing — looking up or down must not launch the dataset", () => {
+  it("ignores head pitch when placing â€” looking up or down must not launch the dataset", () => {
     // controllerForward is the full 3D forward, so the old code's
     // `forward[1] * distance` threw the dataset up to +/-2 m vertically if the
     // user happened to be looking up on the first frame.
@@ -223,7 +226,7 @@ describe("VRExplorationManager.refreshDataBounds", () => {
   });
 });
 
-describe("VRExplorationManager._computeAutoPlacement — pedestal", () => {
+describe("VRExplorationManager._computeAutoPlacement â€” pedestal", () => {
   it("puts the dataset's bottom bound PEDESTAL_HEIGHT_M above the floor, not on it", () => {
     const placement = vrExplorationManager._computeAutoPlacement(BOUNDS);
     const physicalBottom = (BOUNDS[2] - placement.vrOrigin[1]) * placement.vrScale;
@@ -232,7 +235,7 @@ describe("VRExplorationManager._computeAutoPlacement — pedestal", () => {
   });
 });
 
-describe("VRExplorationManager.setVRScale — re-grounds after a discrete scale change", () => {
+describe("VRExplorationManager.setVRScale â€” re-grounds after a discrete scale change", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vrExplorationManager._activeContext = {

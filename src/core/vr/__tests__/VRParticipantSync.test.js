@@ -29,8 +29,14 @@ vi.mock("@Collaboration/yjs/yjsSetup.js", () => ({
   },
 }));
 
+// getParticipantId mirrors getUserId here: the production difference (account
+// vs device) is covered in userManagement's own tests, and keeping one value
+// lets these tests keep asserting on "local-user".
 vi.mock("@Collaboration/presence/userManagement.js", () => ({
   getUserId: vi.fn(() => "local-user"),
+  getParticipantId: vi.fn(() => "local-user"),
+  getParticipantName: vi.fn(() => "Local"),
+  isSelfIdentity: vi.fn((id) => id === "local-user"),
 }));
 
 import {
@@ -256,5 +262,37 @@ describe("VRParticipantSync", () => {
 
     expect(sync.sweepStaleParticipants(now)).toEqual([]);
     expect(leaveEvents).toEqual([]);
+  });
+
+  describe("rekey", () => {
+    it("ignores falsy or already-bound ids", () => {
+      const mapBefore = sync._yParticipants;
+
+      sync.rekey(null);
+      sync.rekey(undefined);
+      sync.rekey("");
+      sync.rekey(session.id); // already bound — must be a no-op
+
+      expect(sync._yParticipants).toBe(mapBefore);
+    });
+
+    it("is not fooled when the caller mutates session.id before calling rekey (the convergence-handler race)", () => {
+      sync.updateLocalState({ headPose: { position: { x: 1, y: 2, z: 3 } } });
+      const oldId = session.id;
+      expect(sync._yParticipants.get("local-user")).toBeDefined();
+
+      // Reproduce VRExplorationManager._watchVRSessionConvergence's exact
+      // order: mutate the SHARED session object BEFORE calling rekey.
+      session.id = "vrsession_winner";
+      sync.rekey("vrsession_winner");
+
+      expect(sync._yParticipants.get("local-user")).toBeUndefined();
+
+      sync._lastUpdateTime = 0; // bypass the pose throttle for this immediate second write
+      sync.updateLocalState({ headPose: { position: { x: 9, y: 9, z: 9 } } });
+      expect(sync._yParticipants).toBe(mockYMaps.get("vr-participants-vrsession_winner"));
+      expect(sync._yParticipants.get("local-user")).toBeDefined();
+      expect(mockYMaps.get(`vr-participants-${oldId}`).get("local-user")).toBeUndefined();
+    });
   });
 });

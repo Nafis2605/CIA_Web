@@ -68,10 +68,13 @@ export const yActiveDataset = ydoc.getMap("activeDataset");
 // View presence: viewId -> { viewers: [userId, ...], lastUpdate }
 export const yViewPresence = ydoc.getMap("viewPresence");
 
-// VR avatars: userId -> { position, rotation, headPose, handPoses, ... }
+// VR avatars: participantId -> { position, rotation, headPose, handPoses, ... }
+// PARTICIPANT id (account+device, see userManagement.getParticipantId), NOT
+// userId: two headsets signed into one account share a userId and would
+// collapse into a single entry that each of them then skips as its own.
 export const yAvatars = ydoc.getMap("avatars");
 
-// VR controllers: `${userId}_${hand}` -> { position, rotation, buttons, ... }
+// VR controllers: `${participantId}_${hand}` -> { position, rotation, buttons, ... }
 export const yVRControllers = ydoc.getMap("vrControllers");
 
 // Text chat: Array of { userId, message, timestamp }
@@ -154,10 +157,7 @@ export async function initializeYjsProvider() {
   }
 
   // Pass projectId so the Y.js server can perform project/room membership checks
-  const projectId = sessionManager.projectId || clientConfig.defaultProjectId || null;
-  if (projectId) {
-    params.projectId = projectId;
-  }
+  params.projectId = sessionManager.getProjectId();
 
   _provider = new WebsocketProvider(wsUrl, roomId, ydoc, {
     awareness,
@@ -235,12 +235,12 @@ export function syncCursorToYjs(userId, cursorData) {
 
 /**
  * Update VR avatar presence in Y.js
- * @param {string} userId - User ID
+ * @param {string} participantId - Per-DEVICE id (getParticipantId), not userId
  * @param {Object} avatarData - { position, rotation, headPose, ... }
  */
-export function syncAvatarToYjs(userId, avatarData) {
+export function syncAvatarToYjs(participantId, avatarData) {
   try {
-    yAvatars.set(userId, {
+    yAvatars.set(participantId, {
       ...avatarData,
       lastUpdate: Date.now(),
     });
@@ -251,7 +251,7 @@ export function syncAvatarToYjs(userId, avatarData) {
 
 /**
  * Update VR controller presence in Y.js
- * @param {string} controllerId - `${userId}_${hand}` format
+ * @param {string} controllerId - `${participantId}_${hand}` format
  * @param {Object} controllerData - { position, rotation, buttons, ... }
  */
 export function syncVRControllerToYjs(controllerId, controllerData) {
@@ -287,8 +287,11 @@ export function syncViewPresenceToYjs(viewId, viewers) {
  * @param {string} viewId - View configuration ID
  * @param {string} userId - User who moved the camera
  * @param {Object} cameraState - { position, focalPoint, viewUp, parallelScale, clippingRange, viewAngle }
+ * @param {string|null} [syncKey] - Cross-client sync key (see viewSyncKey.js).
+ *   viewId is local to the publisher — every client mints its own — so peers
+ *   match on this instead.
  */
-export function syncCameraToYjs(viewId, userId, cameraState) {
+export function syncCameraToYjs(viewId, userId, cameraState, syncKey = null) {
   // Personal-camera mode: the user opted out of sharing their viewpoint —
   // suppress the outgoing broadcast entirely (see cameraSharePolicy).
   if (!cameraSharePolicy.isCameraShared()) return;
@@ -296,6 +299,7 @@ export function syncCameraToYjs(viewId, userId, cameraState) {
     yCameras.set(viewId, {
       camera: cameraState,
       userId,
+      syncKey,
       clientId: ydoc.clientID,
       lastUpdate: Date.now(),
     });
@@ -310,14 +314,18 @@ export function syncCameraToYjs(viewId, userId, cameraState) {
  * @param {string} viewId - View configuration ID
  * @param {string} userId - User making the change
  * @param {Object} vizState - Partial visualization state (only changed fields)
+ * @param {string|null} [syncKey] - Cross-client sync key (see viewSyncKey.js).
+ *   viewId is local to the publisher — every client mints its own — so peers
+ *   match on this instead.
  */
-export function syncVisualizationToYjs(viewId, userId, vizState) {
+export function syncVisualizationToYjs(viewId, userId, vizState, syncKey = null) {
   try {
     // Merge with existing state so partial updates don't overwrite other fields
     const existing = yVisualizationState.get(viewId)?.visualization || {};
     yVisualizationState.set(viewId, {
       visualization: { ...existing, ...vizState },
       userId,
+      syncKey,
       clientId: ydoc.clientID,
       lastUpdate: Date.now(),
     });
@@ -485,16 +493,21 @@ export function releaseVRSession(viewConfigurationId, userId) {
 }
 
 /**
- * Remove user presence from Y.js (call on disconnect)
- * @param {string} userId - User ID to remove
+ * Remove this device's presence from Y.js (call on disconnect).
+ *
+ * Takes a PARTICIPANT id, not a user id: passing the account id would wipe the
+ * presence of every device signed into that account, so one headset leaving
+ * would erase the other's avatar and controllers mid-session.
+ *
+ * @param {string} participantId - getParticipantId() of the leaving device
  */
-export function removeUserPresenceFromYjs(userId) {
-  yCursors.delete(userId);
-  yAvatars.delete(userId);
+export function removeUserPresenceFromYjs(participantId) {
+  yCursors.delete(participantId);
+  yAvatars.delete(participantId);
   // Remove both hand controllers
-  yVRControllers.delete(`${userId}_left`);
-  yVRControllers.delete(`${userId}_right`);
-  log.info(`User presence removed from Y.js: ${userId}`);
+  yVRControllers.delete(`${participantId}_left`);
+  yVRControllers.delete(`${participantId}_right`);
+  log.info(`Participant presence removed from Y.js: ${participantId}`);
 }
 
 log.info("Y.js core initialized (v2.0 - presence only architecture)");

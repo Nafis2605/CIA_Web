@@ -41,6 +41,9 @@ vi.mock("@Collaboration/presence/userManagement.js", () => ({
   getUserId: vi.fn(() => "user-1"),
   getUserName: vi.fn(() => "Tester"),
   getUserColor: vi.fn(() => "#ff0000"),
+  getParticipantId: vi.fn(() => "user-1"),
+  getParticipantName: vi.fn(() => "Tester"),
+  isSelfIdentity: vi.fn((id) => id === "user-1"),
 }));
 vi.mock("@Core/instances/types/vtk/vr/VTKVRAvatars.js", () => ({
   vrAvatarSystem: { initialize: vi.fn(), dispose: vi.fn() },
@@ -88,7 +91,7 @@ vi.mock("@Services/visualizationSyncService.js", () => ({
 import { vrExplorationManager } from "../VRExplorationManager.js";
 import { vr as log } from "@Utils/logger.js";
 
-describe("VRExplorationManager — deferred work queue (_deferHeavy / _drainDeferredWork)", () => {
+describe("VRExplorationManager â€” deferred work queue (_deferHeavy / _drainDeferredWork)", () => {
   beforeEach(() => {
     vrExplorationManager._deferredWork = [];
     vrExplorationManager._pendingWorkLabel = null;
@@ -98,7 +101,7 @@ describe("VRExplorationManager — deferred work queue (_deferHeavy / _drainDefe
 
   it("_deferHeavy does not execute the task immediately", () => {
     const fn = vi.fn();
-    vrExplorationManager._deferHeavy("Doing thing…", fn);
+    vrExplorationManager._deferHeavy("Doing thingâ€¦", fn);
     expect(fn).not.toHaveBeenCalled();
     expect(vrExplorationManager._deferredWork).toHaveLength(1);
   });
@@ -136,7 +139,7 @@ describe("VRExplorationManager — deferred work queue (_deferHeavy / _drainDefe
     expect(() => vrExplorationManager._drainDeferredWork()).not.toThrow();
     expect(log.error).toHaveBeenCalled();
     // The throwing task is still consumed (shifted off), and the next one's
-    // label is now pending — not stuck on the failed task, not null either.
+    // label is now pending â€” not stuck on the failed task, not null either.
     expect(vrExplorationManager.getPendingWorkLabel()).toBe("Good");
     expect(good).not.toHaveBeenCalled();
 
@@ -148,15 +151,15 @@ describe("VRExplorationManager — deferred work queue (_deferHeavy / _drainDefe
   it("getPendingWorkLabel returns the label while queued and null once drained", () => {
     expect(vrExplorationManager.getPendingWorkLabel()).toBeNull();
 
-    vrExplorationManager._deferHeavy("Building glyphs…", () => {});
-    expect(vrExplorationManager.getPendingWorkLabel()).toBe("Building glyphs…");
+    vrExplorationManager._deferHeavy("Building glyphsâ€¦", () => {});
+    expect(vrExplorationManager.getPendingWorkLabel()).toBe("Building glyphsâ€¦");
 
     vrExplorationManager._drainDeferredWork();
     expect(vrExplorationManager.getPendingWorkLabel()).toBeNull();
   });
 
   it("leaveSession-style teardown clears the queue so nothing runs after exit", () => {
-    vrExplorationManager._deferHeavy("Building glyphs…", () => {});
+    vrExplorationManager._deferHeavy("Building glyphsâ€¦", () => {});
     expect(vrExplorationManager._deferredWork).toHaveLength(1);
 
     // Mirrors the reset block in leaveSession()'s finally clause.
@@ -171,7 +174,7 @@ describe("VRExplorationManager — deferred work queue (_deferHeavy / _drainDefe
     const refreshSpy = vi.spyOn(vrExplorationManager, "refreshDataBounds");
     vrExplorationManager._activeContext = { vrContext: { dataBounds: [0, 1, 0, 1, 0, 1] } };
 
-    vrExplorationManager._deferHeavy("Applying appearance…", () => {}, { boundsMayChange: false });
+    vrExplorationManager._deferHeavy("Applying appearanceâ€¦", () => {}, { boundsMayChange: false });
     vrExplorationManager._drainDeferredWork();
 
     expect(refreshSpy).not.toHaveBeenCalled();
@@ -181,7 +184,7 @@ describe("VRExplorationManager — deferred work queue (_deferHeavy / _drainDefe
     const refreshSpy = vi.spyOn(vrExplorationManager, "refreshDataBounds");
     vrExplorationManager._activeContext = { vrContext: { dataBounds: [0, 1, 0, 1, 0, 1] } };
 
-    vrExplorationManager._deferHeavy("Building glyphs…", () => {});
+    vrExplorationManager._deferHeavy("Building glyphsâ€¦", () => {});
     vrExplorationManager._drainDeferredWork();
 
     expect(refreshSpy).toHaveBeenCalledTimes(1);

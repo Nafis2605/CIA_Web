@@ -243,12 +243,14 @@ export async function initializePhase1() {
     logInfo("Instance types registered");
 
     // STEP 2: Session management
-    // Sets up room ID from URL for collaboration
+    // Sets up project + room ID from URL for collaboration
     log.debug("Initializing session...");
     await timeStartupStep("Session initialization", () =>
-      sessionManager.initializeFromURL()
+      sessionManager.initializeFromURLAsync()
     );
-    log.debug(`Session initialized - Room: ${sessionManager.getRoomId()}`);
+    log.debug(
+      `Session initialized - Project: ${sessionManager.getProjectId()}, Room: ${sessionManager.getRoomId()}`
+    );
 
     // STEP 3: Data storage layer (Layer 1)
     log.debug("Setting up data storage layer...");
@@ -466,7 +468,7 @@ export async function initializePhase2() {
   // Diagnostic: log key identifiers so the browser console shows where we are
   console.log('[CIA Init] Phase 2 starting');
   console.log('[CIA Init] Room ID (Y.js session):', sessionManager.getRoomId?.());
-  console.log('[CIA Init] Project ID:', sessionManager.getProjectId?.() || config.defaultSessionId);
+  console.log('[CIA Init] Project ID:', sessionManager.getProjectId());
   console.log('[CIA Init] Y.js WebSocket URL:', config.yjsWebSocketUrl);
   try { console.log('[CIA Init] User ID:', getUserId?.()); } catch (_) {}
   console.log('[CIA Init] URL:', typeof window !== 'undefined' ? window.location.href : 'n/a');
@@ -800,6 +802,9 @@ function setupDebugHelpers() {
 ║  CIA.viewConfigurationManager  - View config manager (Layer 2) ║
 ║  CIA.workspaceManager          - Instance window manager (L3)  ║
 ║                                                                ║
+║  VR Collaboration:                                             ║
+║  CIA.vrDiagnostics()           - Ids two headsets must share   ║
+║                                                                ║
 ║  Sync & Reconciliation:                                        ║
 ║  CIA.syncStatus()              - Check sync status with server ║
 ║  CIA.forceReconcile()          - Force reconcile local/server  ║
@@ -868,6 +873,29 @@ function setupDebugHelpers() {
 
   window.CIA.getInstance = function (id) {
     return workspaceManager?.getInstance(id);
+  };
+
+  /**
+   * Dump the VR collaboration snapshot — every id two headsets must agree on
+   * (and every one they must NOT). This is the first thing to run over
+   * chrome://inspect when two headsets cannot see each other.
+   *
+   * Deliberately console.table + a return value rather than the logger: the
+   * logger defaults to `warn` on any non-localhost host, which is every
+   * headset, so a log.info() helper here would print nothing on the exact
+   * device it exists to debug.
+   *
+   * Lazily imported so the VR module graph is not pulled into app init.
+   */
+  window.CIA.vrDiagnostics = async function () {
+    const { vrExplorationManager } = await import("@Core/vr/VRExplorationManager.js");
+    const d = vrExplorationManager.getCollaborationDiagnostics();
+    console.table(d);
+    console.log(
+      "Compare two headsets: roomId / datasetId / sessionKey / vrSessionId / " +
+        "participantMap must MATCH; viewConfigId / participantId / yjsClientId must DIFFER."
+    );
+    return d;
   };
 
   // Sync debugging helpers
@@ -955,7 +983,7 @@ export function getAnnotationManager() {
  * This is the v2.0 way of getting datasets - server is source of truth
  */
 async function fetchDatasetsFromServer() {
-  const projectId = sessionManager.getProjectId?.() || config.defaultSessionId;
+  const projectId = sessionManager.getProjectId();
 
   const response = await fetch(
     `${config.apiBaseUrl}/projects/${projectId}/files`
@@ -1084,7 +1112,7 @@ async function fetchDatasetsFromServer() {
  * This is the v2.0 way of getting view configurations
  */
 async function fetchViewsFromServer() {
-  const projectId = sessionManager.getProjectId?.() || config.defaultSessionId;
+  const projectId = sessionManager.getProjectId();
 
   const response = await fetch(
     `${config.apiBaseUrl}/views?projectId=${projectId}`
@@ -1117,7 +1145,7 @@ async function fetchViewsFromServer() {
  * This is the v2.0 way of getting annotations
  */
 async function fetchAnnotationsFromServer(fileId = null) {
-  const projectId = sessionManager.getProjectId?.() || config.defaultSessionId;
+  const projectId = sessionManager.getProjectId();
 
   let url = `${config.apiBaseUrl}/annotations?projectId=${projectId}`;
   if (fileId) {

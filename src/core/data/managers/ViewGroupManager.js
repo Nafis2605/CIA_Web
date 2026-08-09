@@ -16,7 +16,6 @@ import {
     VIEWGROUP_STATES,
 } from '@Core/data/models/ViewGroup.js';
 import { getUserId, getUserName } from '@Collaboration/presence/userManagement.js';
-import { config } from '@Core/config/clientConfig.js';
 import { sessionManager } from '@Core/session/sessionManager.js';
 import { apiClient } from '@Services/apiClient.js';
 import { BaseManager } from '@Core/data/managers/BaseManager.js';
@@ -94,7 +93,7 @@ export class ViewGroupManager extends BaseManager {
     initialize(workspaceId = null) {
         this._log.info('Initializing ViewGroupManager...');
 
-        this._projectId = sessionManager?.getProjectId?.() || config?.defaultSessionId;
+        this._projectId = sessionManager.getProjectId();
         this._workspaceId = workspaceId;
 
         this._log.info(`Initialized for project: ${this._projectId}, workspace: ${this._workspaceId}`);

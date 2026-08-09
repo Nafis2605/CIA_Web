@@ -12,6 +12,9 @@ vi.mock("@Collaboration/presence/userManagement.js", () => ({
   getUserId: vi.fn(() => "local-user"),
   getUserName: vi.fn(() => "Local"),
   getUserColor: vi.fn(() => "hsl(120, 70%, 60%)"),
+  getParticipantId: vi.fn(() => "local-user"),
+  getParticipantName: vi.fn(() => "Local"),
+  isSelfIdentity: vi.fn((id) => id === "local-user"),
 }));
 
 // Fake vrCursorSync: capture the per-view callback so tests can feed cursors.
@@ -118,7 +121,7 @@ describe("VTKRemoteVRRays", () => {
     emit("view-1", "vr-user", vrCursor());
     expect(sceneObjects.renderer._actors.length).toBe(1);
 
-    // No updates for > 2s → sweep removes the frozen ray
+    // No updates for > 2s â†’ sweep removes the frozen ray
     vi.advanceTimersByTime(3500);
     expect(sceneObjects.renderer._actors.length).toBe(0);
   });

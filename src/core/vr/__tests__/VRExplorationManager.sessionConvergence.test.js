@@ -1,6 +1,6 @@
 // src/core/vr/__tests__/VRExplorationManager.sessionConvergence.test.js
 // Session convergence (Phase 1): a second "Enter VR" tap on the same view
-// must adopt the FIRST tap's Y.js session id instead of minting its own —
+// must adopt the FIRST tap's Y.js session id instead of minting its own â€”
 // otherwise VRParticipantSync opens a different `vr-participants-<id>` map
 // and the two users never see each other. Uses the REAL VRExplorationSession
 // and the REAL yjsSetup registry (claimVRSession/getVRSessionForView) so the
@@ -41,18 +41,24 @@ vi.mock("@Core/vr/VRManager.js", () => ({
   },
 }));
 
-// REAL VRExplorationSession — session convergence needs its actual id/
+// REAL VRExplorationSession â€” session convergence needs its actual id/
 // ownerUserId/participants behavior, unlike other VRExplorationManager test
 // files that stub it as `class {}`.
 
 vi.mock("@Core/vr/VRParticipantSync.js", () => ({
   VRParticipantSync: vi.fn().mockImplementation(function (session) {
     this._session = session;
+    // Mirrors the real class's independent _boundSessionId guard (see
+    // VRParticipantSync.rekey) so this mock can't mask a regression of the
+    // shared-mutable-session no-op bug it was fixed for.
+    this._boundSessionId = session.id;
     this.start = vi.fn();
     this.stop = vi.fn();
     this.updateLocalState = vi.fn();
     this.rekey = vi.fn((newSessionId) => {
+      if (!newSessionId || newSessionId === this._boundSessionId) return;
       this._session.id = newSessionId;
+      this._boundSessionId = newSessionId;
     });
     mockParticipantSyncInstances.push(this);
   }),
@@ -61,9 +67,12 @@ vi.mock("@Core/vr/VRParticipantSync.js", () => ({
 vi.mock("@Core/vr/VRControlManager.js", () => ({
   VRControlManager: vi.fn().mockImplementation(function (session) {
     this._session = session;
+    this._boundSessionId = session.id;
     this.cleanup = vi.fn();
     this.rekey = vi.fn((newSessionId) => {
+      if (!newSessionId || newSessionId === this._boundSessionId) return;
       this._session.id = newSessionId;
+      this._boundSessionId = newSessionId;
     });
     mockControlManagerInstances.push(this);
   }),
@@ -96,9 +105,12 @@ vi.mock("@Collaboration/presence/userManagement.js", () => ({
   getUserId: vi.fn(() => "user-1"),
   getUserName: vi.fn(() => "Tester"),
   getUserColor: vi.fn(() => "#ff0000"),
+  getParticipantId: vi.fn(() => "user-1"),
+  getParticipantName: vi.fn(() => "Tester"),
+  isSelfIdentity: vi.fn((id) => id === "user-1"),
 }));
 vi.mock("@Core/instances/types/vtk/vr/VTKVRAvatars.js", () => ({
-  vrAvatarSystem: { initialize: vi.fn(), dispose: vi.fn(), update: vi.fn() },
+  vrAvatarSystem: { initialize: vi.fn(), dispose: vi.fn(), update: vi.fn(), rekey: vi.fn() },
 }));
 vi.mock("@Core/instances/types/vtk/vr/VTKVRSpatialUI.js", () => ({
   vrSpatialUI: { initialize: vi.fn(), dispose: vi.fn(), hitTest: vi.fn(), layout: vi.fn() },
@@ -130,6 +142,7 @@ import { vrExplorationManager } from "../VRExplorationManager.js";
 import { workspaceManager } from "@Core/instances/workspaceManager.js";
 import { apiClient } from "@Services/apiClient.js";
 import { yVRSessions, getVRSessionForView } from "@Collaboration/yjs/yjsSetup.js";
+import { vrAvatarSystem } from "@Core/instances/types/vtk/vr/VTKVRAvatars.js";
 
 // datasetId defaults to "ds-1" (matching most tests below); pass null to
 // simulate an instance with no dataset metadata attached yet, which is what
@@ -152,15 +165,16 @@ function makeInstance(viewConfigId, instanceId, datasetId = "ds-1") {
   };
 }
 
-describe("VRExplorationManager — session convergence (Y.js vr-sessions registry)", () => {
+describe("VRExplorationManager â€” session convergence (Y.js vr-sessions registry)", () => {
   beforeEach(async () => {
     yVRSessions.clear();
     mockParticipantSyncInstances.length = 0;
     mockControlManagerInstances.length = 0;
     apiClient.post.mockReset();
     apiClient.post.mockResolvedValue({ id: "server-session-1" });
+    vi.mocked(vrAvatarSystem.rekey).mockReset();
 
-    // Reset the singleton's state — leaveSession() isn't exercised here, and
+    // Reset the singleton's state â€” leaveSession() isn't exercised here, and
     // these tests deliberately call startExploration() more than once on the
     // same manager instance to simulate independent "taps".
     vrExplorationManager._offVRSessionObserver?.();
@@ -183,12 +197,12 @@ describe("VRExplorationManager — session convergence (Y.js vr-sessions registr
       expect.objectContaining({ viewConfigurationId: "view-1" })
     );
     // Registry key is the resolved session key (datasetId, since it's present
-    // here) — see _resolveSessionKey — not the raw viewConfigId.
+    // here) â€” see _resolveSessionKey â€” not the raw viewConfigId.
     expect(getVRSessionForView("ds-1")?.sessionId).toBe("server-session-1");
 
     apiClient.post.mockClear();
 
-    // Second "tap" on the same view — a different instance object (as a
+    // Second "tap" on the same view â€” a different instance object (as a
     // fresh workspaceManager lookup would return), same viewConfigId.
     workspaceManager.getInstance.mockReturnValueOnce(makeInstance("view-1", "inst-2"));
 
@@ -202,7 +216,7 @@ describe("VRExplorationManager — session convergence (Y.js vr-sessions registr
   // Regression test for the multi-headset bug: each client's ViewConfiguration
   // UUID is minted independently by its own createView()/POST /views call, so
   // two Quest headsets opening the SAME dataset in the SAME room never share a
-  // viewConfigId — only datasetId is common between them. Keying convergence
+  // viewConfigId â€” only datasetId is common between them. Keying convergence
   // on viewConfigId (the old behaviour) meant they'd claim two different
   // registry slots and could never see each other's avatars/poses.
   it("two clients with the same datasetId but different viewConfigId converge on one sessionId", async () => {
@@ -215,7 +229,7 @@ describe("VRExplorationManager — session convergence (Y.js vr-sessions registr
     apiClient.post.mockClear();
 
     // Second headset: DIFFERENT viewConfigId (its own local ViewConfiguration),
-    // SAME datasetId — the actual real-world shape of the bug.
+    // SAME datasetId â€” the actual real-world shape of the bug.
     workspaceManager.getInstance.mockReturnValueOnce(makeInstance("view-B", "inst-2", "ds-shared"));
 
     const second = await vrExplorationManager.startExploration("inst-2", {});
@@ -226,8 +240,8 @@ describe("VRExplorationManager — session convergence (Y.js vr-sessions registr
   });
 
   // The other half of _resolveSessionKey: an instance with no dataset id yet
-  // (e.g. handler hasn't attached dataset metadata) must still converge —
-  // via the viewConfigId fallback — rather than claiming a garbage/undefined
+  // (e.g. handler hasn't attached dataset metadata) must still converge â€”
+  // via the viewConfigId fallback â€” rather than claiming a garbage/undefined
   // key.
   it("falls back to viewConfigId when the instance has no datasetId", async () => {
     workspaceManager.getInstance.mockReturnValueOnce(makeInstance("view-1", "inst-1", null));
@@ -245,14 +259,14 @@ describe("VRExplorationManager — session convergence (Y.js vr-sessions registr
     expect(apiClient.post).not.toHaveBeenCalled();
   });
 
-  it("re-keys participantSync and controlManager when the claim race resolves against us", async () => {
+  it("re-keys EVERY session-scoped subsystem when the claim race resolves against us", async () => {
     workspaceManager.getInstance.mockReturnValueOnce(makeInstance("view-1", "inst-1"));
 
     const session = await vrExplorationManager.startExploration("inst-1", {});
     const ourId = session.id;
 
     // Simulate a competing client's write landing AFTER our own claim
-    // resolved locally (see claimVRSession's docstring in yjsSetup.js) — the
+    // resolved locally (see claimVRSession's docstring in yjsSetup.js) â€” the
     // post-claim observer (_watchVRSessionConvergence) is still attached at
     // this point (its ~3s window hasn't elapsed).
     const winningRecord = {
@@ -277,5 +291,39 @@ describe("VRExplorationManager — session convergence (Y.js vr-sessions registr
     const controlManager = mockControlManagerInstances[mockControlManagerInstances.length - 1];
     expect(participantSync.rekey).toHaveBeenCalledWith("vrsession_winner");
     expect(controlManager.rekey).toHaveBeenCalledWith("vrsession_winner");
+
+    // Every subsystem keyed by session id has to move, not just the two that
+    // happened to be asserted here originally. The avatar system was the one
+    // left behind: poses re-keyed and kept flowing, so the session looked
+    // healthy, while avatar METADATA was filtered out on both sides and each
+    // headset rendered the other as a grey, hex-named blob for good.
+    expect(vrAvatarSystem.rekey).toHaveBeenCalledWith("vrsession_winner");
+  });
+
+  it("mutates session.id BEFORE re-keying the avatar system", async () => {
+    // AvatarManager reads session.id live and re-broadcasts on rekey(). If the
+    // mutation ran after, it would announce the losing id — the exact bug the
+    // live read was meant to eliminate.
+    workspaceManager.getInstance.mockReturnValueOnce(makeInstance("view-1", "inst-1"));
+    const session = await vrExplorationManager.startExploration("inst-1", {});
+
+    let idAtAvatarRekey = null;
+    vi.mocked(vrAvatarSystem.rekey).mockImplementation(() => {
+      idAtAvatarRekey = session.id;
+    });
+
+    yVRSessions.set("ds-1", {
+      sessionId: "vrsession_winner",
+      viewConfigurationId: "ds-1",
+      hostUserId: "user-2",
+      hostUserName: "Other User",
+      datasetId: "ds-1",
+      projectId: null,
+      createdAt: Date.now(),
+      lastHeartbeat: Date.now(),
+      participantCount: 1,
+    });
+
+    expect(idAtAvatarRekey).toBe("vrsession_winner");
   });
 });

@@ -37,6 +37,8 @@ import {
   pushSharedWidgetToggle,
   resolveActiveWorkspaceId,
   canModifyActiveView,
+  resolveShareMode,
+  getPermissionDeniedReason,
 } from '../visualizationSyncService.js';
 
 function mockActiveWorkspace(id) {
@@ -72,12 +74,76 @@ describe('visualizationSyncService', () => {
     });
   });
 
-  describe('permission gating', () => {
-    test('canModifyActiveView is false with no active workspace', () => {
+  describe('share mode', () => {
+    // No workspace is not a denial — there is no role to deny. Treating it as
+    // one is what silently broke every locally-loaded VTP: VR was refused and
+    // told the user their *role* was read-only, for a role that did not exist,
+    // while the desktop tools (which bypassed this gate entirely) synced fine.
+    test('no workspace resolves to ephemeral, not blocked', () => {
       mockActiveWorkspace(null);
-      expect(canModifyActiveView()).toBe(false);
+      expect(resolveShareMode()).toBe('ephemeral');
+      expect(canModifyActiveView()).toBe(true);
+      expect(getPermissionDeniedReason()).toBeNull();
     });
 
+    test('workspace + permission resolves to full', () => {
+      mockActiveWorkspace('ws-1');
+      permissionService.getCachedRole.mockReturnValue('editor');
+      permissionService.hasPermission.mockReturnValue(true);
+
+      expect(resolveShareMode()).toBe('full');
+      expect(getPermissionDeniedReason()).toBeNull();
+    });
+
+    // The role check stays exactly as strict as before whenever a workspace
+    // DOES exist.
+    test('workspace + denied role resolves to blocked', () => {
+      mockActiveWorkspace('ws-1');
+      permissionService.getCachedRole.mockReturnValue('viewer');
+      permissionService.hasPermission.mockReturnValue(false);
+
+      expect(resolveShareMode()).toBe('blocked');
+      expect(canModifyActiveView()).toBe(false);
+      expect(getPermissionDeniedReason()).toBe('View is read-only for your role');
+    });
+  });
+
+  describe('ephemeral mode (no active workspace)', () => {
+    // Distinct view ids per test: the Y.js send throttle keys its leading-edge
+    // state by viewId and is module-level, so reusing 'view-1' here would defer
+    // the first send of the tests further down into a timer.
+    beforeEach(() => {
+      mockActiveWorkspace(null);
+    });
+
+    test('visualization transmits over Y.js but skips the durable persist', () => {
+      const result = pushSharedVisualizationUpdate('view-eph-viz', { opacity: 0.5 }, 'dataset-1');
+
+      expect(syncVisualizationToYjs).toHaveBeenCalledWith(
+        'view-eph-viz', 'user-1', { opacity: 0.5 }, 'dataset-1'
+      );
+      expect(mockManager.updateVisualization).not.toHaveBeenCalled();
+      // transmitted:true is what stops callers reporting a working sync as a
+      // failure — VR flashes a "not shared" notice on !persisted alone.
+      expect(result).toEqual({
+        persisted: false,
+        transmitted: true,
+        reason: 'no-active-workspace',
+      });
+    });
+
+    test('camera transmits over Y.js but skips the durable persist', () => {
+      const result = pushSharedCameraUpdate('view-eph-cam', { position: [0, 0, 5] }, 'dataset-1');
+
+      expect(syncCameraToYjs).toHaveBeenCalledWith(
+        'view-eph-cam', 'user-1', { position: [0, 0, 5] }, 'dataset-1'
+      );
+      expect(mockManager.updateCamera).not.toHaveBeenCalled();
+      expect(result.transmitted).toBe(true);
+    });
+  });
+
+  describe('permission gating', () => {
     test('canModifyActiveView reflects permissionService.hasPermission', () => {
       mockActiveWorkspace('ws-1');
       permissionService.getCachedRole.mockReturnValue('editor');
@@ -106,7 +172,7 @@ describe('visualizationSyncService', () => {
 
       const result = pushSharedCameraUpdate('view-1', { position: [0, 0, 5] });
 
-      expect(syncCameraToYjs).toHaveBeenCalledWith('view-1', 'user-1', { position: [0, 0, 5] });
+      expect(syncCameraToYjs).toHaveBeenCalledWith('view-1', 'user-1', { position: [0, 0, 5] }, null);
       expect(mockManager.updateCamera).toHaveBeenCalledWith('view-1', { position: [0, 0, 5] });
       expect(result).toEqual({ persisted: true });
     });
@@ -138,7 +204,7 @@ describe('visualizationSyncService', () => {
 
       const result = pushSharedVisualizationUpdate('view-1', { opacity: 0.5 });
 
-      expect(syncVisualizationToYjs).toHaveBeenCalledWith('view-1', 'user-1', { opacity: 0.5 });
+      expect(syncVisualizationToYjs).toHaveBeenCalledWith('view-1', 'user-1', { opacity: 0.5 }, null);
       expect(mockManager.updateVisualization).toHaveBeenCalledWith('view-1', { opacity: 0.5 });
       expect(result).toEqual({ persisted: true });
     });

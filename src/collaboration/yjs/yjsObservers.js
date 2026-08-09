@@ -24,7 +24,7 @@ import {
   yManipulatorState,
   yActiveDataset,
 } from "@Collaboration/yjs/yjsSetup.js";
-import { getUserId } from "@Collaboration/presence/userManagement.js";
+import { getUserId, getParticipantId } from "@Collaboration/presence/userManagement.js";
 import { sync as log } from "@Utils/logger.js";
 
 // ============================================================================
@@ -105,16 +105,19 @@ export function initializeAvatarObserver() {
   log.debug("Setting up avatar presence observer");
 
   yAvatars.observe((event) => {
-    const myId = getUserId();
+    // yAvatars is keyed per DEVICE, so the self-skip must be too — comparing
+    // against getUserId() made a second headset on the same account look like
+    // "me" and silently dropped its avatar.
+    const myId = getParticipantId();
 
-    event.changes.keys.forEach((change, avatarUserId) => {
+    event.changes.keys.forEach((change, avatarParticipantId) => {
       // Skip own avatar
-      if (avatarUserId === myId) return;
+      if (avatarParticipantId === myId) return;
 
-      const avatarData = yAvatars.get(avatarUserId);
+      const avatarData = yAvatars.get(avatarParticipantId);
       avatarChangeCallbacks.forEach((cb) => {
         try {
-          cb({ action: change.action, userId: avatarUserId, data: avatarData });
+          cb({ action: change.action, userId: avatarParticipantId, data: avatarData });
         } catch (error) {
           log.error("Avatar observer callback error:", error);
         }
@@ -196,6 +199,7 @@ export function initializeCameraObserver() {
             viewId,
             camera: cameraData?.camera,
             userId: cameraData?.userId,
+            syncKey: cameraData?.syncKey,
           });
         } catch (error) {
           log.error("Camera observer callback error:", error);
@@ -242,6 +246,7 @@ export function initializeVisualizationObserver() {
             viewId,
             visualization: data.visualization,
             userId: data.userId,
+            syncKey: data.syncKey,
           });
         } catch (error) {
           log.error("Visualization observer callback error:", error);
@@ -360,9 +365,11 @@ export function initializeAllObservers() {
   // - WebSocket: serverSync.js broadcasts
 
   // Diagnostic: log collaboration identity on connect
-  const myId = getUserId();
   console.group("[CIA Collab] Observers initialized");
-  console.log("User ID:", myId);
+  console.log("Account ID:", getUserId());
+  // Two headsets on ONE account share the account id above and differ only
+  // here — the first thing to compare when they cannot see each other.
+  console.log("Participant ID (unique per device):", getParticipantId());
   console.log("Y.js clientID (unique per connection):", ydoc.clientID);
   console.groupEnd();
 

@@ -42,6 +42,9 @@ vi.mock("@Collaboration/presence/userManagement.js", () => ({
   getUserId: vi.fn(() => "user-1"),
   getUserName: vi.fn(() => "Tester"),
   getUserColor: vi.fn(() => "#ff0000"),
+  getParticipantId: vi.fn(() => "user-1"),
+  getParticipantName: vi.fn(() => "Tester"),
+  isSelfIdentity: vi.fn((id) => id === "user-1"),
 }));
 vi.mock("@Core/instances/types/vtk/vr/VTKVRAvatars.js", () => ({
   vrAvatarSystem: { initialize: vi.fn(), dispose: vi.fn(), update: vi.fn() },
@@ -84,7 +87,7 @@ describe("VRExplorationManager isolation mode", () => {
     expect((0.5 - ctx.vrOrigin[2]) * ctx.vrScale).toBeLessThan(-2);
 
     // GROUNDED: the data-space bottom (dataBounds[2] = 0) maps to physical
-    // y = PEDESTAL_HEIGHT_M (0.5), not the literal floor — see
+    // y = PEDESTAL_HEIGHT_M (0.5), not the literal floor â€” see
     // VRExplorationManager.js's PEDESTAL_HEIGHT_M. This is what stops a
     // two-hand zoom lifting the model overhead.
     expect((ctx.dataBounds[2] - ctx.vrOrigin[1]) * ctx.vrScale).toBeCloseTo(0.5, 10);

@@ -16,7 +16,7 @@ import {
   yAvatars,
   syncAvatarToYjs,
 } from '@Collaboration/yjs/yjsSetup.js';
-import { getUserId } from '@Collaboration/presence/userManagement.js';
+import { getParticipantId } from '@Collaboration/presence/userManagement.js';
 
 export class AvatarNetworkSync {
   constructor() {
@@ -28,7 +28,7 @@ export class AvatarNetworkSync {
     this._updateEventHandler = null;
     this._leaveEventHandler = null;
 
-    this._localUserId = null;
+    this._localParticipantId = null;
     this._lastSentPresence = null;
   }
 
@@ -36,7 +36,10 @@ export class AvatarNetworkSync {
    * Start listening for remote avatar events.
    */
   initialize() {
-    this._localUserId = getUserId();
+    // Per-DEVICE, not per-account: two headsets signed into one account share
+    // a getUserId(), which made them collide on a single yAvatars entry and
+    // skip each other's updates as their own. See getParticipantId().
+    this._localParticipantId = getParticipantId();
 
     // Remote POSE updates arrive as custom window events dispatched by VRParticipantSync
     this._updateEventHandler = (e) => this._onParticipantUpdate(e.detail);
@@ -46,13 +49,13 @@ export class AvatarNetworkSync {
 
     // Remote PRESENCE (metadata) via Y.js avatar map
     const observer = (event) => {
-      const myId = this._localUserId;
-      event.changes.keys.forEach((change, userId) => {
-        if (userId === myId) return;
-        const data = yAvatars.get(userId);
+      const myId = this._localParticipantId;
+      event.changes.keys.forEach((change, participantId) => {
+        if (participantId === myId) return;
+        const data = yAvatars.get(participantId);
         if (!data) return;
         try {
-          this._remotePresenceCb?.(userId, data);
+          this._remotePresenceCb?.(participantId, data);
         } catch (err) {
           log.error('AvatarNetworkSync presence callback error:', err);
         }
@@ -78,12 +81,12 @@ export class AvatarNetworkSync {
    * @private
    */
   _replayPresenceSnapshot() {
-    const myId = this._localUserId;
+    const myId = this._localParticipantId;
     let replayed = 0;
-    yAvatars.forEach((data, userId) => {
-      if (!data || userId === myId) return;
+    yAvatars.forEach((data, participantId) => {
+      if (!data || participantId === myId) return;
       try {
-        this._remotePresenceCb?.(userId, data);
+        this._remotePresenceCb?.(participantId, data);
         replayed += 1;
       } catch (err) {
         log.error('AvatarNetworkSync presence snapshot error:', err);
@@ -112,15 +115,15 @@ export class AvatarNetworkSync {
    *   activity?: string|null }} state
    */
   sendLocalPresence(state) {
-    const userId = this._localUserId;
-    if (!userId) return;
+    const participantId = this._localParticipantId;
+    if (!participantId) return;
 
     // Skip if nothing changed
     const serialized = JSON.stringify(state);
     if (serialized === this._lastSentPresence) return;
     this._lastSentPresence = serialized;
 
-    syncAvatarToYjs(userId, {
+    syncAvatarToYjs(participantId, {
       displayName: state.displayName,
       color: state.color,
       avatarUrl: state.avatarUrl || null,
@@ -169,7 +172,7 @@ export class AvatarNetworkSync {
 
   _onParticipantUpdate(detail) {
     const userId = detail?.odUserId;
-    if (!userId || userId === this._localUserId) return;
+    if (!userId || userId === this._localParticipantId) return;
 
     const data = detail?.data;
     if (!data) return;
@@ -187,7 +190,7 @@ export class AvatarNetworkSync {
 
   _onParticipantLeft(detail) {
     const userId = detail?.odUserId;
-    if (!userId || userId === this._localUserId) return;
+    if (!userId || userId === this._localParticipantId) return;
     try {
       this._remoteLeaveCb?.(userId);
     } catch (err) {

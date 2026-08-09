@@ -35,6 +35,9 @@ vi.mock("@Collaboration/presence/userManagement.js", () => ({
   getUserId: vi.fn(() => "user-1"),
   getUserName: vi.fn(() => "Tester"),
   getUserColor: vi.fn(() => "#ff0000"),
+  getParticipantId: vi.fn(() => "user-1"),
+  getParticipantName: vi.fn(() => "Tester"),
+  isSelfIdentity: vi.fn((id) => id === "user-1"),
 }));
 vi.mock("@Core/instances/types/vtk/vr/VTKVRAvatars.js", () => ({
   vrAvatarSystem: { initialize: vi.fn() },
@@ -176,7 +179,7 @@ describe("VRExplorationManager tool-result persistence", () => {
 
 // ---------------------------------------------------------------------------
 // Draft state machine wiring: fixing a point (annotation-pending) and
-// discarding it (annotation-cancelled) must never touch the server — only
+// discarding it (annotation-cancelled) must never touch the server â€” only
 // Save (confirmAnnotationDraft -> annotation-created) may. Also covers the
 // in-flight-undo hole: undo racing ahead of an in-flight create POST.
 // ---------------------------------------------------------------------------
@@ -275,7 +278,7 @@ describe("VR annotation draft persistence", () => {
 
     vrExplorationManager._handleToolAction({ type: "annotation-created", data });
     // Let the create POST actually fire (and capture resolveCreate) before
-    // the user's undo lands — mirrors a keyboard user hitting Undo a beat
+    // the user's undo lands â€” mirrors a keyboard user hitting Undo a beat
     // before the network round-trip finishes.
     await flush();
 

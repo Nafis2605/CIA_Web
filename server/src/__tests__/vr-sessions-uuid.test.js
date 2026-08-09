@@ -10,6 +10,13 @@
 
 'use strict';
 
+// Must be set before requiring ../routes/vr — auth.js's DEV_BYPASS_AUTH is a
+// module-load-time constant. This lets getUserId(req) resolve to DEV_USER's
+// id (no x-user-id header needed below, and no optionalAuth mount in
+// buildApp()) instead of the 401 it would now correctly return post-H1.
+process.env.DEV_BYPASS_AUTH = 'true';
+process.env.NODE_ENV = 'development';
+
 const express = require('express');
 const request = require('supertest');
 

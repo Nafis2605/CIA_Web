@@ -32,8 +32,7 @@ export function useRecordings() {
   });
 
   const durationIntervalRef = useRef(null);
-  const projectId =
-    sessionManager.getProjectId?.() || sessionManager.getRoomId?.();
+  const projectId = sessionManager.getProjectId();
   const apiBase = config.apiBaseUrl || "http://localhost:3001/api";
 
   // ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@ import { useState, useEffect, useCallback, useMemo } from "react";
 import { vrManager } from "@Core/vr/VRManager.js";
 import { vrExplorationManager } from "@Core/vr/VRExplorationManager.js";
 import { apiClient } from "@Services/apiClient.js";
-import { getUserId } from "@Collaboration/presence/userManagement.js";
+import { isSelfIdentity } from "@Collaboration/presence/userManagement.js";
 import { toast } from "@UI/react/store/toastStore.js";
 
 /**
@@ -361,10 +361,13 @@ export function useVRSession(projectId) {
     [currentSession]
   );
 
-  // Check if current user is session owner
+  // Check if current user is session owner.
+  // isSelfIdentity, not an exact compare: ownerUserId is a participant id when
+  // the session was claimed through the Y.js registry, but a bare account id
+  // when it came back from the server.
   const isOwner = useMemo(() => {
     if (!currentSession) return false;
-    return currentSession.ownerUserId === getUserId();
+    return isSelfIdentity(currentSession.ownerUserId);
   }, [currentSession]);
 
   // Get sessions relevant to a specific dataset. activeSessions rows are raw

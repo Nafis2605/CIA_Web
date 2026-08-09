@@ -1,7 +1,7 @@
 // src/core/vr/__tests__/VRExplorationManager.manipulationGate.test.js
 // Phase 3: a VR participant who does NOT hold the data-manipulation token must
 // not be able to push shared visualization patches, enter move-object mode, or
-// place annotations/measurements — and must be TOLD why rather than silently
+// place annotations/measurements â€” and must be TOLD why rather than silently
 // desyncing. The critical regression guarded here is the fail-open path: with
 // no lock at all (VRExplorationManager.vizsync.test.js fabricates exactly that
 // shape) everything must still work as it did before this feature landed.
@@ -45,6 +45,9 @@ vi.mock("@Collaboration/presence/userManagement.js", () => ({
   getUserId: vi.fn(() => "peer-2"),
   getUserName: vi.fn(() => "Bob"),
   getUserColor: vi.fn(() => "#ff0000"),
+  getParticipantId: vi.fn(() => "peer-2"),
+  getParticipantName: vi.fn(() => "Bob"),
+  isSelfIdentity: vi.fn((id) => id === "peer-2"),
 }));
 vi.mock("@Core/instances/types/vtk/vr/VTKVRAvatars.js", () => ({
   vrAvatarSystem: { initialize: vi.fn(), dispose: vi.fn() },
@@ -135,7 +138,7 @@ function primeContext() {
   };
 }
 
-describe("VRExplorationManager — manipulation gate", () => {
+describe("VRExplorationManager â€” manipulation gate", () => {
   beforeEach(() => {
     mockPush.mockClear();
     mockSyncManipulator.mockClear();
@@ -160,7 +163,9 @@ describe("VRExplorationManager — manipulation gate", () => {
 
     vrExplorationManager._pushVisualizationPatch({ representation: "wireframe" });
 
-    expect(mockPush).toHaveBeenCalledWith("view-1", { representation: "wireframe" });
+    // Third arg is the cross-client sync key. This fixture has no datasetId,
+    // so it falls back to viewConfigId (see @Core/instances/viewSyncKey.js).
+    expect(mockPush).toHaveBeenCalledWith("view-1", { representation: "wireframe" }, "view-1");
     // The EXISTING desktop manipulator-awareness channel, not new plumbing.
     expect(mockSyncManipulator).toHaveBeenCalledWith("peer-2", "Bob", "dataset", "manipulating");
   });
@@ -193,7 +198,7 @@ describe("VRExplorationManager — manipulation gate", () => {
 
     vrExplorationManager._pushVisualizationPatch({ representation: "points" });
 
-    expect(mockPush).toHaveBeenCalledWith("view-1", { representation: "points" });
+    expect(mockPush).toHaveBeenCalledWith("view-1", { representation: "points" }, "view-1");
     expect(vrExplorationManager.getVRNotice()).toBeNull();
   });
 
@@ -210,7 +215,7 @@ describe("VRExplorationManager — manipulation gate", () => {
   });
 });
 
-describe("VRExplorationManager — navigation gate (move-object)", () => {
+describe("VRExplorationManager â€” navigation gate (move-object)", () => {
   let nav;
 
   beforeEach(() => {
@@ -253,7 +258,7 @@ describe("VRExplorationManager — navigation gate (move-object)", () => {
     expect(nav.cycleMode).toHaveBeenCalledTimes(2);
   });
 
-  it("setVRScale — a per-user viewpoint concern — is never gated", () => {
+  it("setVRScale â€” a per-user viewpoint concern â€” is never gated", () => {
     vrExplorationManager._manipulationLock = blockedLock();
     nav.setScale = vi.fn();
 
@@ -264,7 +269,7 @@ describe("VRExplorationManager — navigation gate (move-object)", () => {
   });
 });
 
-describe("VRExplorationManager — public delegates", () => {
+describe("VRExplorationManager â€” public delegates", () => {
   beforeEach(() => {
     primeContext();
   });
@@ -307,10 +312,10 @@ describe("VRExplorationManager — public delegates", () => {
 });
 
 // The tools take the predicate through VRToolManager's _toolContext (a live
-// getter surface) rather than importing VRExplorationManager — which imports
+// getter surface) rather than importing VRExplorationManager â€” which imports
 // them, so a direct import would be a cycle.
 describe("VR tool placement gate", () => {
-  /** A right-hand trigger rising edge — the placement gesture. */
+  /** A right-hand trigger rising edge â€” the placement gesture. */
   const pull = {
     controllers: { right: { triggerPressed: true, buttons: {}, targetRay: { origin: [0, 0, 0], direction: [0, 0, -1] } } },
   };

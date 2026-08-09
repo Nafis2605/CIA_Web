@@ -5,7 +5,7 @@
 // session ends. VRExplorationManager drives the lifecycle.
 
 import { vr as log } from '@Utils/logger.js';
-import { getUserId, getUserName, getUserColor } from '@Collaboration/presence/userManagement.js';
+import { getUserColor, getParticipantId, getParticipantName } from '@Collaboration/presence/userManagement.js';
 import { LocalAvatarController } from './LocalAvatarController.js';
 import { RemoteAvatarController } from './RemoteAvatarController.js';
 import { AvatarNetworkSync } from './AvatarNetworkSync.js';
@@ -24,8 +24,54 @@ export class AvatarManager {
     this._localUserInfo = null;
     this._localAvatarUrl = null;
     this._enabled = true;
-    // yAvatars is ROOM-global, not per VR session — see _onRemotePresence.
-    this._sessionId = null;
+    // Session id the last outbound presence carried — see rekey().
+    this._lastBroadcastSessionId = null;
+  }
+
+  // ===========================================================================
+  // SESSION IDENTITY
+  // ===========================================================================
+
+  /**
+   * The session this avatar system currently belongs to.
+   *
+   * Read live from `_session` rather than copied into a field at initialize().
+   * `VRExplorationManager` MUTATES that same object when a session-claim race
+   * resolves against us (`session.id = record.sessionId` in
+   * _watchVRSessionConvergence), so a cached copy silently goes stale — and
+   * because this id is both stamped on outgoing presence and compared against
+   * incoming presence, a stale copy makes the two headsets reject each other's
+   * metadata symmetrically. Reading live removes the drift entirely.
+   *
+   * yAvatars is ROOM-global, not per VR session — see _onRemotePresence for why
+   * the id is needed at all.
+   *
+   * @returns {string|null}
+   */
+  get sessionId() {
+    return this._session?.id || null;
+  }
+
+  /**
+   * Re-point this avatar system at a different session id.
+   *
+   * The inbound filter needs no help — `sessionId` above is already live. What
+   * this exists for is the OUTBOUND half: `_broadcastPresence` only fires on an
+   * avatarUrl/speaking/activity change, which may never happen again in a
+   * session, so without an explicit nudge our peers would keep seeing the id we
+   * announced before the race resolved.
+   *
+   * Called from VRExplorationManager._watchVRSessionConvergence alongside the
+   * participantSync / controlManager / manipulationLock re-keys.
+   *
+   * @param {string} sessionId - the winning session id
+   */
+  rekey(sessionId) {
+    if (!sessionId || sessionId === this._lastBroadcastSessionId) return;
+    // No need to reset AvatarNetworkSync's unchanged-payload short-circuit:
+    // sessionId is part of the payload it hashes, so this is never suppressed.
+    this._broadcastPresence();
+    log.debug(`AvatarManager re-keyed to session ${sessionId}`);
   }
 
   // ===========================================================================
@@ -44,12 +90,13 @@ export class AvatarManager {
     this._renderer = renderer;
     this._session = session;
     this._vrContext = vrContext;
-    this._sessionId = session?.id || null;
 
     this._localUserInfo = {
-      userId: getUserId(),
-      displayName: getUserName(),
-      color: getUserColor(),
+      // Per-device: two headsets on one account must be two avatars, with two
+      // distinct colours (getUserColor hashes whatever id it is given).
+      userId: getParticipantId(),
+      displayName: getParticipantName(),
+      color: getUserColor(getParticipantId()),
       avatarUrl: this._localAvatarUrl,
       isSpeaking: false,
       // 'dataset' | 'filter' | null — see setLocalActivity.
@@ -170,12 +217,14 @@ export class AvatarManager {
    */
   _broadcastPresence() {
     if (!this._localUserInfo) return;
+    const sessionId = this.sessionId;
+    this._lastBroadcastSessionId = sessionId;
     this._networkSync.sendLocalPresence({
       displayName: this._localUserInfo.displayName,
       color: this._localUserInfo.color,
       avatarUrl: this._localUserInfo.avatarUrl || null,
       isSpeaking: this._localUserInfo.isSpeaking || false,
-      sessionId: this._sessionId,
+      sessionId,
       activity: this._localUserInfo.activity || null,
     });
   }
@@ -217,9 +266,10 @@ export class AvatarManager {
     this._localController.dispose();
     this._networkSync.dispose();
     this._renderer = null;
+    // Nulling _session also clears the session id — it is a live read now.
     this._session = null;
     this._vrContext = null;
-    this._sessionId = null;
+    this._lastBroadcastSessionId = null;
     log.debug('AvatarManager disposed');
   }
 
@@ -248,7 +298,12 @@ export class AvatarManager {
     // too, and would otherwise be spawned into our scene. Only reject on a
     // positive mismatch — a peer that predates the sessionId field (or a
     // session with no id yet) still gets an avatar rather than vanishing.
-    if (this._sessionId && data?.sessionId && data.sessionId !== this._sessionId) {
+    //
+    // `sessionId` is a live read (see the getter): after a claim race resolves
+    // against us it already reflects the winning id, so we do not reject the
+    // winner's presence while still thinking we are in the losing session.
+    const sessionId = this.sessionId;
+    if (sessionId && data?.sessionId && data.sessionId !== sessionId) {
       return;
     }
 

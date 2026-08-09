@@ -4,9 +4,10 @@
 //
 // Broadcast side: VRExplorationManager._broadcastPointerRay publishes the VR
 // user's controller ray (already converted to DATA space) through
-// vrCursorSync.broadcastVRPointer → Y.js "vrCursors" map, keyed by userId and
-// carrying { mode: 'vr-controller', viewId, rayOrigin, rayDirection, hand,
-// userName, userColor, timestamp }.
+// vrCursorSync.broadcastVRPointer → Y.js "vrCursors" map, keyed by PARTICIPANT
+// id (account+device, see getParticipantId) and carrying { mode:
+// 'vr-controller', viewId, rayOrigin, rayDirection, hand, userName, userColor,
+// timestamp }.
 //
 // This module is the desktop consumer: per attached instance it subscribes
 // vrCursorSync.onRemoteCursor(viewConfigId, cb) and maintains one line actor
@@ -17,7 +18,11 @@
 
 import { cursor as log } from "@Utils/logger.js";
 import { vrCursorSync } from "@Core/vr/VRCursorSync.js";
-import { getUserId, getUserName, getUserColor } from "@Collaboration/presence/userManagement.js";
+import {
+  getUserColor,
+  getParticipantId,
+  getParticipantName,
+} from "@Collaboration/presence/userManagement.js";
 import { hexToRgb } from "@Utils/colorHelpers.js";
 
 import vtkActor from "@kitware/vtk.js/Rendering/Core/Actor";
@@ -65,7 +70,14 @@ export class VTKRemoteVRRays {
 
     // Render-side consumers must also initialize vrCursorSync so its Y.js
     // observers are attached (idempotent).
-    vrCursorSync.initialize(getUserId(), getUserName(), getUserColor(getUserId()));
+    //
+    // Must pass the SAME identity VRExplorationManager does. initialize()
+    // overwrites _localUserId on every call, so mixing an account id here with
+    // a participant id there would leave the broadcast keyed by whichever ran
+    // last — reintroducing the two-headsets-one-entry collision on a headset
+    // that also renders a desktop view.
+    const participantId = getParticipantId();
+    vrCursorSync.initialize(participantId, getParticipantName(), getUserColor(participantId));
 
     const state = {
       sceneObjects,

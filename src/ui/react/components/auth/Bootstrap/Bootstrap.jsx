@@ -94,6 +94,20 @@ export function Bootstrap() {
             log.debug("Bootstrap: Initializing auth service...");
             await authService.initialize();
 
+            // Authoritative room-access check — see sessionManager.revalidateAccess().
+            // Phase 1's own validation (appInitializer.js) runs before auth exists
+            // and can only proceed optimistically on a 401; this is the real check.
+            // A reload is the simplest correct way to re-run the boot sequence
+            // cleanly against the corrected room (matches switchRoom()'s existing
+            // "reload to reconnect Y.js" convention) and guarantees Phase 2 never
+            // starts against a room access was actually denied for.
+            const roomChanged = await sessionManager.revalidateAccess();
+            if (roomChanged) {
+                log.info("Bootstrap: Room access corrected after authentication — reloading");
+                window.location.reload();
+                return;
+            }
+
             const isAuthenticated = authService.isAuthenticated();
             log.debug(`Bootstrap: Auth status - authenticated: ${isAuthenticated}, devBypass: ${isDevBypass}`);
 
@@ -428,7 +442,7 @@ export function Bootstrap() {
                     <CIAWebApp
                         username={username}
                         userId={getUserId()}
-                        projectId={sessionManager.getRoomId()}
+                        projectId={sessionManager.getProjectId()}
                     />
                 </div>
             </DevUserProvider>

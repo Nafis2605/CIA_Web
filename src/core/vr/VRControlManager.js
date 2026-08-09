@@ -2,12 +2,16 @@
 // Manages desktop-to-VR control handoff
 
 import { vr as log } from '@Utils/logger.js';
-import { getUserId, getUserName } from '@Collaboration/presence/userManagement.js';
+// Per-device identity: every toUserId/fromUserId check below is "is this
+// request addressed to ME?", and with the account id a request aimed at one
+// headset was also accepted by the other headset on the same account.
+import { getParticipantId, getParticipantName } from '@Collaboration/presence/userManagement.js';
 import { ydoc } from '@Collaboration/yjs/yjsSetup.js';
 
 export class VRControlManager {
   constructor(session) {
     this._session = session;
+    this._boundSessionId = session.id;
     this._yControlRequests = ydoc.getMap(`vr-control-${session.id}`);
     this._pendingRequest = null;
     this._observers = [];
@@ -20,17 +24,17 @@ export class VRControlManager {
       event.changes.keys.forEach((change, key) => {
         const data = this._yControlRequests.get(key);
 
-        if (data?.type === 'request' && data.toUserId === getUserId()) {
+        if (data?.type === 'request' && data.toUserId === getParticipantId()) {
           // Someone is requesting to control us. No approval UI exists yet —
           // requests surface only through respondToControl() being called
           // programmatically (e.g. auto-approval when the session allows it).
           log.info(`VR control requested by ${data.fromUserName} (${data.fromUserId})`);
         }
 
-        if (data?.type === 'response' && data.toUserId === getUserId()) {
+        if (data?.type === 'response' && data.toUserId === getParticipantId()) {
           // Response to our request
           if (data.approved) {
-            this._session.establishControl(getUserId(), data.fromUserId);
+            this._session.establishControl(getParticipantId(), data.fromUserId);
           }
           log.info(`VR control request ${data.approved ? 'approved' : 'denied'} by ${data.fromUserId}`);
           this._pendingRequest = null;
@@ -69,15 +73,15 @@ export class VRControlManager {
     const requestId = `req_${Date.now()}`;
     this._yControlRequests.set(requestId, {
       type: 'request',
-      fromUserId: getUserId(),
-      fromUserName: getUserName(),
+      fromUserId: getParticipantId(),
+      fromUserName: getParticipantName(),
       toUserId: targetUserId,
       timestamp: Date.now(),
     });
 
     if (!this._session.requireControlApproval) {
       // Auto-approve
-      this._session.establishControl(getUserId(), targetUserId);
+      this._session.establishControl(getParticipantId(), targetUserId);
       this._pendingRequest = null;
       return { status: 'established' };
     }
@@ -94,7 +98,7 @@ export class VRControlManager {
     // Get the pending request for us
     let requestData = null;
     this._yControlRequests.forEach((data, key) => {
-      if (data.type === 'request' && data.toUserId === getUserId()) {
+      if (data.type === 'request' && data.toUserId === getParticipantId()) {
         requestData = data;
       }
     });
@@ -102,15 +106,15 @@ export class VRControlManager {
     if (!requestData) return;
 
     if (approved) {
-      this._session.establishControl(requestData.fromUserId, getUserId());
+      this._session.establishControl(requestData.fromUserId, getParticipantId());
     } else {
-      this._session.declineControlRequest(requestData.fromUserId, getUserId());
+      this._session.declineControlRequest(requestData.fromUserId, getParticipantId());
     }
 
     // Broadcast response
     this._yControlRequests.set(responseId, {
       type: 'response',
-      fromUserId: getUserId(),
+      fromUserId: getParticipantId(),
       toUserId: requestData.fromUserId,
       approved,
       timestamp: Date.now(),
@@ -121,13 +125,13 @@ export class VRControlManager {
    * Release control
    */
   async releaseControl() {
-    this._session.releaseControl(getUserId());
+    this._session.releaseControl(getParticipantId());
 
     // Broadcast release
     const releaseId = `release_${Date.now()}`;
     this._yControlRequests.set(releaseId, {
       type: 'release',
-      fromUserId: getUserId(),
+      fromUserId: getParticipantId(),
       timestamp: Date.now(),
     });
   }
@@ -156,12 +160,13 @@ export class VRControlManager {
    * @param {string} newSessionId
    */
   rekey(newSessionId) {
-    if (!newSessionId || newSessionId === this._session.id) return;
+    if (!newSessionId || newSessionId === this._boundSessionId) return;
 
     this._observers.forEach(cleanup => cleanup());
     this._observers = [];
 
     this._session.id = newSessionId;
+    this._boundSessionId = newSessionId;
     this._yControlRequests = ydoc.getMap(`vr-control-${newSessionId}`);
     this._pendingRequest = null;
 

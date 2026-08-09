@@ -101,8 +101,15 @@ router.get("/:roomId", validateRoomId, async (req, res, next) => {
   try {
     const { projectId, roomId } = req.params;
     const userId = getUserId(req);
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
     const { pool } = req.app.locals;
 
+    // Mirrors checkRoomDocumentAccess() in the root server.js Y.js server —
+    // same access model (room member, or public room + project member) —
+    // rather than the is_member/my_role fields below being purely
+    // informational and never actually gating who can see the room.
     const result = await pool.query(
       `
       SELECT
@@ -112,11 +119,18 @@ router.get("/:roomId", validateRoomId, async (req, res, next) => {
         (SELECT rm.role FROM room_members rm WHERE rm.room_id = r.id AND rm.user_id = $2) as my_role
       FROM rooms r
       WHERE r.id = $1 AND r.project_id = $3
+        AND (
+          EXISTS(SELECT 1 FROM room_members rm WHERE rm.room_id = r.id AND rm.user_id = $2)
+          OR (r.is_public = true AND EXISTS(
+            SELECT 1 FROM project_members pm WHERE pm.project_id = r.project_id AND pm.user_id = $2
+          ))
+        )
     `,
       [roomId, userId, projectId]
     );
 
     if (result.rows.length === 0) {
+      // 404, not 403 — don't confirm existence of a private room to a non-member.
       return res.status(404).json({ error: "Room not found" });
     }
 

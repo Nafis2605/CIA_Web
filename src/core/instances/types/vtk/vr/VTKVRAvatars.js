@@ -64,6 +64,18 @@ class VRAvatarSystem {
     this._manager?.setLocalActivity(target);
   }
 
+  /**
+   * Re-point the avatar system at a different VR session id after a
+   * session-claim race resolves against this client. Must be called alongside
+   * the participantSync / controlManager / manipulationLock re-keys, or this
+   * client keeps announcing the losing session id and every peer filters its
+   * avatar metadata out.
+   * @param {string} sessionId - the winning session id
+   */
+  rekey(sessionId) {
+    this._manager?.rekey(sessionId);
+  }
+
   dispose() {
     this._manager?.dispose();
     this._manager = null;

@@ -10,6 +10,8 @@ import {
   hasDeviceName,
 } from "@Core/identity/deviceIdentity.js";
 
+export { getDeviceId } from "@Core/identity/deviceIdentity.js";
+
 // Initialize or retrieve user ID
 let userId = localStorage.getItem("cia_user_id");
 if (!userId) {
@@ -82,6 +84,99 @@ export function getUserId() {
     return authUser.id;
   }
   return userId;
+}
+
+// =============================================================================
+// PARTICIPANT IDENTITY (account + device)
+//
+// getUserId() answers "WHOSE account is this?" — it is the Keycloak subject in
+// production, and it is what ownership, permissions and every server row are
+// keyed by. It must keep meaning exactly that.
+//
+// It is NOT a usable presence key. Two headsets signed into one account return
+// the identical string from it, so they write the same entry in every Y.js
+// presence map and each one's observer then skips the other's writes as its
+// own — the two devices are invisible to each other while appearing perfectly
+// connected. (deviceIdentity.js was written for precisely this failure in dev
+// bypass; production's authenticated path never reaches it.)
+//
+// getParticipantId() answers the different question presence actually asks:
+// "WHICH connected device is this?" Use it for anything that identifies a peer
+// in the room — Y.js presence keys, self-vs-remote checks, avatar colour, the
+// LiveKit identity — and keep getUserId() for ownership and server calls.
+// =============================================================================
+
+/** Separator between the account and device halves. Never appears in a UUID. */
+const PARTICIPANT_ID_SEPARATOR = "#";
+
+/**
+ * Stable identity for THIS device's presence in the room.
+ *
+ * Composite rather than the bare device id so the owning account stays
+ * recoverable (see getAccountId) — rosters, permission checks and the LiveKit
+ * token validation all need to get back to it.
+ *
+ * @returns {string} `<accountId>#<deviceId>`
+ */
+export function getParticipantId() {
+  return `${getUserId()}${PARTICIPANT_ID_SEPARATOR}${getDeviceId()}`;
+}
+
+/**
+ * Recover the account id from a participant id.
+ * Tolerates being handed a plain account id (returns it unchanged), so callers
+ * can pass through values from older clients or server rows without branching.
+ *
+ * @param {string} participantId
+ * @returns {string}
+ */
+export function getAccountId(participantId) {
+  return String(participantId ?? "").split(PARTICIPANT_ID_SEPARATOR)[0];
+}
+
+/**
+ * Does `id` refer to this client?
+ *
+ * For OWNERSHIP checks only (am I the host? did I author this?) — never for a
+ * presence-map self-skip, which must compare participant ids exactly or two
+ * devices on one account collapse back into one peer.
+ *
+ * Accepts both forms because they legitimately mix: the Y.js registry stores
+ * participant ids, while a server row (`owner_user_id`, derived from the auth
+ * token) stores the bare account id. A bare id matches on the account, a
+ * composite id must match this exact device.
+ *
+ * @param {string|null|undefined} id
+ * @returns {boolean}
+ */
+export function isSelfIdentity(id) {
+  if (!id) return false;
+  const value = String(id);
+  if (value.includes(PARTICIPANT_ID_SEPARATOR)) {
+    return value === getParticipantId();
+  }
+  return value === getUserId();
+}
+
+/**
+ * Display name for this device, disambiguated when the account may be signed
+ * in on more than one at once.
+ *
+ * Two headsets on one account would otherwise both render "Fahim" with no way
+ * to tell which avatar is which. Dev-bypass names are already per-device
+ * (getDeviceName), so only the authenticated path needs the suffix.
+ *
+ * @returns {string}
+ */
+export function getParticipantName() {
+  const baseName = getUserName();
+  if (isDevBypassMode()) return baseName;
+
+  const deviceLabel = getDeviceName();
+  if (!baseName) return deviceLabel;
+  // Already device-specific (the user typed a name on this device only).
+  if (!deviceLabel || baseName === deviceLabel) return baseName;
+  return `${baseName} (${deviceLabel})`;
 }
 
 export function getUserName() {

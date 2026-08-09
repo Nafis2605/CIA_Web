@@ -93,8 +93,7 @@ export class ViewConfigurationManager extends BaseManager {
     log.info("Initializing...");
 
     // Get project ID for API calls
-    this._projectId =
-      sessionManager.getProjectId?.() || config.defaultSessionId;
+    this._projectId = sessionManager.getProjectId();
 
     // Start cleanup task
     this._startCleanupTask();

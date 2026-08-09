@@ -25,6 +25,15 @@ import { permissionService, PERMISSIONS } from "@Services/permissionService.js";
 
 const NO_VIEW = { persisted: false, reason: "no-active-view" };
 const NO_PERMISSION = { persisted: false, reason: "permission-denied" };
+// Sent to collaborators but not written to a ViewConfiguration, because there
+// is no active workspace to own one. `transmitted: true` is what distinguishes
+// this from an actual refusal — callers that only check `persisted` would
+// otherwise report a working sync as a failure.
+const TRANSMITTED_ONLY = {
+  persisted: false,
+  transmitted: true,
+  reason: "no-active-workspace",
+};
 
 const _roleFetchInFlight = new Set();
 
@@ -42,7 +51,7 @@ const _roleFetchInFlight = new Set();
 const YJS_SEND_THROTTLE_MS = 50;
 
 function createViewPatchThrottle(sendFn, throttleMs = YJS_SEND_THROTTLE_MS) {
-  const state = new Map(); // viewId -> { lastSent, timer, pending, userId }
+  const state = new Map(); // viewId -> { lastSent, timer, pending, userId, syncKey }
 
   const flush = (viewId) => {
     const e = state.get(viewId);
@@ -54,16 +63,20 @@ function createViewPatchThrottle(sendFn, throttleMs = YJS_SEND_THROTTLE_MS) {
       clearTimeout(e.timer);
       e.timer = null;
     }
-    if (e.userId) sendFn(viewId, e.userId, patch);
+    if (e.userId) sendFn(viewId, e.userId, patch, e.syncKey);
   };
 
-  return (viewId, userId, patch) => {
+  return (viewId, userId, patch, syncKey = null) => {
     let e = state.get(viewId);
     if (!e) {
-      e = { lastSent: 0, timer: null, pending: null, userId };
+      e = { lastSent: 0, timer: null, pending: null, userId, syncKey };
       state.set(viewId, e);
     }
     e.userId = userId;
+    // Latest wins, but never let a caller that omitted the key erase one we
+    // already have — a mid-drag patch from a path that doesn't resolve it
+    // would otherwise make the trailing flush unroutable for peers.
+    if (syncKey) e.syncKey = syncKey;
     e.pending = { ...(e.pending || {}), ...patch };
 
     const elapsed = Date.now() - e.lastSent;
@@ -87,13 +100,41 @@ export function resolveActiveWorkspaceId() {
 }
 
 /**
- * Synchronous permission check for shared-view edits, using whatever role is
- * currently cached. Kicks off a background role fetch if nothing is cached
- * yet for this workspace, so subsequent calls become accurate.
+ * How much of the sync pipeline a change is allowed to use right now.
+ *
+ * WHY THREE STATES AND NOT A BOOLEAN
+ * The old boolean folded "there is no workspace" into "you lack permission",
+ * which broke the most common local workflow: opening a VTP file never
+ * activates a workspace, so every VR change was refused and the user was told
+ * their *role* was read-only — for a role that did not exist. Worse, the
+ * desktop VTK tools never consulted this gate at all, so the SAME clipBox /
+ * threshold / representation change broadcast fine from the tools menu while VR
+ * was blocked.
+ *
+ * No workspace means no permission model to enforce, not "deny everything".
+ * There is nothing to persist to either, so that case transmits over Y.js and
+ * skips only the durable write. Once a workspace DOES exist, the role check is
+ * exactly as strict as it has always been.
+ *
+ * @typedef {'ephemeral'|'full'|'blocked'} ShareMode
  */
-export function canModifyActiveView() {
+
+/** Y.js only — no workspace to persist to, and no roles to enforce. */
+const SHARE_EPHEMERAL = "ephemeral";
+/** Y.js + durable REST persist. */
+const SHARE_FULL = "full";
+/** Nothing: a workspace exists and this role may not modify the view. */
+const SHARE_BLOCKED = "blocked";
+
+/**
+ * Resolve how much of the pipeline the local user may use for the active view.
+ * Kicks off a background role fetch when nothing is cached yet, so subsequent
+ * calls become accurate.
+ * @returns {ShareMode}
+ */
+export function resolveShareMode() {
   const workspaceId = resolveActiveWorkspaceId();
-  if (!workspaceId) return false;
+  if (!workspaceId) return SHARE_EPHEMERAL;
 
   if (
     permissionService.getCachedRole(workspaceId) == null &&
@@ -105,27 +146,43 @@ export function canModifyActiveView() {
       .finally(() => _roleFetchInFlight.delete(workspaceId));
   }
 
-  return permissionService.hasPermission(workspaceId, PERMISSIONS.VIEW_MODIFY_CONFIGURATION);
+  return permissionService.hasPermission(workspaceId, PERMISSIONS.VIEW_MODIFY_CONFIGURATION)
+    ? SHARE_FULL
+    : SHARE_BLOCKED;
+}
+
+/**
+ * Whether the local user may modify the active shared view.
+ *
+ * True in ephemeral mode as well as full: with no workspace there is no role to
+ * deny, and refusing there is what silently broke local-file collaboration.
+ * @returns {boolean}
+ */
+export function canModifyActiveView() {
+  return resolveShareMode() !== SHARE_BLOCKED;
 }
 
 /** Human-readable reason to show in the panel when a control is gated. */
 export function getPermissionDeniedReason() {
-  const workspaceId = resolveActiveWorkspaceId();
-  if (!workspaceId) return null;
-  return canModifyActiveView() ? null : "View is read-only for your role";
+  return resolveShareMode() === SHARE_BLOCKED ? "View is read-only for your role" : null;
 }
 
 /**
  * Push a camera update: ephemeral Y.js (real-time) + throttled durable persist.
  * @param {string} viewId
  * @param {object} cameraPatch - partial camera state (position, focalPoint, viewUp, viewAngle, ...)
+ * @param {string|null} [syncKey] - cross-client sync key (see viewSyncKey.js)
  */
-export function pushSharedCameraUpdate(viewId, cameraPatch) {
+export function pushSharedCameraUpdate(viewId, cameraPatch, syncKey = null) {
   if (!viewId) return NO_VIEW;
-  if (!canModifyActiveView()) return NO_PERMISSION;
+
+  const mode = resolveShareMode();
+  if (mode === SHARE_BLOCKED) return NO_PERMISSION;
 
   const userId = getUserId();
-  if (userId) _throttledCameraSend(viewId, userId, cameraPatch);
+  if (userId) _throttledCameraSend(viewId, userId, cameraPatch, syncKey);
+
+  if (mode === SHARE_EPHEMERAL) return TRANSMITTED_ONLY;
   getViewConfigurationManager()?.updateCamera(viewId, cameraPatch);
 
   return { persisted: true };
@@ -137,13 +194,22 @@ export function pushSharedCameraUpdate(viewId, cameraPatch) {
  * Y.js (real-time) + throttled durable persist.
  * @param {string} viewId
  * @param {object} patch - shallow patch, e.g. { opacity: 0.5 } or { transform: {...} }
+ * @param {string|null} [syncKey] - cross-client sync key (see viewSyncKey.js).
+ *   Without it the patch only reaches peers that happen to share this exact
+ *   viewId, which ad-hoc-opened views never do.
  */
-export function pushSharedVisualizationUpdate(viewId, patch) {
+export function pushSharedVisualizationUpdate(viewId, patch, syncKey = null) {
   if (!viewId) return NO_VIEW;
-  if (!canModifyActiveView()) return NO_PERMISSION;
+
+  const mode = resolveShareMode();
+  if (mode === SHARE_BLOCKED) return NO_PERMISSION;
 
   const userId = getUserId();
-  if (userId) _throttledVizSend(viewId, userId, patch);
+  if (userId) _throttledVizSend(viewId, userId, patch, syncKey);
+
+  // No workspace: the peer still sees the change, but there is no
+  // ViewConfiguration to write it to, so it does not survive a reload.
+  if (mode === SHARE_EPHEMERAL) return TRANSMITTED_ONLY;
   getViewConfigurationManager()?.updateVisualization(viewId, patch);
 
   return { persisted: true };
@@ -161,7 +227,7 @@ export function pushSharedVisualizationUpdate(viewId, patch) {
  */
 export function pushSharedWidgetToggle(viewId, widgetType, active) {
   if (!viewId) return NO_VIEW;
-  if (!canModifyActiveView()) return NO_PERMISSION;
+  if (resolveShareMode() === SHARE_BLOCKED) return NO_PERMISSION;
 
   const vcm = getViewConfigurationManager();
   const view = vcm?.getView(viewId);

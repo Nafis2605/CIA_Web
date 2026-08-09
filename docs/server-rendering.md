@@ -6,13 +6,14 @@ Browser-based VTK.js rendering has hard limits:
 
 - Large datasets (20–50 MB VTP files) must be fully downloaded to the browser before rendering begins
 - WebGL is limited by GPU memory available to the browser tab
-- VR headsets (Quest) have constrained GPUs that cannot handle complex scientific geometry
 - Browser-side VTK.js does not support all VTK features (volume rendering, filters, pipelines)
 
 The CIA_Web server-rendering architecture moves compute and rendering to a dedicated Python VTK server. The browser becomes a thin client that:
 - Displays rendered PNG/JPEG frames in an `<img>` element
 - Forwards mouse/wheel events as camera commands
 - Receives updated frames at interactive rates
+
+**Not connected to VR.** This is a desktop-only, opt-in path for viewing large datasets in a regular browser tab. `VRExplorationManager` (`src/core/vr/VRExplorationManager.js`) requires a local WebGL/VTK rendering context and always renders locally regardless of `RENDER_MODE` — entering VR throws if no local context is available, with no server-rendered fallback. `ServerRenderedViewport.jsx` has no per-eye/stereo projection, no Quest head/controller pose ingestion, no WebXR layer integration, and no avatar/annotation/measurement overlays, so it cannot currently serve an immersive session. Solving VR's own GPU-constraint problem (Quest hardware can't handle complex scientific geometry) would need a dedicated design — stereo frame delivery, pose ingestion, a WebXR layer, and a synchronized interaction protocol — none of which exists today; this document describes the existing desktop server-rendering path only.
 
 ---
 

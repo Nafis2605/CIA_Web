@@ -17,12 +17,25 @@ import { VRControlManager } from '@Core/vr/VRControlManager.js';
 import { VRManipulationLock } from '@Core/vr/VRManipulationLock.js';
 import { VRNavigationController } from '@Core/vr/navigation/VRNavigationController.js';
 import { workspaceManager } from '@Core/instances/workspaceManager.js';
+import { resolveViewSyncKey } from '@Core/instances/viewSyncKey.js';
 import { getViewConfigurationManager } from '@Init/appInitializer.js';
-import { getUserId, getUserName, getUserColor } from '@Collaboration/presence/userManagement.js';
+// getParticipantId(), NOT getUserId(), is the identity every peer-facing check
+// below uses: two headsets on one account share a getUserId(), so "is this me?"
+// answered yes on both and each device claimed the other's host role, lock and
+// avatar. getUserId() stays only where an ACCOUNT is meant.
+import {
+  getUserId,
+  getUserName,
+  getUserColor,
+  getParticipantId,
+  getParticipantName,
+  isSelfIdentity,
+} from '@Collaboration/presence/userManagement.js';
 // Room id for the collaboration diagnostic — it is the Y.Doc room every peer
 // must share, and the first thing to compare when two headsets cannot see
 // each other. See getCollaborationDiagnostics().
 import { sessionManager } from '@Core/session/sessionManager.js';
+import { getDeviceId } from '@Core/identity/deviceIdentity.js';
 import { apiClient } from '@Services/apiClient.js';
 import { BaseManager } from '@Core/data/managers/BaseManager.js';
 import { vrAvatarSystem } from '@Core/instances/types/vtk/vr/VTKVRAvatars.js';
@@ -40,6 +53,7 @@ import { instanceTools } from '@VTK/vtkInstanceTools.js';
 import { pushSharedVisualizationUpdate } from '@Services/visualizationSyncService.js';
 import { vrCursorSync } from '@Core/vr/VRCursorSync.js';
 import {
+  ydoc,
   yVRSessions,
   getVRSessionForView,
   claimVRSession,
@@ -183,6 +197,13 @@ class VRExplorationManager extends BaseManager {
     // force vrSpatialUI.forceReanchor() after a snap-turn (see there).
     this._lastMenuYawOffset = 0;
 
+    // Per-frame error dedupe — a throw inside the XR loop repeats at headset
+    // frame rate, so each distinct "<step>:<message>" is logged once. Cleared
+    // between sessions by _resetFrameErrorState; without that reset a fault
+    // that recurred in a later session of the same page load logged nothing.
+    this._frameErrorSignatures = new Set();
+    this._lastFrameErrorSignature = null;
+
     // In-VR "follow a collaborator" — soft positional follow only, never
     // touches head orientation (see followParticipant/_updateParticipantFollow).
     this._followTargetUserId = null;
@@ -270,8 +291,8 @@ class VRExplorationManager extends BaseManager {
       viewConfigurationId: instance.viewConfigId,
       datasetId: instance.instanceData?.dataset?.id,
       projectId: instance.instanceData?.projectId,
-      ownerUserId: serverSession?.owner_user_id || getUserId(),
-      ownerUserName: serverSession?.owner_user_name || getUserName(),
+      ownerUserId: serverSession?.owner_user_id || getParticipantId(),
+      ownerUserName: serverSession?.owner_user_name || getParticipantName(),
       ...sessionConfig,
     });
 
@@ -312,8 +333,8 @@ class VRExplorationManager extends BaseManager {
         }
         const claimed = claimVRSession(sessionKey, {
           sessionId: session.id,
-          hostUserId: getUserId(),
-          hostUserName: getUserName(),
+          hostUserId: getParticipantId(),
+          hostUserName: getParticipantName(),
           datasetId: session.datasetId,
           projectId: session.projectId,
         });
@@ -325,9 +346,9 @@ class VRExplorationManager extends BaseManager {
 
     // Add self as participant
     session.addParticipant(
-      getUserId(),
-      getUserName(),
-      getUserColor(),
+      getParticipantId(),
+      getParticipantName(),
+      getUserColor(getParticipantId()),
       serverSession ? sessionConfig.participationMode || PARTICIPATION_MODE.VR_EXPLORER : PARTICIPATION_MODE.VR_EXPLORER
     );
 
@@ -444,6 +465,11 @@ class VRExplorationManager extends BaseManager {
     // Start session
     session.start();
 
+    // Fresh session, fresh error budget: the per-step dedupe suppresses repeat
+    // logs, so carrying signatures over from a previous session would silence a
+    // fault that recurs in this one.
+    this._resetFrameErrorState();
+
     // Drive our frame work off VRManager's single XR frame loop instead of
     // requesting our own animation frames.
     this._offFrame = vrManager.on('frame', this._onFrame);
@@ -457,7 +483,9 @@ class VRExplorationManager extends BaseManager {
     // channel; everyone else asks for it (see requestManipulationControl).
     this._safeInitStep('manipulationLock.start', () => {
       this._manipulationLock.start();
-      if (session.ownerUserId === getUserId()) {
+      // ownerUserId is a participant id from the Y.js registry, but a bare
+      // account id when it came from a server row — isSelfIdentity handles both.
+      if (isSelfIdentity(session.ownerUserId)) {
         this._manipulationLock.claimAsHost();
       }
       this._offManipulationLock = this._manipulationLock.onChange((state) =>
@@ -490,7 +518,11 @@ class VRExplorationManager extends BaseManager {
     // Pointer-ray broadcasting: desktop collaborators render this VR user's
     // controller ray via vrCursorSync (consumed by VTKRemoteVRRays).
     this._safeInitStep('vrCursorSync.initialize', () =>
-      vrCursorSync.initialize(getUserId(), getUserName(), getUserColor(getUserId()))
+      vrCursorSync.initialize(
+        getParticipantId(),
+        getParticipantName(),
+        getUserColor(getParticipantId())
+      )
     );
 
     // Print the room/session/view triple every peer must agree on. Cheap, once
@@ -525,7 +557,7 @@ class VRExplorationManager extends BaseManager {
       presenceSystem.setVRPresence({
         inVR: true,
         vrSessionId: session.id,
-        vrRole: session.ownerUserId === getUserId() ? 'host' : 'participant',
+        vrRole: isSelfIdentity(session.ownerUserId) ? 'host' : 'participant',
       })
     );
 
@@ -584,17 +616,17 @@ class VRExplorationManager extends BaseManager {
    * undefined when neither is available so callers preserve the existing
    * "no key, do nothing" behaviour instead of claiming/watching garbage.
    *
+   * Delegates to @Core/instances/viewSyncKey.js — the visualization and camera
+   * channels converge on the same key, and they must not be allowed to drift
+   * apart from session convergence. Only the empty case differs: this returns
+   * undefined where the shared helper returns null.
+   *
    * @param {object} instance - workspaceManager instance (see startExploration)
    * @returns {string|undefined}
    * @private
    */
   _resolveSessionKey(instance) {
-    return (
-      instance?.instanceData?.dataset?.id ||
-      instance?.datasetId ||
-      instance?.viewConfigId ||
-      undefined
-    );
+    return resolveViewSyncKey(instance) || undefined;
   }
 
   /**
@@ -608,8 +640,8 @@ class VRExplorationManager extends BaseManager {
    * @private
    */
   async _tryRegisterSession(session, timeoutMs = 1500) {
-    try {
-      const post = apiClient.post('/vr/sessions', {
+    const post = apiClient
+      .post('/vr/sessions', {
         viewConfigurationId: session.viewConfigurationId,
         datasetId: session.datasetId,
         projectId: session.projectId,
@@ -618,18 +650,88 @@ class VRExplorationManager extends BaseManager {
         allowJoin: session.allowJoin,
         allowDesktopParticipants: session.allowDesktopParticipants,
         allowDesktopControl: session.allowDesktopControl,
+        deviceId: getDeviceId(),
+        // Stable, client-generated collaboration id (session.id, minted at
+        // construction — see startExploration). Recorded on the row
+        // separately from its own server-generated PK so a late response
+        // can always be reconciled unambiguously.
+        clientSessionKey: session.id,
+      })
+      .catch((err) => {
+        log.warn('VR session server registration failed (continuing locally):', err.message);
+        return null;
       });
-      const timeout = new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs));
-      const serverRow = await Promise.race([post, timeout]);
-      if (serverRow?.id) {
-        log.debug(`VR session registered on server as ${serverRow.id}`);
-        return serverRow;
+
+    const TIMED_OUT = Symbol('vr-registration-timeout');
+    const timeout = new Promise((resolve) => setTimeout(() => resolve(TIMED_OUT), timeoutMs));
+    const raceResult = await Promise.race([post, timeout]);
+
+    if (raceResult !== TIMED_OUT) {
+      if (raceResult?.id) {
+        log.debug(`VR session registered on server as ${raceResult.id}`);
+        return raceResult;
       }
-      log.warn('VR session registration timed out; continuing with local id');
       return null;
-    } catch (err) {
-      log.warn('VR session server registration failed (continuing locally):', err.message);
-      return null;
+    }
+
+    // Timeout won. `post` is still running — do NOT drop it (that was the
+    // bug this fixes): reconcile against whatever it eventually resolves to,
+    // once _activeSession/sub-managers exist. Attaching this only in the
+    // timeout branch (rather than unconditionally on `post`) matters: a fast
+    // response resolves `post` before startExploration has set
+    // `_activeSession = session` (that happens well after this method
+    // returns), so reconciling unconditionally would see "not the active
+    // session yet" on every normal fast registration and delete the row it
+    // just created.
+    log.warn('VR session registration timed out; continuing with local id (reconciled if/when it completes)');
+    post.then((serverRow) => this._reconcileLateRegistration(session, serverRow));
+    return null;
+  }
+
+  /**
+   * Runs when a registration POST from _tryRegisterSession resolves AFTER
+   * its 1.5s race already timed out. If we're still on the local id it
+   * raced against, adopt the server's canonical id now — mirroring
+   * _watchVRSessionConvergence's rekey sequence exactly (see its comment for
+   * why order matters: session.id first, then sub-managers, so nothing reads
+   * a stale id mid-rekey). If we've since left, or a Y.js convergence race
+   * already re-keyed us onto a different session, this row is unreachable
+   * via Y.js and would otherwise sit orphaned in 'preparing' status forever
+   * — end it instead.
+   *
+   * @param {VRExplorationSession} session
+   * @param {object|null} serverRow
+   * @private
+   */
+  _reconcileLateRegistration(session, serverRow) {
+    if (!serverRow?.id || session.id === serverRow.id) return;
+
+    const stillUsingLocalId =
+      this._activeSession === session && String(session.id).startsWith('vrsession_');
+
+    if (!stillUsingLocalId) {
+      apiClient
+        .delete(`/vr/sessions/${serverRow.id}`)
+        .catch((err) => log.debug('Failed to clean up orphaned VR session row:', err.message));
+      return;
+    }
+
+    log.info(`VR session registration completed late — adopting server id ${serverRow.id}`);
+    session.id = serverRow.id;
+    this._participantSync?.rekey(serverRow.id);
+    this._controlManager?.rekey(serverRow.id);
+    this._manipulationLock?.rekey(serverRow.id);
+    vrAvatarSystem.rekey?.(serverRow.id);
+
+    const sessionKey = this._resolveSessionKey(this._activeContext?.instance);
+    if (sessionKey) {
+      claimVRSession(sessionKey, {
+        sessionId: serverRow.id,
+        hostUserId: session.ownerUserId,
+        hostUserName: session.ownerUserName,
+        datasetId: session.datasetId,
+        projectId: session.projectId,
+      });
     }
   }
 
@@ -665,12 +767,24 @@ class VRExplorationManager extends BaseManager {
       if (!record || record.sessionId === session.id) return;
 
       log.info(`VR session claim race resolved against us — re-keying ${session.id} -> ${record.sessionId}`);
-      this._participantSync?.rekey(record.sessionId);
-      this._controlManager?.rekey(record.sessionId);
-      this._manipulationLock?.rekey(record.sessionId);
+
+      // ORDER MATTERS. Mutate the session FIRST: AvatarManager holds this same
+      // object and reads `session.id` live (it used to cache a copy, which then
+      // went stale here and made both headsets filter out each other's avatar
+      // metadata). The three managers below take the id as an argument and so
+      // don't care, but vrAvatarSystem.rekey re-broadcasts using the live value
+      // and would announce the LOSING id if it ran before this line.
       session.id = record.sessionId;
       session.ownerUserId = record.hostUserId;
       session.ownerUserName = record.hostUserName;
+
+      this._participantSync?.rekey(record.sessionId);
+      this._controlManager?.rekey(record.sessionId);
+      this._manipulationLock?.rekey(record.sessionId);
+      vrAvatarSystem.rekey?.(record.sessionId);
+
+      // The ids every peer must agree on just changed — re-dump them.
+      this._logCollaborationDiagnostics('session-rekey');
     };
 
     yVRSessions.observe(observer);
@@ -709,7 +823,7 @@ class VRExplorationManager extends BaseManager {
   _tickVRSessionRegistry(sessionKey, session) {
     if (!sessionKey || !session) return;
 
-    heartbeatVRSession(sessionKey, getUserId());
+    heartbeatVRSession(sessionKey, getParticipantId());
 
     if (getVRSessionForView(sessionKey)) return; // host's slot is still live
 
@@ -720,19 +834,19 @@ class VRExplorationManager extends BaseManager {
       !best || p.joinedAt < best.joinedAt ? p : best,
       null
     );
-    if (!winner || winner.odUserId !== getUserId()) return; // not our turn
+    if (!winner || winner.odUserId !== getParticipantId()) return; // not our turn
 
     const claimed = claimVRSession(sessionKey, {
       sessionId: session.id,
-      hostUserId: getUserId(),
-      hostUserName: getUserName(),
+      hostUserId: getParticipantId(),
+      hostUserName: getParticipantName(),
       datasetId: session.datasetId,
       projectId: session.projectId,
     });
     session.ownerUserId = claimed.hostUserId;
     session.ownerUserName = claimed.hostUserName;
-    if (claimed.hostUserId === getUserId()) {
-      log.info(`VR session host promoted: ${getUserId()} claimed ${sessionKey}`);
+    if (claimed.hostUserId === getParticipantId()) {
+      log.info(`VR session host promoted: ${getParticipantId()} claimed ${sessionKey}`);
     }
   }
 
@@ -763,7 +877,7 @@ class VRExplorationManager extends BaseManager {
     log.info('Joining VR session...', { sessionId, mode });
 
     try {
-      const joinPost = apiClient.post(`/vr/sessions/${sessionId}/join`, { mode });
+      const joinPost = apiClient.post(`/vr/sessions/${sessionId}/join`, { mode, deviceId: getDeviceId() });
       const timeout = new Promise((resolve) => setTimeout(() => resolve(null), 1500));
       await Promise.race([joinPost, timeout]);
     } catch (err) {
@@ -850,6 +964,54 @@ class VRExplorationManager extends BaseManager {
     }
   }
 
+  /**
+   * Per-frame sibling of _safeInitStep, for steps whose failure must not cost
+   * this frame's presence broadcast.
+   *
+   * WHY: _onFrame wrapped ~20 calls in ONE try. The participant pose broadcast
+   * sits about two-thirds of the way down, behind navigation, tools, follow and
+   * isolation — so a throw in any of those jumped straight to the outer catch
+   * and skipped the broadcast, the avatar update and the handler's draw. The
+   * cause is per-frame state, so it then repeated every frame: the peer's
+   * avatar froze permanently while this headset carried on rendering a
+   * perfectly healthy-looking session.
+   *
+   * Errors are deduped per LABEL rather than globally, so a persistent throw in
+   * navigation still leaves a later throw in tools visible instead of masking
+   * it — the previous single-signature dedupe hid exactly that case.
+   *
+   * @param {string} label - step name, shown in the log
+   * @param {Function} fn
+   * @returns {*} fn's return value, or undefined if it threw
+   * @private
+   */
+  _safeFrameStep(label, fn) {
+    try {
+      return fn();
+    } catch (e) {
+      const signature = `${label}:${e?.message || String(e)}`;
+      if (!this._frameErrorSignatures.has(signature)) {
+        this._frameErrorSignatures.add(signature);
+        log.error(
+          `VR frame: ${label} failed — ${e?.message} (further identical errors suppressed)`,
+          e?.stack || e
+        );
+      }
+      return undefined;
+    }
+  }
+
+  /**
+   * Clear per-frame error dedupe state. Called on session start and teardown:
+   * the signatures are what suppress repeat logs, so carrying them across
+   * sessions means a fault that recurs in the NEXT session logs nothing at all.
+   * @private
+   */
+  _resetFrameErrorState() {
+    this._frameErrorSignatures.clear();
+    this._lastFrameErrorSignature = null;
+  }
+
   async leaveSession() {
     // Guard against re-entrancy: leaveSession() -> vrManager.exitVR() ->
     // XRSession "end" event -> our sessionEnded handler -> leaveSession()
@@ -890,8 +1052,8 @@ class VRExplorationManager extends BaseManager {
       // non-host (releaseVRSession itself also guards this, but checking
       // here avoids a pointless Y.js write from every leaving participant).
       await this._safeCleanupStep('vrSessionRegistry.release', () => {
-        if (sessionKey && session.ownerUserId === getUserId()) {
-          releaseVRSession(sessionKey, getUserId());
+        if (sessionKey && isSelfIdentity(session.ownerUserId)) {
+          releaseVRSession(sessionKey, session.ownerUserId);
         }
       });
 
@@ -941,7 +1103,7 @@ class VRExplorationManager extends BaseManager {
       // Notify the server (non-fatal; only meaningful for server-registered ids)
       if (session.id && !String(session.id).startsWith('vrsession_')) {
         apiClient
-          .post(`/vr/sessions/${session.id}/leave`, {})
+          .post(`/vr/sessions/${session.id}/leave`, { deviceId: getDeviceId() })
           .catch((err) => log.warn('VR session leave notification failed:', err.message));
       }
     } finally {
@@ -954,6 +1116,7 @@ class VRExplorationManager extends BaseManager {
       this._lastIsolationButtonState = false;
       this._lastMenuToggleButtonState = false;
       this._lastMenuYawOffset = 0;
+      this._resetFrameErrorState();
       this._followTargetUserId = null;
       this._inputProfileDetected = false;
       // The cached hit belongs to the picker on the vrContext just disposed.
@@ -1009,7 +1172,7 @@ class VRExplorationManager extends BaseManager {
   }
 
   getMyParticipant() {
-    return this._activeSession?.getParticipant(getUserId());
+    return this._activeSession?.getParticipant(getParticipantId());
   }
 
   /**
@@ -1020,7 +1183,7 @@ class VRExplorationManager extends BaseManager {
   getOtherParticipants() {
     const session = this._activeSession;
     if (!session) return [];
-    const selfId = getUserId();
+    const selfId = getParticipantId();
     return session.participants.filter((p) => p.odUserId !== selfId);
   }
 
@@ -1054,7 +1217,7 @@ class VRExplorationManager extends BaseManager {
     const session = this._activeSession;
     if (!session) return [];
 
-    const selfId = getUserId();
+    const selfId = getParticipantId();
     const hostId = session.ownerUserId || null;
     const holderId = this.getManipulationHolder()?.holderUserId || null;
 
@@ -1211,7 +1374,7 @@ class VRExplorationManager extends BaseManager {
   async updateParticipantMode(newMode) {
     if (!this._activeSession) return;
 
-    const participant = this._activeSession.updateParticipantMode(getUserId(), newMode);
+    const participant = this._activeSession.updateParticipantMode(getParticipantId(), newMode);
 
     // Sync via Y.js
     this._participantSync?.broadcastParticipant(participant);
@@ -1356,13 +1519,32 @@ class VRExplorationManager extends BaseManager {
       }
     })();
 
+    const instance = this._activeContext?.instance;
+    const vrSessionId = this._activeContext?.session?.id ?? null;
+
     return {
+      // MUST MATCH on both headsets ------------------------------------------
       roomId: sessionManager.getRoomId?.() ?? null,
-      vrSessionId: this._activeContext?.session?.id ?? null,
-      sessionKey: this._resolveSessionKey(this._activeContext?.instance) ?? null,
-      viewConfigId: this._activeContext?.instance?.viewConfigId ?? null,
-      userId: getUserId(),
-      userName: getUserName(),
+      datasetId: instance?.instanceData?.dataset?.id ?? instance?.datasetId ?? null,
+      sessionKey: this._resolveSessionKey(instance) ?? null,
+      vrSessionId,
+      // The Y.js map the poses actually travel through. Two headsets naming
+      // different maps here is the whole failure, stated in one line.
+      participantMap: vrSessionId ? `vr-participants-${vrSessionId}` : null,
+
+      // MUST DIFFER on both headsets -----------------------------------------
+      // viewConfigId is per-client by construction (each mints its own via
+      // POST /views); it is NOT a bug that these differ — see viewSyncKey.js.
+      viewConfigId: instance?.viewConfigId ?? null,
+      // Two headsets on ONE account share accountId and differ only in
+      // participantId — the fastest way to tell "same account, two devices"
+      // from "wrong room".
+      accountId: getUserId(),
+      participantId: getParticipantId(),
+      yjsClientId: ydoc.clientID,
+
+      // Session state --------------------------------------------------------
+      userName: getParticipantName(),
       participants: roster.length,
       peers: roster.filter((r) => !r.isSelf).map((r) => r.userName || r.odUserId),
       controlHolder: holder?.holderUserName || holder?.holderUserId || '(unheld)',
@@ -1376,13 +1558,28 @@ class VRExplorationManager extends BaseManager {
     };
   }
 
-  /** @private */
+  /**
+   * Print the collaboration snapshot.
+   *
+   * LEVEL IS LOAD-BEARING. This used to log at `info`, which the logger
+   * suppresses on any non-localhost host (see logger.js's defaultLevel) — and a
+   * headset is never localhost. The single diagnostic written specifically to
+   * debug two headsets therefore never printed on either of them. `warn`
+   * survives the default threshold, and one line per session (plus one per
+   * re-key) is a price worth paying to never lose it again.
+   *
+   * @param {string} reason - what triggered the dump
+   * @private
+   */
   _logCollaborationDiagnostics(reason) {
     try {
       const d = this.getCollaborationDiagnostics();
-      log.info(
-        `VR collab [${reason}] room=${d.roomId} session=${d.vrSessionId} ` +
-          `key=${d.sessionKey} view=${d.viewConfigId} as=${d.userName} participants=${d.participants} ` +
+      log.warn(
+        `VR collab [${reason}]\n` +
+          `  MUST MATCH  room=${d.roomId} dataset=${d.datasetId} key=${d.sessionKey}\n` +
+          `              session=${d.vrSessionId} map=${d.participantMap}\n` +
+          `  MUST DIFFER view=${d.viewConfigId} participant=${d.participantId} yjsClient=${d.yjsClientId}\n` +
+          `  account=${d.accountId} as=${d.userName} participants=${d.participants} ` +
           `peers=[${d.peers.join(', ')}] control=${d.controlHolder} voice=${d.voiceConnected}`
       );
       if (!d.sessionKey) {
@@ -1468,7 +1665,7 @@ class VRExplorationManager extends BaseManager {
    */
   _signalManipulation(target, action = 'manipulating') {
     try {
-      syncManipulatorToYjs(getUserId(), getUserName(), target, action);
+      syncManipulatorToYjs(getParticipantId(), getParticipantName(), target, action);
       // In-headset counterpart of the desktop awareness UI: a marker on THIS
       // user's avatar so the other headsets can see who is acting. Driven here
       // — at manipulation-event rate, then again on the idle timer — never per
@@ -1492,7 +1689,7 @@ class VRExplorationManager extends BaseManager {
       this._manipulatorIdleTimer = null;
     }
     try {
-      syncManipulatorToYjs(getUserId(), null, null, null);
+      syncManipulatorToYjs(getParticipantId(), null, null, null);
       vrAvatarSystem.setLocalActivity?.(null);
     } catch (err) {
       log.warn(`VR manipulator clear failed: ${err?.message}`);
@@ -1772,7 +1969,7 @@ class VRExplorationManager extends BaseManager {
       return false;
     }
     voiceRoomService
-      .joinRoom(getVoiceRoomName(), getUserName())
+      .joinRoom(getVoiceRoomName(), getParticipantName())
       .catch((err) => log.warn('Voice join failed:', err?.message));
     return true;
   }
@@ -2991,7 +3188,7 @@ class VRExplorationManager extends BaseManager {
 
     try {
       const mine = snapshot?.participantStates?.find(
-        (p) => p.odUserId === getUserId()
+        (p) => p.odUserId === getParticipantId()
       );
       const vrContext = this._activeContext?.vrContext;
       if (mine && vrContext) {
@@ -3260,7 +3457,14 @@ class VRExplorationManager extends BaseManager {
 
       // Update navigation (handles movement, teleport, scale). Nav consumes the
       // arbitration-gated clone so a menu pinch / tool pinch can't drive it.
-      if (this._navigationController) {
+      //
+      // Guarded from here down to the tool update: these steps sit UPSTREAM of
+      // the participant broadcast below, and used to share one try with it, so
+      // any throw here stopped this headset from publishing its pose — every
+      // frame, silently, for the rest of the session. Losing a frame of
+      // navigation is recoverable; losing presence entirely is not.
+      this._safeFrameStep('navigation', () => {
+        if (!this._navigationController) return;
         const navResult = this._navigationController.update(navInput, frame, deltaTime);
 
         // Apply navigation result to VR context
@@ -3286,35 +3490,38 @@ class VRExplorationManager extends BaseManager {
         if (navResult.grabEnded || navResult.teleporting) {
           this._persistVRHints(vrContext);
         }
-      }
+      });
 
       // In-VR follow: soft positional lerp toward the target participant.
       // Real locomotion input (thumbstick/teleport trigger) always wins and
       // cancels follow — mirrors followService's desktop
       // auto-unfollow-on-manual-move semantics. Reads the nav-gated clone so a
       // menu/tool pinch doesn't read as "the user is moving".
-      if (this._followTargetUserId) {
+      this._safeFrameStep('follow', () => {
+        if (!this._followTargetUserId) return;
         if (this._hasLocomotionInput(navInput)) {
           this.stopFollowing();
         } else {
           this._updateParticipantFollow(vrContext, deltaTime);
         }
-      }
+      });
 
       // B button (right controller) toggles isolation mode: pull the model
       // to room scale for walk-around inspection, press again to restore.
       const bPressed = inputState.controllers?.right?.buttons?.b || false;
       if (bPressed && !this._lastIsolationButtonState) {
-        this.toggleIsolation();
+        this._safeFrameStep('isolation-toggle', () => this.toggleIsolation());
       }
       this._lastIsolationButtonState = bPressed;
 
       // Update tools with the arbitration-gated clone so a pinch aimed at a
       // menu button never also fires the active tool.
-      const toolAction = this._toolManager?.update(toolInput, frame);
-      if (toolAction) {
-        this._handleToolAction(toolAction);
-      }
+      this._safeFrameStep('tools', () => {
+        const toolAction = this._toolManager?.update(toolInput, frame);
+        if (toolAction) {
+          this._handleToolAction(toolAction);
+        }
+      });
 
       // STEP 6.5 — pointer ray. Computed HERE, between the tools and the
       // participant broadcast, for one reason: its result has to ride along in
@@ -3324,9 +3531,11 @@ class VRExplorationManager extends BaseManager {
       // both of which the old inline _broadcastPointerRay already paid — and
       // the only expensive part (the surface pick) is capped at 10 Hz inside
       // and skipped entirely while the menu is hovered.
-      const pointerRay = this._computePointerRay(inputState, vrContext, {
-        skipPick: menuHovering,
-      });
+      // Guarded: a pick failure must degrade to "no ray this frame", not cost
+      // the pose broadcast on the next line.
+      const pointerRay = this._safeFrameStep('pointer-ray', () =>
+        this._computePointerRay(inputState, vrContext, { skipPick: menuHovering })
+      );
 
       // Update participant sync. Head/hand poses are in THIS user's own
       // physical XR space (each participant has an independent WebXR
@@ -3334,18 +3543,23 @@ class VRExplorationManager extends BaseManager {
       // remote viewers can convert into the one shared frame, data space,
       // using the SENDER's transform rather than their own (see
       // RemoteAvatarController._toScenePose).
-      this._participantSync?.updateLocalState({
-        headPose: inputState.headPose,
-        leftHandPose: inputState.controllers?.left?.pose,
-        rightHandPose: inputState.controllers?.right?.pose,
-        vrScale: vrContext.vrScale || 1.0,
-        vrOrigin: vrContext.vrOrigin || [0, 0, 0],
-        // XR metres (converted by the receiver with the transform above)...
-        pointer: pointerRay,
-        // ...and the surface hit, which is ALREADY data space and shared by
-        // every viewer — see VRParticipantSync.updateLocalState.
-        pointerHit: pointerRay?.hit || null,
-      });
+      //
+      // Guarded in its own right so that even a malformed pose can't take down
+      // the steps after it (avatars, the handler's stereo draw).
+      this._safeFrameStep('participant-broadcast', () =>
+        this._participantSync?.updateLocalState({
+          headPose: inputState.headPose,
+          leftHandPose: inputState.controllers?.left?.pose,
+          rightHandPose: inputState.controllers?.right?.pose,
+          vrScale: vrContext.vrScale || 1.0,
+          vrOrigin: vrContext.vrOrigin || [0, 0, 0],
+          // XR metres (converted by the receiver with the transform above)...
+          pointer: pointerRay,
+          // ...and the surface hit, which is ALREADY data space and shared by
+          // every viewer — see VRParticipantSync.updateLocalState.
+          pointerHit: pointerRay?.hit || null,
+        })
+      );
 
       // Shared vr-sessions registry housekeeping — heartbeat + host-promotion
       // check (see _tickVRSessionRegistry) — throttled to VR_SESSION_HEARTBEAT_MS,
@@ -3353,9 +3567,11 @@ class VRExplorationManager extends BaseManager {
       const nowForVRSessionRegistry = Date.now();
       if (nowForVRSessionRegistry - this._lastVRSessionHeartbeat >= VR_SESSION_HEARTBEAT_MS) {
         this._lastVRSessionHeartbeat = nowForVRSessionRegistry;
-        this._tickVRSessionRegistry(
-          this._resolveSessionKey(this._activeContext?.instance),
-          this._activeSession
+        this._safeFrameStep('vr-session-registry', () =>
+          this._tickVRSessionRegistry(
+            this._resolveSessionKey(this._activeContext?.instance),
+            this._activeSession
+          )
         );
         // Same 1 Hz budget: refresh our hold on the data-control token, or (as
         // host) reclaim one whose holder went stale. Internally throttled too,
@@ -3369,10 +3585,12 @@ class VRExplorationManager extends BaseManager {
 
       // Broadcast the active controller ray so desktop collaborators can see
       // where this VR user is pointing (throttled inside vrCursorSync).
-      this._broadcastPointerRay(pointerRay);
+      this._safeFrameStep('pointer-ray-broadcast', () =>
+        this._broadcastPointerRay(pointerRay)
+      );
 
       // Update avatar system
-      vrAvatarSystem.update(deltaTime, inputState);
+      this._safeFrameStep('avatars', () => vrAvatarSystem.update(deltaTime, inputState));
 
       // Everything that can mutate vrContext.vrScale/vrOrigin has now run:
       // navigation, participant-follow, the B-button isolation toggle, and
@@ -3416,12 +3634,15 @@ class VRExplorationManager extends BaseManager {
       this._emit('frame', { time, inputState, deltaTime });
 
     } catch (error) {
-      // This catch spans ~9 unguarded calls (pose correction, input gathering,
-      // menu hit-test, navigation, tools, follow, isolation). A throw in ANY of
-      // them silently skips everything downstream — including the tool update —
-      // and then repeats at headset frame rate. Log the stack, and dedupe on
-      // message so a per-frame throw produces one readable entry instead of
-      // thousands that bury it.
+      // BACKSTOP ONLY. The steps that used to make this catch load-bearing —
+      // navigation, follow, isolation, tools, pointer ray, the participant
+      // broadcast, avatars — are each wrapped in _safeFrameStep now, precisely
+      // so that one of them throwing can no longer skip the presence broadcast
+      // downstream of it and freeze this headset's avatar for every peer.
+      //
+      // What still reaches here is the genuinely frame-fatal set: pose
+      // correction, _gatherInputState (without inputState the rest is
+      // meaningless), the input gating, and the handler's stereo draw.
       const signature = error?.message || String(error);
       if (this._lastFrameErrorSignature !== signature) {
         this._lastFrameErrorSignature = signature;
@@ -3895,7 +4116,8 @@ class VRExplorationManager extends BaseManager {
       const key = Object.keys(patch)[0];
       const label = PATCH_LABELS[key] || 'That change';
 
-      const viewId = this._activeContext?.instance?.viewConfigId;
+      const instance = this._activeContext?.instance;
+      const viewId = instance?.viewConfigId;
       if (!viewId) {
         // A view opened without a server-side ViewConfiguration has a null
         // viewConfigId. The local change still applies, but there is nothing
@@ -3911,20 +4133,29 @@ class VRExplorationManager extends BaseManager {
       // desktop observers; everything else is a change to the dataset itself.
       this._signalManipulation(FILTER_PATCH_KEYS.has(key) ? 'filter' : 'dataset');
 
-      Promise.resolve(pushSharedVisualizationUpdate(viewId, patch))
+      // Same key VR session convergence uses (_resolveSessionKey): the peer
+      // headset opened this dataset itself and holds a DIFFERENT viewConfigId,
+      // so viewId alone would address a view no one else has.
+      Promise.resolve(
+        pushSharedVisualizationUpdate(viewId, patch, resolveViewSyncKey(instance))
+      )
         .then((result) => {
           // The service REFUSES by RETURNING { persisted: false, reason },
           // it does not throw — so the .catch() below never fires for the
           // most common failure. That made a refused sync completely silent
           // in VR: the local view changed, the other headset never saw it,
           // and nothing explained why.
-          if (result && result.persisted === false) {
-            this._flashVRNotice(
-              result.reason === 'permission-denied'
-                ? `${label} not shared — view is read-only for your role`
-                : `${label} not shared — no active collaboration workspace`
-            );
-          }
+          //
+          // `transmitted` is the case that is NOT a failure: with no active
+          // workspace the peer still receives the change, there is just no
+          // ViewConfiguration to persist it to. Reporting that as "not shared"
+          // would be exactly backwards.
+          if (!result || result.persisted || result.transmitted) return;
+          this._flashVRNotice(
+            result.reason === 'permission-denied'
+              ? `${label} not shared — view is read-only for your role`
+              : `${label} not shared — no view to share it against`
+          );
         })
         .catch((err) => log.warn(`VR visualization sync failed: ${err?.message}`));
     } catch (err) {

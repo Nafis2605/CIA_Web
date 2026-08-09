@@ -33,8 +33,21 @@ app.use(express.json());
 
 async function requireAuth(req, res, next) {
   if (DEV_BYPASS_AUTH) {
+    // There is no token to check here, so the body IS the identity. Fall back
+    // to the account half of participantId before the shared default: without
+    // it every dev client collapses onto ...0001, and resolveLiveKitIdentity
+    // then rejects each client's own participantId as "not theirs" — which is
+    // exactly the identity collision this is all meant to avoid.
+    const claimedAccountId =
+      typeof req.body?.participantId === "string"
+        ? req.body.participantId.split("#")[0]
+        : null;
+
     req.user = {
-      id: req.body?.userId || "00000000-0000-0000-0000-000000000001",
+      id:
+        req.body?.userId ||
+        claimedAccountId ||
+        "00000000-0000-0000-0000-000000000001",
       name: req.body?.userName || "Development User",
       email: req.body?.userEmail || "developer@localhost",
     };
@@ -69,6 +82,40 @@ const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET || "secret";
 const usingDevCredentials =
   !process.env.LIVEKIT_API_KEY || !process.env.LIVEKIT_API_SECRET;
 
+/**
+ * Resolve the LiveKit identity for a token request.
+ *
+ * LiveKit permits ONE connection per identity per room and force-disconnects
+ * the older one on a collision. Using the account id as the identity therefore
+ * meant two devices signed into the same account (two headsets, or a headset
+ * plus a desktop tab) repeatedly kicked each other out of voice. The client
+ * sends a per-device participant id — `<accountId>#<deviceId>` — instead.
+ *
+ * The body is untrusted, so the claimed id is honoured only when its account
+ * half matches the authenticated user; anything else falls back to the account
+ * id. Otherwise a caller could mint a token impersonating another user, or
+ * squat an identity to evict them from the room.
+ *
+ * @param {object} req - Express request (req.user is set by requireAuth)
+ * @param {string} fallbackName - identity to use when there is no user id
+ * @returns {string}
+ */
+function resolveLiveKitIdentity(req, fallbackName) {
+  const accountId = req.user?.id;
+  const claimed = req.body?.participantId;
+
+  if (accountId && typeof claimed === "string" && claimed) {
+    const [claimedAccountId, deviceId] = claimed.split("#");
+    if (claimedAccountId === accountId && deviceId) return claimed;
+    log.warn(
+      "Rejecting participantId that does not belong to the authenticated user;" +
+        " falling back to the account id"
+    );
+  }
+
+  return accountId || fallbackName;
+}
+
 app.post("/token", requireAuth, async (req, res) => {
   try {
     const { roomName, userName } = req.body;
@@ -80,11 +127,13 @@ app.post("/token", requireAuth, async (req, res) => {
       userName ||
       `User-${Date.now().toString(36).slice(-4)}`;
 
+    const identity = resolveLiveKitIdentity(req, effectiveName);
+
     log.info("Generating token for user:", effectiveName, "in room:", roomName);
     log.debug("Using API Key:", LIVEKIT_API_KEY);
 
     const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
-      identity: req.user?.id || effectiveName,
+      identity,
       name: effectiveName, // Also set display name
     });
 

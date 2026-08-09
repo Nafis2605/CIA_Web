@@ -1,11 +1,11 @@
 // src/core/vr/__tests__/VRExplorationManager.roster.test.js
-// Phase 4: getSessionRoster() — the single decorated, precedence-ORDERED
+// Phase 4: getSessionRoster() â€” the single decorated, precedence-ORDERED
 // participant list that both roster surfaces render (the in-VR People drawer
 // and the desktop VRSessionPanel).
 //
 // Precedence is the point of the method. Alphabetical or join order buries the
-// two people whose state actually matters — whoever holds the data-manipulation
-// token, and the host who can take it back — under however many observers
+// two people whose state actually matters â€” whoever holds the data-manipulation
+// token, and the host who can take it back â€” under however many observers
 // happened to join first.
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
@@ -37,6 +37,9 @@ vi.mock("@Collaboration/presence/userManagement.js", () => ({
   getUserId: vi.fn(() => "self-1"),
   getUserName: vi.fn(() => "Me"),
   getUserColor: vi.fn(() => "#ff0000"),
+  getParticipantId: vi.fn(() => "self-1"),
+  getParticipantName: vi.fn(() => "Me"),
+  isSelfIdentity: vi.fn((id) => id === "self-1"),
 }));
 vi.mock("@Core/instances/types/vtk/vr/VTKVRAvatars.js", () => ({
   vrAvatarSystem: { initialize: vi.fn(), dispose: vi.fn(), setLocalActivity: vi.fn() },
@@ -103,7 +106,7 @@ function participant(odUserId, over = {}) {
 }
 
 /**
- * Wire the manager's private collaborators directly — startExploration() drags
+ * Wire the manager's private collaborators directly â€” startExploration() drags
  * in WebXR and VTK, and none of it is what this method reads.
  */
 function setup({ participants, ownerUserId = null, holder = null, remote = [], poses = {} }) {
@@ -121,7 +124,7 @@ function headAt(x, y, z) {
   return { headPose: { position: { x, y, z } }, vrScale: 1, vrOrigin: [0, 0, 0] };
 }
 
-describe("VRExplorationManager.getSessionRoster — precedence", () => {
+describe("VRExplorationManager.getSessionRoster â€” precedence", () => {
   beforeEach(() => {
     yManipulatorState.clear();
     vrExplorationManager._activeSession = null;
@@ -133,7 +136,7 @@ describe("VRExplorationManager.getSessionRoster — precedence", () => {
     expect(vrExplorationManager.getSessionRoster()).toEqual([]);
   });
 
-  it("orders holder → host → VR explorers by joinedAt → desktop observers", () => {
+  it("orders holder â†’ host â†’ VR explorers by joinedAt â†’ desktop observers", () => {
     setup({
       ownerUserId: "host-1",
       holder: { holderUserId: "holder-1", holderUserName: "Holder" },
@@ -194,7 +197,7 @@ describe("VRExplorationManager.getSessionRoster — precedence", () => {
   });
 });
 
-describe("VRExplorationManager.getSessionRoster — row decoration", () => {
+describe("VRExplorationManager.getSessionRoster â€” row decoration", () => {
   beforeEach(() => {
     yManipulatorState.clear();
     vrExplorationManager._activeSession = null;
@@ -287,7 +290,7 @@ describe("VRExplorationManager.getSessionRoster — row decoration", () => {
     setup({ ownerUserId: SELF, participants: [participant(SELF)] });
 
     const [row] = vrExplorationManager.getSessionRoster();
-    // joinedAt is used to SORT, not to render — it must not leak into the shape.
+    // joinedAt is used to SORT, not to render â€” it must not leak into the shape.
     expect(Object.keys(row).sort()).toEqual(
       [
         "activity",

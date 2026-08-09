@@ -105,8 +105,7 @@ class ServerSyncService {
         this.isConnected = true;
         this.reconnectAttempts = 0;
 
-        this.pendingProjectId =
-          sessionManager.getProjectId?.() || config.defaultSessionId;
+        this.pendingProjectId = sessionManager.getProjectId();
         void this._authenticate();
       };
 

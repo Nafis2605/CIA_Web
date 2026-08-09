@@ -1,8 +1,13 @@
 // src/collaboration/yjs/yjsSetup.test.js
-// Documents the actual presence-collision behavior: cursors are keyed by
-// userId (two tabs sharing a user id intentionally overwrite one entry),
-// while camera sync is keyed by viewId + echo-guarded by per-tab clientId
-// (unaffected by userId collisions). No real WebSocket connection is made.
+// Documents the actual presence-collision behavior of each map:
+//   - yCursors is keyed by whatever id the caller passes. Two writes under one
+//     id overwrite a single entry — which is why VR presence now passes a
+//     per-DEVICE participant id rather than the account id.
+//   - yAvatars is keyed by participant id, so two devices on one account are
+//     two entries.
+//   - Camera/visualization are keyed by viewId, echo-guarded by per-tab
+//     clientId, and now also carry a cross-client syncKey.
+// No real WebSocket connection is made.
 
 import { describe, test, expect, vi, beforeEach } from 'vitest';
 
@@ -42,8 +47,12 @@ import {
   ydoc,
   yCursors,
   yCameras,
+  yAvatars,
+  yVisualizationState,
   syncCursorToYjs,
   syncCameraToYjs,
+  syncAvatarToYjs,
+  syncVisualizationToYjs,
 } from './yjsSetup.js';
 
 describe('cursor presence (yCursors) — keyed by userId', () => {
@@ -60,12 +69,39 @@ describe('cursor presence (yCursors) — keyed by userId', () => {
     expect(yCursors.get('user-bob').position).toEqual({ x: 2, y: 2 });
   });
 
-  test('same user id from two tabs overwrites a single entry (expected, documented)', () => {
+  test('one id written twice overwrites a single entry (why presence keys per device)', () => {
     syncCursorToYjs('user-shared', { position: { x: 1, y: 1 } });
     syncCursorToYjs('user-shared', { position: { x: 9, y: 9 } });
 
     expect(yCursors.size).toBe(1);
     expect(yCursors.get('user-shared').position).toEqual({ x: 9, y: 9 });
+  });
+});
+
+describe('avatar presence (yAvatars) — keyed per DEVICE, not per account', () => {
+  beforeEach(() => {
+    yAvatars.clear();
+  });
+
+  // The regression this whole change exists for: two headsets signed into ONE
+  // account used to write the same yAvatars key, so the map held a single
+  // entry that each device's observer then skipped as its own — connected,
+  // but permanently invisible to each other.
+  test('two devices on one account occupy two entries', () => {
+    syncAvatarToYjs('acct-1#device-a', { displayName: 'Fahim (Quest 3 a41f)' });
+    syncAvatarToYjs('acct-1#device-b', { displayName: 'Fahim (Quest 3 90c2)' });
+
+    expect(yAvatars.size).toBe(2);
+    expect(yAvatars.get('acct-1#device-a').displayName).toBe('Fahim (Quest 3 a41f)');
+    expect(yAvatars.get('acct-1#device-b').displayName).toBe('Fahim (Quest 3 90c2)');
+  });
+
+  test('the same device rewriting its entry still collapses to one', () => {
+    syncAvatarToYjs('acct-1#device-a', { displayName: 'Fahim', isSpeaking: false });
+    syncAvatarToYjs('acct-1#device-a', { displayName: 'Fahim', isSpeaking: true });
+
+    expect(yAvatars.size).toBe(1);
+    expect(yAvatars.get('acct-1#device-a').isSpeaking).toBe(true);
   });
 });
 
@@ -90,5 +126,39 @@ describe('camera presence (yCameras) — keyed by viewId, echo-guarded by client
     expect(yCameras.size).toBe(2);
     expect(yCameras.get('view-1').camera.position).toEqual([0, 0, 1]);
     expect(yCameras.get('view-2').camera.position).toEqual([1, 1, 1]);
+  });
+
+  test('the syncKey rides along so peers with a different viewId can match', () => {
+    syncCameraToYjs('view-1', 'user-alice', { position: [0, 0, 1] }, 'dataset-1');
+    expect(yCameras.get('view-1').syncKey).toBe('dataset-1');
+  });
+});
+
+describe('visualization state (yVisualizationState) — carries the cross-client syncKey', () => {
+  beforeEach(() => {
+    yVisualizationState.clear();
+  });
+
+  test('stores the syncKey alongside the sender-local viewId', () => {
+    syncVisualizationToYjs('view-1', 'user-alice', { opacity: 0.5 }, 'dataset-1');
+
+    const entry = yVisualizationState.get('view-1');
+    expect(entry.visualization).toEqual({ opacity: 0.5 });
+    expect(entry.syncKey).toBe('dataset-1');
+    expect(entry.clientId).toBe(ydoc.clientID);
+  });
+
+  test('partial patches merge, and the syncKey survives the merge', () => {
+    syncVisualizationToYjs('view-1', 'user-alice', { opacity: 0.5 }, 'dataset-1');
+    syncVisualizationToYjs('view-1', 'user-alice', { representation: 'points' }, 'dataset-1');
+
+    const entry = yVisualizationState.get('view-1');
+    expect(entry.visualization).toEqual({ opacity: 0.5, representation: 'points' });
+    expect(entry.syncKey).toBe('dataset-1');
+  });
+
+  test('omitting the syncKey is allowed and records null', () => {
+    syncVisualizationToYjs('view-1', 'user-alice', { opacity: 0.5 });
+    expect(yVisualizationState.get('view-1').syncKey).toBeNull();
   });
 });

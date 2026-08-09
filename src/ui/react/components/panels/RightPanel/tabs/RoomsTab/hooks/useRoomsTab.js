@@ -98,14 +98,14 @@ const SAMPLE_ROOMS = [
 export function useRoomsTab(options = {}) {
   const { projectId: propProjectId } = options;
 
-  // Get project ID from props or sessionManager
-  const projectId = propProjectId || sessionManager.getProjectId?.() || sessionManager.getRoomId?.();
+  // Prop wins (explicit override from parent); otherwise trust sessionManager,
+  // which is now the real, authoritative source.
+  const projectId = propProjectId || sessionManager.getProjectId();
 
   // Debug: Log which projectId we're using
   log.debug("useRoomsTab initialized with projectId:", {
     fromProps: propProjectId,
-    fromSessionManager: sessionManager.getProjectId?.(),
-    fromRoomId: sessionManager.getRoomId?.(),
+    fromSessionManager: sessionManager.getProjectId(),
     final: projectId,
   });
 

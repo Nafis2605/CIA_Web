@@ -617,11 +617,18 @@ CREATE TABLE vr_exploration_sessions (
     -- Session state
     status VARCHAR(20) DEFAULT 'preparing' CHECK (status IN ('preparing', 'active', 'paused', 'ended')),
 
+    -- Client-generated stable collaboration id (see _tryRegisterSession in
+    -- VRExplorationManager.js), separate from this row's own PK so a late
+    -- server response can always be reconciled unambiguously.
+    client_session_key VARCHAR(64),
+
     -- Timestamps
     created_at TIMESTAMPTZ DEFAULT NOW(),
     started_at TIMESTAMPTZ,
     ended_at TIMESTAMPTZ,
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+
+    CONSTRAINT vr_sessions_client_key_unique UNIQUE (client_session_key)
 );
 
 CREATE INDEX idx_vr_sessions_project ON vr_exploration_sessions(project_id);
@@ -632,7 +639,13 @@ CREATE INDEX idx_vr_sessions_dataset ON vr_exploration_sessions(dataset_id);
 CREATE TABLE vr_session_participants (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     session_id UUID NOT NULL REFERENCES vr_exploration_sessions(id) ON DELETE CASCADE,
-    od_user_id VARCHAR(255) NOT NULL,
+    -- Verified account identity (server-derived, see getUserId() in
+    -- server/src/middleware/auth.js).
+    account_user_id VARCHAR(255) NOT NULL,
+    -- Account+device composite (`${accountId}#${deviceId}`, mirrors
+    -- getParticipantId() in src/collaboration/presence/userManagement.js) —
+    -- distinguishes multiple devices signed into the same account.
+    participant_id VARCHAR(255) NOT NULL,
     user_name VARCHAR(255),
 
     -- Participant mode
@@ -652,11 +665,12 @@ CREATE TABLE vr_session_participants (
     left_at TIMESTAMPTZ,
     last_active_at TIMESTAMPTZ DEFAULT NOW(),
 
-    CONSTRAINT unique_session_participant UNIQUE (session_id, od_user_id)
+    CONSTRAINT unique_session_participant UNIQUE (session_id, participant_id)
 );
 
 CREATE INDEX idx_vr_participants_session ON vr_session_participants(session_id);
-CREATE INDEX idx_vr_participants_user ON vr_session_participants(od_user_id);
+CREATE INDEX idx_vr_participants_account ON vr_session_participants(account_user_id);
+CREATE INDEX idx_vr_participants_participant ON vr_session_participants(participant_id);
 
 CREATE TABLE vr_session_snapshots (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),

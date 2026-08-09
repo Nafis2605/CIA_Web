@@ -42,42 +42,12 @@ import { vtkInstanceCursors } from "@VTK/collaboration/VTKInstanceCursors.js";
 import { getViewConfigurationManager } from "@Init/appInitializer.js";
 import {
   syncCameraToYjs,
-  syncVisualizationToYjs as _syncVisualizationToYjs,
   syncManipulatorToYjs,
 } from "@Collaboration/yjs/yjsSetup.js";
+import { pushSharedVisualizationUpdate } from "@Services/visualizationSyncService.js";
 import { getUserId, getUserName } from "@Collaboration/presence/userManagement.js";
+import { resolveViewSyncKey } from "@Core/instances/viewSyncKey.js";
 import { metricsService } from "@Services/metrics/metricsService.js";
-
-/**
- * Thin instrumentation wrapper around syncVisualizationToYjs. Stamps the
- * outgoing patch with a `_syncOriginTs` (this client's send-time, ms epoch)
- * so the receiving side (applySharedState, below) can compute an end-to-end
- * apply-latency delta. Falls back to the plain (uninstrumented) call if
- * anything here throws — instrumentation must never break the Y.js sync
- * path. See src/services/metrics/metricsService.js for the latency-metrics
- * module and its clock-skew caveat.
- * @param {string} viewId
- * @param {string} userId
- * @param {Object} vizState
- */
-function syncVisualizationToYjs(viewId, userId, vizState) {
-  try {
-    return _syncVisualizationToYjs(viewId, userId, {
-      ...vizState,
-      _syncOriginTs: Date.now(),
-    });
-  } catch (err) {
-    // Instrumentation failure — fall back to uninstrumented call so sync
-    // itself is unaffected.
-    try {
-      return _syncVisualizationToYjs(viewId, userId, vizState);
-    } catch {
-      // If even the fallback throws, let it propagate as it would have
-      // without instrumentation (original behavior).
-      throw err;
-    }
-  }
-}
 
 // Raycasting and cursor collaboration
 import {
@@ -2274,13 +2244,7 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
             if (!caps.hasData) return;
             instanceTools.setOpacity?.(instanceId, value);
             this._emitToolsUpdate(instanceId);
-            if (!this._isApplyingRemoteState) {
-              const vId = this.instances.get(instanceId)?.viewConfigId;
-              if (vId) {
-                syncVisualizationToYjs(vId, getUserId(), { opacity: value });
-                getViewConfigurationManager()?.updateVisualization(vId, { opacity: value });
-              }
-            }
+            this._syncVizPatch(instanceId, { opacity: value });
           },
         },
 
@@ -2300,13 +2264,7 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
             if (!caps.hasData) return;
             instanceTools.setRepresentation?.(instanceId, "surface");
             this._emitToolsUpdate(instanceId);
-            if (!this._isApplyingRemoteState) {
-              const vId = this.instances.get(instanceId)?.viewConfigId;
-              if (vId) {
-                syncVisualizationToYjs(vId, getUserId(), { representation: "surface" });
-                getViewConfigurationManager()?.updateVisualization(vId, { representation: "surface" });
-              }
-            }
+            this._syncVizPatch(instanceId, { representation: "surface" });
           },
         },
         {
@@ -2320,13 +2278,7 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
             if (!caps.hasData) return;
             instanceTools.setRepresentation?.(instanceId, "wireframe");
             this._emitToolsUpdate(instanceId);
-            if (!this._isApplyingRemoteState) {
-              const vId = this.instances.get(instanceId)?.viewConfigId;
-              if (vId) {
-                syncVisualizationToYjs(vId, getUserId(), { representation: "wireframe" });
-                getViewConfigurationManager()?.updateVisualization(vId, { representation: "wireframe" });
-              }
-            }
+            this._syncVizPatch(instanceId, { representation: "wireframe" });
           },
         },
         {
@@ -2340,13 +2292,7 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
             if (!caps.hasData) return;
             instanceTools.setRepresentation?.(instanceId, "points");
             this._emitToolsUpdate(instanceId);
-            if (!this._isApplyingRemoteState) {
-              const vId = this.instances.get(instanceId)?.viewConfigId;
-              if (vId) {
-                syncVisualizationToYjs(vId, getUserId(), { representation: "points" });
-                getViewConfigurationManager()?.updateVisualization(vId, { representation: "points" });
-              }
-            }
+            this._syncVizPatch(instanceId, { representation: "points" });
           },
         },
 
@@ -2828,13 +2774,7 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
               onClick: () => {
                 vtkScalarColoringFeature.disableScalarColoring(instanceId);
                 this._emitToolsUpdate(instanceId);
-                if (!this._isApplyingRemoteState) {
-                  const vId = this.instances.get(instanceId)?.viewConfigId;
-                  if (vId) {
-                    syncVisualizationToYjs(vId, getUserId(), { activeArray: null });
-                    getViewConfigurationManager()?.updateVisualization(vId, { activeArray: null });
-                  }
-                }
+                this._syncVizPatch(instanceId, { activeArray: null });
               },
             },
             { type: "separator" },
@@ -2846,13 +2786,7 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
               onClick: () => {
                 vtkScalarColoringFeature.enableScalarColoring(instanceId, array.name, array.type);
                 this._emitToolsUpdate(instanceId);
-                if (!this._isApplyingRemoteState) {
-                  const vId = this.instances.get(instanceId)?.viewConfigId;
-                  if (vId) {
-                    syncVisualizationToYjs(vId, getUserId(), { activeArray: array.name, activeArrayType: array.type });
-                    getViewConfigurationManager()?.updateVisualization(vId, { activeArray: array.name, activeArrayType: array.type });
-                  }
-                }
+                this._syncVizPatch(instanceId, { activeArray: array.name, activeArrayType: array.type });
               },
             })),
           ],
@@ -2875,13 +2809,7 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
               onClick: () => {
                 vtkScalarColoringFeature.setColormap(instanceId, cmapName);
                 this._emitToolsUpdate(instanceId);
-                if (!this._isApplyingRemoteState) {
-                  const vId = this.instances.get(instanceId)?.viewConfigId;
-                  if (vId) {
-                    syncVisualizationToYjs(vId, getUserId(), { colormap: cmapName });
-                    getViewConfigurationManager()?.updateVisualization(vId, { colormap: cmapName });
-                  }
-                }
+                this._syncVizPatch(instanceId, { colormap: cmapName });
               },
             })),
           });
@@ -2905,12 +2833,9 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
       const syncGlyph = () => {
         this._emitToolsUpdate(instanceId);
         if (!this._isApplyingRemoteState) {
-          const vId = this.instances.get(instanceId)?.viewConfigId;
-          if (vId) {
-            const glyphConfig = vtkGlyphFeature.getConfigForSync(instanceId);
-            syncVisualizationToYjs(vId, getUserId(), { glyph: glyphConfig });
-            getViewConfigurationManager()?.updateVisualization(vId, { glyph: glyphConfig });
-          }
+          this._syncVizPatch(instanceId, {
+            glyph: vtkGlyphFeature.getConfigForSync(instanceId),
+          });
         }
       };
 
@@ -3078,12 +3003,9 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
       const syncSlicePlane = () => {
         this._emitToolsUpdate(instanceId);
         if (!this._isApplyingRemoteState) {
-          const vId = this.instances.get(instanceId)?.viewConfigId;
-          if (vId) {
-            const sliceConfig = vtkSliceFeature.getConfigForSync(instanceId);
-            syncVisualizationToYjs(vId, getUserId(), { slicePlane: sliceConfig });
-            getViewConfigurationManager()?.updateVisualization(vId, { slicePlane: sliceConfig });
-          }
+          this._syncVizPatch(instanceId, {
+            slicePlane: vtkSliceFeature.getConfigForSync(instanceId),
+          });
         }
       };
 
@@ -3178,12 +3100,9 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
       const syncClipBox = () => {
         this._emitToolsUpdate(instanceId);
         if (!this._isApplyingRemoteState) {
-          const vId = this.instances.get(instanceId)?.viewConfigId;
-          if (vId) {
-            const clipConfig = vtkClippingFeature.getConfigForSync(instanceId);
-            syncVisualizationToYjs(vId, getUserId(), { clipBox: clipConfig });
-            getViewConfigurationManager()?.updateVisualization(vId, { clipBox: clipConfig });
-          }
+          this._syncVizPatch(instanceId, {
+            clipBox: vtkClippingFeature.getConfigForSync(instanceId),
+          });
         }
       };
 
@@ -3232,12 +3151,9 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
       const syncThreshold = () => {
         this._emitToolsUpdate(instanceId);
         if (!this._isApplyingRemoteState) {
-          const vId = this.instances.get(instanceId)?.viewConfigId;
-          if (vId) {
-            const thresholdConfig = vtkThresholdFeature.getConfigForSync(instanceId);
-            syncVisualizationToYjs(vId, getUserId(), { threshold: thresholdConfig });
-            getViewConfigurationManager()?.updateVisualization(vId, { threshold: thresholdConfig });
-          }
+          this._syncVizPatch(instanceId, {
+            threshold: vtkThresholdFeature.getConfigForSync(instanceId),
+          });
         }
       };
 
@@ -3468,6 +3384,43 @@ console.log('Tools:', tools);
   // ===========================================================================
   // ADD this helper method
   // ===========================================================================
+
+  /**
+   * Broadcast + persist a visualization patch for one instance.
+   *
+   * Every tools-menu setter used to inline the same five lines (remote-state
+   * guard, instance lookup, viewConfigId check, Y.js send, durable persist).
+   * Collapsed here so the cross-client sync key is resolved in ONE place —
+   * viewConfigId alone never matches a peer that opened the dataset itself
+   * (see @Core/instances/viewSyncKey.js).
+   *
+   * @param {string} instanceId
+   * @param {Object} patch - shallow visualization patch, e.g. { opacity: 0.5 }
+   * @private
+   */
+  _syncVizPatch(instanceId, patch) {
+    // Applying a patch we just received must not echo it back out.
+    if (this._isApplyingRemoteState) return;
+
+    const instance = this.instances.get(instanceId);
+    const vId = instance?.viewConfigId;
+    if (!vId) return;
+
+    // Goes through visualizationSyncService, the SAME entry point the VR menus
+    // and the InstanceToolsPanel use. This used to call the Y.js writer
+    // directly, which meant the tools menu bypassed the permission gate
+    // entirely: an identical clipBox/threshold/representation change broadcast
+    // fine from here while VR was refused. One path, one policy.
+    //
+    // `_syncOriginTs` is stamped BEFORE the hand-off because the service passes
+    // the patch through untouched, and applySharedState on the receiving side
+    // reads it to compute apply latency (see the metrics wrapper above).
+    pushSharedVisualizationUpdate(
+      vId,
+      { ...patch, _syncOriginTs: Date.now() },
+      resolveViewSyncKey(instance)
+    );
+  }
 
   /**
    * Emit event that tools changed (triggers React re-render)
@@ -4308,8 +4261,9 @@ console.log('Tools:', tools);
     this._isApplyingRemoteState = true;
 
     // Sync-latency instrumentation (send → apply). `state.visualization._syncOriginTs`
-    // is stamped by the syncVisualizationToYjs wrapper above at send time on the
-    // originating client. Same-machine multi-tab deltas are valid latency
+    // is stamped by _syncVizPatch at send time on the originating client (VR
+    // patches come through visualizationSyncService without one, so they simply
+    // record nothing). Same-machine multi-tab deltas are valid latency
     // measurements; cross-machine deltas are subject to clock skew — see the
     // caveat in src/services/metrics/metricsService.js. try/catch-safe no-op.
     try {
@@ -5638,7 +5592,12 @@ console.log('Tools:', tools);
           // REAL-TIME: Sync to Y.js for immediate updates to other users
           const userId = getUserId();
           if (userId) {
-            syncCameraToYjs(instanceData.viewConfigId, userId, cameraState);
+            syncCameraToYjs(
+              instanceData.viewConfigId,
+              userId,
+              cameraState,
+              resolveViewSyncKey(instanceData)
+            );
 
             // Broadcast active manipulator; auto-clear after 1.5 s of inactivity
             syncManipulatorToYjs(userId, getUserName(), 'camera', 'manipulating');

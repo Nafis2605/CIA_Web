@@ -6,6 +6,10 @@ import { getHandlerForType } from "@Core/instances/types/instanceTypesInit.js";
 import { getUserId } from "@Collaboration/presence/userManagement.js";
 import cameraSharePolicy from "@Core/session/cameraSharePolicy.js";
 import {
+  instanceMatchesViewUpdate,
+  resolveViewSyncKey,
+} from "@Core/instances/viewSyncKey.js";
+import {
   getDatasetManager,
   getViewConfigurationManager,
 } from "@Init/appInitializer.js";
@@ -25,6 +29,13 @@ import {
 // ============================================================================
 // INSTANCE COLORS - For visual differentiation of instances
 // ============================================================================
+
+/**
+ * How often an "update matched no local instance" warning may repeat for the
+ * same channel + ids. The visualization channel runs at slider rate (~20/sec),
+ * so an unthrottled warning would bury the signal it exists to provide.
+ */
+const UNROUTABLE_WARN_INTERVAL_MS = 5000;
 
 const INSTANCE_COLORS = [
   { name: "blue", hex: "#60a5fa" },
@@ -81,6 +92,10 @@ class WorkspaceManager {
     this._focusedCanvasId = null;
     this._focusedPaneId = null;
 
+    // "<channel>:<viewId>:<syncKey>" -> last warn timestamp. See
+    // _warnUnroutableUpdate.
+    this._unroutableWarnedAt = new Map();
+
     log.debug("WorkspaceManager created (type-agnostic)");
   }
 
@@ -104,17 +119,17 @@ class WorkspaceManager {
    */
   _setupViewSyncListener() {
     // REAL-TIME: Listen for Y.js camera updates (instant, smooth sync)
-    onCameraChange(({ viewId, camera, userId }) => {
+    onCameraChange(({ viewId, camera, userId, syncKey }) => {
       if (camera) {
-        this._handleYjsCameraUpdate(viewId, camera, userId);
+        this._handleYjsCameraUpdate(viewId, camera, userId, syncKey);
       }
     });
     log.debug("Y.js camera sync listener registered (real-time)");
 
     // REAL-TIME: Listen for Y.js visualization state updates
-    onVisualizationChange(({ viewId, visualization, userId }) => {
+    onVisualizationChange(({ viewId, visualization, userId, syncKey }) => {
       if (visualization) {
-        this._handleYjsVisualizationUpdate(viewId, visualization, userId);
+        this._handleYjsVisualizationUpdate(viewId, visualization, userId, syncKey);
       }
     });
     log.debug("Y.js visualization sync listener registered");
@@ -180,9 +195,13 @@ class WorkspaceManager {
 
   /**
    * Handle Y.js camera update - apply immediately for smooth real-time sync
+   * @param {string} viewId - the SENDER's view configuration id
+   * @param {Object} camera
+   * @param {string} [sourceUserId]
+   * @param {string|null} [syncKey] - cross-client key (see viewSyncKey.js)
    * @private
    */
-  _handleYjsCameraUpdate(viewId, camera, sourceUserId) {
+  _handleYjsCameraUpdate(viewId, camera, sourceUserId, syncKey = null) {
     // Personal-camera mode: ignore collaborators' camera broadcasts — unless
     // followService is actively driving the camera (follow overrides personal).
     if (
@@ -192,10 +211,12 @@ class WorkspaceManager {
       return;
     }
     // Find all instances viewing this view
+    let applied = 0;
     for (const [instanceId, instance] of this.instances) {
-      if (instance.viewConfigId !== viewId) continue;
+      if (!instanceMatchesViewUpdate(instance, viewId, syncKey)) continue;
       if (!instance.handler || !instance.instanceData) continue;
 
+      applied += 1;
       try {
         // Call handler's applySharedState for immediate camera update
         if (typeof instance.handler.applySharedState === "function") {
@@ -212,18 +233,33 @@ class WorkspaceManager {
         );
       }
     }
+
+    if (applied === 0) this._warnUnroutableUpdate("camera", viewId, syncKey);
   }
 
   /**
    * Apply visualization state from Y.js to all local instances viewing the given view.
    * Mirrors the camera sync pattern in _handleYjsCameraUpdate.
+   *
+   * Matching on viewId ALONE (the old behaviour) meant this silently dropped
+   * every cross-client patch: each client mints its own ViewConfiguration when
+   * it opens a dataset, so a peer's viewId matches no local instance and the
+   * loop just fell through. See @Core/instances/viewSyncKey.js.
+   *
+   * @param {string} viewId - the SENDER's view configuration id
+   * @param {Object} visualization
+   * @param {string} [sourceUserId]
+   * @param {string|null} [syncKey] - cross-client key (see viewSyncKey.js)
    * @private
    */
-  _handleYjsVisualizationUpdate(viewId, visualization, sourceUserId) {
+  _handleYjsVisualizationUpdate(viewId, visualization, sourceUserId, syncKey = null) {
+    let applied = 0;
+
     for (const [instanceId, instance] of this.instances) {
-      if (instance.viewConfigId !== viewId) continue;
+      if (!instanceMatchesViewUpdate(instance, viewId, syncKey)) continue;
       if (!instance.handler || !instance.instanceData) continue;
 
+      applied += 1;
       try {
         if (typeof instance.handler.applySharedState === "function") {
           instance.handler.applySharedState(
@@ -236,6 +272,46 @@ class WorkspaceManager {
         log.error(`Failed to apply Y.js visualization to instance ${instanceId}:`, error);
       }
     }
+
+    if (applied === 0) this._warnUnroutableUpdate("visualization", viewId, syncKey);
+  }
+
+  /**
+   * Report an inbound update that matched no local instance.
+   *
+   * This used to be the silent failure mode: a peer's patch arrived, matched
+   * nothing, and the loop simply ran to completion — no log, no counter, no
+   * way to tell "nothing was sent" from "it was sent and dropped on arrival".
+   * That is precisely the shape of the cross-client bug that made two headsets
+   * unable to see each other's changes.
+   *
+   * Throttled per (channel, key) pair because this path runs at slider rate —
+   * an unthrottled warn would emit ~20/sec and bury its own signal.
+   *
+   * @param {string} channel - 'visualization' | 'camera'
+   * @param {string} viewId - the SENDER's view id
+   * @param {string|null} syncKey - the SENDER's resolved sync key
+   * @private
+   */
+  _warnUnroutableUpdate(channel, viewId, syncKey) {
+    const now = Date.now();
+    const dedupeKey = `${channel}:${viewId}:${syncKey}`;
+    if (now - (this._unroutableWarnedAt.get(dedupeKey) || 0) < UNROUTABLE_WARN_INTERVAL_MS) {
+      return;
+    }
+    this._unroutableWarnedAt.set(dedupeKey, now);
+
+    const candidates = [...this.instances.values()].map((i) => ({
+      viewConfigId: i.viewConfigId,
+      syncKey: resolveViewSyncKey(i),
+    }));
+    log.warn(
+      `Y.js ${channel} update matched NO local instance — it was received and dropped. ` +
+        `incoming: viewId=${viewId} syncKey=${syncKey}; ` +
+        `local: ${JSON.stringify(candidates)}. ` +
+        `A differing viewId is normal (each client mints its own); a differing ` +
+        `syncKey means the two clients are not on the same dataset.`
+    );
   }
 
   /**

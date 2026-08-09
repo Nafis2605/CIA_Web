@@ -9,6 +9,7 @@
 //   const { provider, mode } = await initializeStorageProvider();
 
 import { config } from "@Core/config/clientConfig.js";
+import { sessionManager } from "@Core/session/sessionManager.js";
 import { ServerStorageProvider } from "@Core/data/providers/ServerStorageProvider.js";
 import { DatasetManagerAdapter } from "@Core/data/managers/DatasetManagerAdapter.js";
 import { dataCache } from "@Services/storage/dataCache.js";
@@ -33,7 +34,7 @@ export async function initializeStorageProvider() {
 
     const provider = new ServerStorageProvider(
       config.apiBaseUrl,
-      config.defaultSessionId
+      sessionManager.getProjectId()
     );
 
     try {
@@ -107,6 +108,6 @@ export function getStorageConfig() {
   return {
     useServerStorage: config.useServerStorage,
     apiBaseUrl: config.apiBaseUrl,
-    sessionId: config.defaultSessionId,
+    sessionId: sessionManager.getProjectId(),
   };
 }

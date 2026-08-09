@@ -76,8 +76,9 @@ export const config = Object.freeze({
     "00000000-0000-0000-0000-000000000001"
   ),
 
-  /** Demo project ID (sample files project) */
-  demoProjectId: "00000000-0000-0000-0000-000000000001",
+  /** Default project ID (sample files project) — used when sessionManager
+   *  hasn't resolved a real projectId yet (e.g. unresolvable legacy link). */
+  defaultProjectId: "00000000-0000-0000-0000-000000000001",
 
   // ---------------------------------------------------------------------------
   // Feature Flags

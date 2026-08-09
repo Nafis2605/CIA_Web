@@ -12,10 +12,16 @@ vi.mock("@Utils/logger.js", () => {
 
 const mockUserId = vi.fn(() => "host-1");
 const mockUserName = vi.fn(() => "Hostess");
+// The lock now identifies itself per DEVICE. Point getParticipantId at the
+// same stub the tests already drive so existing cases keep working, and derive
+// isSelfIdentity from it so host checks follow whatever a test sets.
 vi.mock("@Collaboration/presence/userManagement.js", () => ({
   getUserId: (...a) => mockUserId(...a),
   getUserName: (...a) => mockUserName(...a),
   getUserColor: vi.fn(() => "#ff0000"),
+  getParticipantId: (...a) => mockUserId(...a),
+  getParticipantName: (...a) => mockUserName(...a),
+  isSelfIdentity: (id) => !!id && id === mockUserId(),
 }));
 
 import {
@@ -240,6 +246,26 @@ describe("VRManipulationLock", () => {
     const oldMap = ydoc.getMap(`vr-manipulation-${sessionId}`);
 
     const newId = `${sessionId}-winner`;
+    host.rekey(newId);
+
+    expect(oldMap.get("holder")).toBeUndefined();
+    expect(host.getHolder()).toBeNull();
+
+    host.claimAsHost();
+    expect(ydoc.getMap(`vr-manipulation-${newId}`).get("holder").holderUserId).toBe("host-1");
+
+    ydoc.getMap(`vr-manipulation-${newId}`).clear();
+  });
+
+  it("rekey is not fooled by a shared session object whose id was already mutated (the convergence-handler race)", () => {
+    host.claimAsHost();
+    const oldMap = ydoc.getMap(`vr-manipulation-${sessionId}`);
+    const newId = `${sessionId}-winner`;
+
+    // Reproduce VRExplorationManager._watchVRSessionConvergence's exact
+    // order: mutate the SHARED session object BEFORE calling rekey.
+    const sharedSession = host._session; // same object passed to the constructor
+    sharedSession.id = newId;
     host.rekey(newId);
 
     expect(oldMap.get("holder")).toBeUndefined();

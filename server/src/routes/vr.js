@@ -6,6 +6,16 @@ const { v4: uuidv4 } = require("uuid");
 const { createLogger } = require("../utils/logger");
 const { isValidUUID } = require("../middleware/validateUUID");
 const vrPreprocessing = require("../services/vrPreprocessing");
+const { getUserId, getUser } = require("../middleware/auth");
+
+// Device ids come from the client (localStorage-backed, see
+// src/core/identity/deviceIdentity.js) and are only ever used to build the
+// composite participant id below — never for authorization. "#" is the
+// separator, so strip any the client sends to keep the composite parseable.
+function buildParticipantId(accountUserId, rawDeviceId) {
+  const deviceId = String(rawDeviceId || "default").replace(/#/g, "").slice(0, 200);
+  return `${accountUserId}#${deviceId}`;
+}
 
 const router = express.Router({ mergeParams: true });
 const log = createLogger("vr");
@@ -50,10 +60,16 @@ router.post("/sessions", async (req, res) => {
       allowDesktopControl,
       regionOfInterest,
       selectionIds,
+      deviceId,
+      clientSessionKey,
     } = req.body;
 
-    const userId = req.headers["x-user-id"] || "anonymous";
-    const userName = req.headers["x-user-name"] || "Anonymous";
+    const userId = getUserId(req);
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+    const userName = getUser(req)?.name || "Anonymous";
+    const participantId = buildParticipantId(userId, deviceId);
 
     const sessionId = uuidv4();
 
@@ -65,8 +81,8 @@ router.post("/sessions", async (req, res) => {
         selection_type, default_exploration_mode, default_vr_scale,
         allow_join, allow_desktop_participants, allow_desktop_control,
         region_of_interest, selection_ids,
-        status, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW())
+        status, client_session_key, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW())
       RETURNING *`,
       [
         sessionId,
@@ -84,6 +100,7 @@ router.post("/sessions", async (req, res) => {
         regionOfInterest ? JSON.stringify(regionOfInterest) : null,
         selectionIds ? JSON.stringify(selectionIds) : null,
         "preparing",
+        clientSessionKey || null,
       ]
     );
 
@@ -92,9 +109,9 @@ router.post("/sessions", async (req, res) => {
     // Add owner as first participant
     await pool.query(
       `INSERT INTO vr_session_participants (
-        id, session_id, od_user_id, user_name, mode, joined_at
-      ) VALUES ($1, $2, $3, $4, $5, NOW())`,
-      [uuidv4(), sessionId, userId, userName, "vr-explorer"]
+        id, session_id, account_user_id, participant_id, user_name, mode, joined_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+      [uuidv4(), sessionId, userId, participantId, userName, "vr-explorer"]
     );
 
     // Broadcast to project
@@ -188,7 +205,10 @@ router.put("/sessions/:id", async (req, res) => {
   const wsManager = req.app.locals.wsManager;
 
   try {
-    const userId = req.headers["x-user-id"] || "anonymous";
+    const userId = getUserId(req);
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
 
     const sessionResult = await pool.query(
       `SELECT * FROM vr_exploration_sessions WHERE id = $1`,
@@ -259,7 +279,10 @@ router.delete("/sessions/:id", async (req, res) => {
   const wsManager = req.app.locals.wsManager;
 
   try {
-    const userId = req.headers["x-user-id"] || "anonymous";
+    const userId = getUserId(req);
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
 
     const sessionResult = await pool.query(
       `SELECT * FROM vr_exploration_sessions WHERE id = $1`,
@@ -308,8 +331,11 @@ router.post("/sessions/:id/join", async (req, res) => {
   const wsManager = req.app.locals.wsManager;
 
   try {
-    const userId = req.headers["x-user-id"] || "anonymous";
-    const userName = req.headers["x-user-name"] || "Anonymous";
+    const userId = getUserId(req);
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+    const userName = getUser(req)?.name || "Anonymous";
 
     const sessionResult = await pool.query(
       `SELECT * FROM vr_exploration_sessions WHERE id = $1`,
@@ -326,7 +352,8 @@ router.post("/sessions/:id/join", async (req, res) => {
       return res.status(403).json({ error: "Session does not allow joining" });
     }
 
-    const { mode } = req.body;
+    const { mode, deviceId } = req.body;
+    const participantId = buildParticipantId(userId, deviceId);
 
     if (
       mode === "desktop-participant" &&
@@ -340,12 +367,12 @@ router.post("/sessions/:id/join", async (req, res) => {
     // Upsert participant
     const result = await pool.query(
       `INSERT INTO vr_session_participants (
-        id, session_id, od_user_id, user_name, mode, joined_at, last_active_at
-      ) VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-      ON CONFLICT (session_id, od_user_id) DO UPDATE SET
-        mode = $5, last_active_at = NOW()
+        id, session_id, account_user_id, participant_id, user_name, mode, joined_at, last_active_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+      ON CONFLICT (session_id, participant_id) DO UPDATE SET
+        mode = $6, last_active_at = NOW()
       RETURNING *`,
-      [uuidv4(), req.params.id, userId, userName, mode || "desktop-observer"]
+      [uuidv4(), req.params.id, userId, participantId, userName, mode || "desktop-observer"]
     );
 
     const participant = result.rows[0];
@@ -375,11 +402,16 @@ router.post("/sessions/:id/leave", async (req, res) => {
   const wsManager = req.app.locals.wsManager;
 
   try {
-    const userId = req.headers["x-user-id"] || "anonymous";
+    const userId = getUserId(req);
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+    const { deviceId } = req.body;
+    const participantId = buildParticipantId(userId, deviceId);
 
     await pool.query(
-      `DELETE FROM vr_session_participants WHERE session_id = $1 AND od_user_id = $2`,
-      [req.params.id, userId]
+      `DELETE FROM vr_session_participants WHERE session_id = $1 AND participant_id = $2`,
+      [req.params.id, participantId]
     );
 
     const sessionResult = await pool.query(
@@ -391,7 +423,7 @@ router.post("/sessions/:id/leave", async (req, res) => {
       wsManager.vrParticipantLeft(
         sessionResult.rows[0].project_id,
         req.params.id,
-        userId
+        participantId
       );
     }
 
@@ -403,13 +435,25 @@ router.post("/sessions/:id/leave", async (req, res) => {
 });
 
 /**
- * PUT /vr/sessions/:id/participants/:odUserId
+ * PUT /vr/sessions/:id/participants/:participantId
  * Update participant state
  */
-router.put("/sessions/:id/participants/:odUserId", async (req, res) => {
+router.put("/sessions/:id/participants/:participantId", async (req, res) => {
   const pool = req.app.locals.pool;
 
   try {
+    const accountUserId = getUserId(req);
+    if (!accountUserId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+    const { participantId } = req.params;
+    if (
+      participantId !== accountUserId &&
+      !participantId.startsWith(`${accountUserId}#`)
+    ) {
+      return res.status(403).json({ error: "Cannot modify another participant" });
+    }
+
     const allowedUpdates = ["mode", "vr_scale", "scale_visibility"];
     const updates = [];
     const values = [];
@@ -426,10 +470,10 @@ router.put("/sessions/:id/participants/:odUserId", async (req, res) => {
 
     updates.push(`last_active_at = NOW()`);
 
-    values.push(req.params.id, req.params.odUserId);
+    values.push(req.params.id, participantId);
     const result = await pool.query(
       `UPDATE vr_session_participants SET ${updates.join(", ")}
-      WHERE session_id = $${paramCount} AND od_user_id = $${paramCount + 1}
+      WHERE session_id = $${paramCount} AND participant_id = $${paramCount + 1}
       RETURNING *`,
       values
     );
@@ -458,8 +502,11 @@ router.post("/sessions/:id/snapshots", async (req, res) => {
   const wsManager = req.app.locals.wsManager;
 
   try {
-    const userId = req.headers["x-user-id"] || "anonymous";
-    const userName = req.headers["x-user-name"] || "Anonymous";
+    const userId = getUserId(req);
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+    const userName = getUser(req)?.name || "Anonymous";
 
     const { name, viewSnapshotId, participantStates } = req.body;
 
@@ -579,7 +626,10 @@ router.post("/preprocessing/:datasetId/start", async (req, res) => {
   const wsManager = req.app.locals.wsManager;
 
   try {
-    const userId = req.headers["x-user-id"] || "anonymous";
+    const userId = getUserId(req);
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
     const { projectId, force } = req.body;
 
     const result = await vrPreprocessing.startPreprocessing(

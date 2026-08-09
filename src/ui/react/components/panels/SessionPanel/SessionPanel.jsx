@@ -14,7 +14,8 @@ export function SessionPanel({ currentRoomId, roomMembers = [], onClose }) {
     // Always use sessionManager.getRoomId() as the Y.js session source of truth.
     // currentRoomId prop may reflect a server-side "project room" which can differ.
     const sessionId = sessionManager.getRoomId?.() || currentRoomId || 'unknown';
-    const sessionUrl = `${window.location.origin}/rooms/${sessionId}`;
+    const projectId = sessionManager.getProjectId();
+    const sessionUrl = `${window.location.origin}/projects/${projectId}/rooms/${sessionId}`;
 
     const [copied, setCopied] = useState(false);
     const [joinInput, setJoinInput] = useState('');
@@ -27,6 +28,7 @@ export function SessionPanel({ currentRoomId, roomMembers = [], onClose }) {
     useEffect(() => {
         console.log('[CIA Session] Panel mounted');
         console.log('[CIA Session] URL:', window.location.href);
+        console.log('[CIA Session] Project ID (sessionManager):', sessionManager.getProjectId());
         console.log('[CIA Session] Session ID (sessionManager):', sessionManager.getRoomId?.());
         console.log('[CIA Session] currentRoomId prop:', currentRoomId);
         console.log('[CIA Session] Resolved session ID:', sessionId);
@@ -95,15 +97,23 @@ export function SessionPanel({ currentRoomId, roomMembers = [], onClose }) {
         const raw = joinInput.trim();
         if (!raw) return;
         let id = raw;
-        // Strip origin + /rooms/ prefix if user pasted a full URL
+        let projectId = null;
+        // Strip origin + /projects/:id/rooms/ or legacy /rooms/ prefix if the
+        // user pasted a full URL
         try {
             const url = new URL(raw);
-            const m = url.pathname.match(/^\/rooms\/([^/]+)/);
-            if (m) id = m[1];
+            const canonical = url.pathname.match(/^\/projects\/([^/]+)\/rooms\/([^/]+)/);
+            if (canonical) {
+                projectId = canonical[1];
+                id = canonical[2];
+            } else {
+                const legacy = url.pathname.match(/^\/rooms\/([^/]+)/);
+                if (legacy) id = legacy[1];
+            }
         } catch (e) {
-            // Not a URL — use as-is
+            // Not a URL — use as-is (bare room id, same project)
         }
-        sessionManager.switchRoom(id);
+        sessionManager.switchRoom(id, projectId || undefined);
     }, [joinInput]);
 
     const handleGenerateInvite = useCallback(() => {

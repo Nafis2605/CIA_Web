@@ -3,7 +3,7 @@
 
 import { vr as log } from '@Utils/logger.js';
 import { ydoc } from '@Collaboration/yjs/yjsSetup.js';
-import { getUserId } from '@Collaboration/presence/userManagement.js';
+import { getParticipantId } from '@Collaboration/presence/userManagement.js';
 
 /**
  * Pose broadcast period. 20 Hz.
@@ -51,8 +51,18 @@ const STALE_SWEEP_INTERVAL_MS = 1000;
 export class VRParticipantSync {
   constructor(session) {
     this._session = session;
+    // Independent of `session.id`, which VRExplorationManager mutates on the
+    // SAME shared object before calling rekey() (see
+    // _watchVRSessionConvergence) — comparing against the live session.id
+    // there made the guard below always see newSessionId === session.id and
+    // silently no-op every rekey.
+    this._boundSessionId = session.id;
     this._yParticipants = null;
-    this._localUserId = getUserId();
+    // Per-DEVICE, not per-account. Keying this map by getUserId() meant two
+    // headsets signed into the same account wrote the SAME entry at 20 Hz and
+    // each observer then discarded the other's poses via the self-skip below,
+    // so neither ever saw the other's avatar. See getParticipantId().
+    this._localParticipantId = getParticipantId();
     this._updateInterval = null;
     this._observers = [];
     this._throttleMs = POSE_THROTTLE_MS;
@@ -70,7 +80,7 @@ export class VRParticipantSync {
     // Set up observer for remote updates
     const observer = (event) => {
       event.changes.keys.forEach((change, odUserId) => {
-        if (odUserId === this._localUserId) return;
+        if (odUserId === this._localParticipantId) return;
 
         if (change.action === 'delete') {
           this._handleParticipantLeft(odUserId);
@@ -94,7 +104,7 @@ export class VRParticipantSync {
 
     // Remove self from Y.js
     if (this._yParticipants) {
-      this._yParticipants.delete(this._localUserId);
+      this._yParticipants.delete(this._localParticipantId);
     }
 
     // Stop update interval
@@ -116,12 +126,12 @@ export class VRParticipantSync {
    * @param {string} newSessionId
    */
   rekey(newSessionId) {
-    if (!newSessionId || newSessionId === this._session.id) return;
+    if (!newSessionId || newSessionId === this._boundSessionId) return;
 
     // Remove our own entry from the OLD map before abandoning it — otherwise
     // a stale copy of us lingers there until PARTICIPANT_STALE_MS evicts it.
     if (this._yParticipants) {
-      this._yParticipants.delete(this._localUserId);
+      this._yParticipants.delete(this._localParticipantId);
     }
 
     // Same cleanup stop() does for observers, without touching the update
@@ -130,6 +140,7 @@ export class VRParticipantSync {
     this._observers = [];
 
     this._session.id = newSessionId;
+    this._boundSessionId = newSessionId;
     this.start();
 
     log.debug(`VRParticipantSync re-keyed to session ${newSessionId}`);
@@ -155,11 +166,11 @@ export class VRParticipantSync {
       this.sweepStaleParticipants(now);
     }
 
-    const participant = this._session.getParticipant(this._localUserId);
+    const participant = this._session.getParticipant(this._localParticipantId);
     if (!participant) return;
 
     const data = {
-      odUserId: this._localUserId,
+      odUserId: this._localParticipantId,
       userName: participant.userName,
       userColor: participant.userColor,
       mode: participant.mode,
@@ -190,7 +201,7 @@ export class VRParticipantSync {
       cursorTarget: state.cursorTarget || null,
     };
 
-    this._yParticipants.set(this._localUserId, data);
+    this._yParticipants.set(this._localParticipantId, data);
   }
 
   /**
@@ -219,7 +230,7 @@ export class VRParticipantSync {
 
     const participants = [];
     this._yParticipants.forEach((data, odUserId) => {
-      if (odUserId !== this._localUserId) {
+      if (odUserId !== this._localParticipantId) {
         participants.push({
           ...data,
           isStale: Date.now() - data.timestamp > 5000,
@@ -262,7 +273,7 @@ export class VRParticipantSync {
 
     const evicted = [];
     this._yParticipants.forEach((data, odUserId) => {
-      if (odUserId === this._localUserId) return;
+      if (odUserId === this._localParticipantId) return;
 
       const timestamp = data?.timestamp || 0;
       if (nowMs - timestamp <= PARTICIPANT_GONE_MS) {

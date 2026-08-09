@@ -25,8 +25,12 @@ vi.mock("@Collaboration/yjs/yjsSetup.js", () => ({
   syncAvatarToYjs: (...args) => mockSyncAvatar(...args),
 }));
 
+// getParticipantId mirrors getUserId here — see VRParticipantSync.test.js.
 vi.mock("@Collaboration/presence/userManagement.js", () => ({
   getUserId: vi.fn(() => "local-user"),
+  getParticipantId: vi.fn(() => "local-user"),
+  getParticipantName: vi.fn(() => "Local"),
+  isSelfIdentity: vi.fn((id) => id === "local-user"),
 }));
 
 import { AvatarNetworkSync } from "../AvatarNetworkSync.js";
@@ -219,5 +223,99 @@ describe("AvatarNetworkSync.initialize — existing-peer presence snapshot", () 
     // One bad peer must not abort initialize and leave the observer unregistered.
     expect(() => throwing.initialize()).not.toThrow();
     expect(mockYAvatars.observe).toHaveBeenCalled();
+  });
+});
+
+describe("AvatarNetworkSync — LIVE presence observer", () => {
+  // REGRESSION: the observer passed an identifier that did not exist in scope,
+  // so every live presence change threw a ReferenceError that the surrounding
+  // catch swallowed into a suppressed log line. Only the one-shot snapshot
+  // replay above still worked, which is precisely why the tests stayed green:
+  // they covered the replay path exclusively. A peer who changed their
+  // name/colour/avatar — or joined after us — therefore stayed a grey avatar
+  // labelled with 8 hex characters for the whole session.
+  //
+  // These tests drive the OBSERVER, not the snapshot.
+
+  /** Capture the observer AvatarNetworkSync registers, and drive it directly. */
+  function captureObserver() {
+    let observer = null;
+    mockYAvatars.observe.mockImplementation((fn) => {
+      observer = fn;
+    });
+    mockYAvatars.forEach.mockImplementation(() => {});
+    return () => observer;
+  }
+
+  /** Fire a Y.Map-shaped change event for the given keys. */
+  function emitChange(observer, keys) {
+    observer({ changes: { keys: new Map(keys.map((k) => [k, { action: "update" }])) } });
+  }
+
+  beforeEach(() => {
+    mockYAvatars.observe.mockReset();
+    mockYAvatars.get.mockReset();
+    mockYAvatars.forEach.mockReset();
+  });
+
+  it("delivers a peer's live metadata change, keyed by participant id", () => {
+    const getObserver = captureObserver();
+    mockYAvatars.get.mockImplementation((id) =>
+      id === "remote-1" ? { displayName: "Alice", color: "#ff0000" } : null
+    );
+
+    const sync = new AvatarNetworkSync();
+    const seen = [];
+    sync.onRemotePresence((participantId, state) => seen.push([participantId, state.displayName]));
+    sync.initialize();
+
+    emitChange(getObserver(), ["remote-1"]);
+
+    // The id must be the map KEY. Passing anything undefined here is the bug.
+    expect(seen).toEqual([["remote-1", "Alice"]]);
+  });
+
+  it("skips our own live entry", () => {
+    const getObserver = captureObserver();
+    mockYAvatars.get.mockImplementation((id) => ({ displayName: id }));
+
+    const sync = new AvatarNetworkSync();
+    const seen = [];
+    sync.onRemotePresence((participantId) => seen.push(participantId));
+    sync.initialize();
+
+    emitChange(getObserver(), ["local-user", "remote-1"]);
+
+    expect(seen).toEqual(["remote-1"]);
+  });
+
+  it("delivers a peer that appears only AFTER we joined", () => {
+    // The empty-map case: nothing to replay, so the observer is the only route.
+    const getObserver = captureObserver();
+    mockYAvatars.get.mockReturnValue({ displayName: "Bob", color: "#00ff00" });
+
+    const sync = new AvatarNetworkSync();
+    const seen = [];
+    sync.onRemotePresence((participantId, state) => seen.push([participantId, state.color]));
+    sync.initialize();
+
+    expect(seen).toEqual([]); // nothing was in the map at join
+
+    emitChange(getObserver(), ["remote-2"]);
+
+    expect(seen).toEqual([["remote-2", "#00ff00"]]);
+  });
+
+  it("ignores a key whose entry has already been removed", () => {
+    const getObserver = captureObserver();
+    mockYAvatars.get.mockReturnValue(undefined);
+
+    const sync = new AvatarNetworkSync();
+    const seen = [];
+    sync.onRemotePresence((participantId) => seen.push(participantId));
+    sync.initialize();
+
+    expect(() => emitChange(getObserver(), ["remote-1"])).not.toThrow();
+    expect(seen).toEqual([]);
   });
 });

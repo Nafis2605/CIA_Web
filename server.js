@@ -46,6 +46,14 @@ const MESSAGE_AWARENESS = 1;
 const MESSAGE_AUTH = 2;
 const MESSAGE_QUERY_AWARENESS = 3;
 
+// Sentinel transactionOrigin for the initial DB-hydration update in
+// Room.loadFromDB(). Lets the centralized doc.on("update") listener (see the
+// Room constructor) recognize "these bytes just came FROM the database" and
+// skip re-persisting them, without skipping the broadcast (harmless — by the
+// time loadFromDB() runs, getOrCreateRoom()'s readyPromise guarantees no
+// client has connected to this room yet).
+const DB_LOAD_ORIGIN = Symbol("yjs-db-load");
+
 // Build database connection config from environment
 const dbConfig = {
   host: process.env.DB_HOST || "localhost",
@@ -330,6 +338,10 @@ class Room {
     this.clients = new Set();
     this.projectId = null;
     this.isLoaded = false;
+    // Set by getOrCreateRoom() immediately after construction — every caller
+    // awaits this before touching the room, so the doc is never exposed to
+    // sync code until loading has succeeded or definitively failed.
+    this.readyPromise = null;
     this.lastUpdateId = null;
     // Track which message IDs we've already persisted to avoid duplicates
     this.persistedMessageIds = new Set();
@@ -345,6 +357,34 @@ class Room {
         if (name) roots.add(name);
       });
       this._lastChangedRoots = roots;
+    });
+
+    // Centralized propagation point for every accepted Y.Doc mutation,
+    // regardless of source: a live update message, a sync-step-2 reconnect
+    // replay (readUpdate === readSyncStep2 in y-protocols — identical code
+    // path to a plain update), a server-side mutation with no socket (Matrix
+    // bridge chat injection), or DB hydration. `afterTransaction` (above)
+    // always fires before `update` for the same transaction (yjs's
+    // cleanupTransactions emits afterTransaction inside its try block, update
+    // later in finally), so detectUpdateOrigin() below always sees this
+    // transaction's freshly-populated _lastChangedRoots.
+    this.doc.on("update", (update, origin) => {
+      const originSocket = origin instanceof WebSocket ? origin : null;
+
+      const encoder = encoding.createEncoder();
+      encoding.writeVarUint(encoder, MESSAGE_SYNC);
+      syncProtocol.writeUpdate(encoder, update);
+      broadcastToRoom(this, encoding.toUint8Array(encoder), originSocket);
+
+      if (origin === DB_LOAD_ORIGIN) return; // don't re-persist what we just loaded
+
+      const changeOrigin = detectUpdateOrigin(this);
+      this.storeUpdate(
+        update,
+        changeOrigin,
+        originSocket?.userId || null,
+        originSocket?.clientId || null
+      );
     });
 
     // Track chat messages for persistence
@@ -468,7 +508,7 @@ class Room {
       );
 
       if (docRecord.documentState && docRecord.documentState.length > 0) {
-        Y.applyUpdate(this.doc, docRecord.documentState);
+        Y.applyUpdate(this.doc, docRecord.documentState, DB_LOAD_ORIGIN);
         syncLog.info(
           "Loaded Y.Doc state for room:",
           this.roomId,
@@ -564,21 +604,30 @@ async function getOrCreateRoom(roomName) {
     room = new Room(roomName);
     rooms.set(roomName, room);
 
-    // Load state from database
-    await room.loadFromDB();
-
-    // The room is registered BEFORE this await, but has no clients yet — so a
-    // client disconnecting during the load sees clients.size === 0 and deletes
-    // it from `rooms` (see the close handler). Re-registering the instance we
-    // built keeps that from happening behind our back.
-    //
-    // This return used to be `rooms.get(roomName)`, which in exactly that race
-    // returned UNDEFINED and crashed the whole server on the caller's
-    // `room.clients.add(socket)` — taking every other room's session with it.
-    if (rooms.get(roomName) !== room) rooms.set(roomName, room);
+    // Assigned synchronously, in the same tick as rooms.set() above and
+    // before any await — so a concurrent getOrCreateRoom(roomName) call can
+    // only ever observe a room that already has this promise set. EVERY
+    // caller (including this one) awaits it below, so no caller can be
+    // handed a room whose doc hasn't finished loading (or definitively
+    // failed to — loadFromDB()'s own try/catch means this never rejects).
+    room.readyPromise = room.loadFromDB().then(() => {
+      // The room is registered BEFORE the load above, but has no clients yet
+      // — so a client disconnecting during the load sees clients.size === 0
+      // and deletes it from `rooms` (see the close handler). Re-registering
+      // the instance we built keeps that from happening behind our back.
+      //
+      // This used to be checked with a plain `rooms.get(roomName)` return,
+      // which in exactly that race returned UNDEFINED and crashed the whole
+      // server on the caller's `room.clients.add(socket)` — taking every
+      // other room's session with it. Chained onto readyPromise so it runs
+      // exactly once, regardless of how many callers are concurrently
+      // awaiting it.
+      if (rooms.get(roomName) !== room) rooms.set(roomName, room);
+      return room;
+    });
   }
 
-  return room;
+  return room.readyPromise;
 }
 
 /**
@@ -642,7 +691,7 @@ async function handleMessage(socket, room, message) {
 
     switch (messageType) {
       case MESSAGE_SYNC:
-        handleSyncMessage(socket, room, decoder, message);
+        handleSyncMessage(socket, room, decoder);
         break;
 
       case MESSAGE_AWARENESS:
@@ -669,46 +718,20 @@ async function handleMessage(socket, room, message) {
 /**
  * Handle Y.js sync protocol messages
  */
-function handleSyncMessage(socket, room, decoder, rawMessage) {
+function handleSyncMessage(socket, room, decoder) {
   const encoder = encoding.createEncoder();
   encoding.writeVarUint(encoder, MESSAGE_SYNC);
 
-  const syncMessageType = syncProtocol.readSyncMessage(
-    decoder,
-    encoder,
-    room.doc,
-    socket
-  );
+  syncProtocol.readSyncMessage(decoder, encoder, room.doc, socket);
 
-  // If we have a response to send back
+  // Broadcasting to other clients and persisting the change are handled
+  // uniformly by Room's doc.on("update", ...) listener (see the Room
+  // constructor) for every message subtype that actually mutates the doc —
+  // sync step 2 (reconnect replay) and update messages apply through the
+  // exact same y-protocols code path (readUpdate === readSyncStep2), so there
+  // is no propagation logic here to branch on subtype.
   if (encoding.length(encoder) > 1) {
     send(socket, encoding.toUint8Array(encoder));
-  }
-
-  // Sync step 2 or update - relay to other clients
-  if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
-    // State received from client - could store snapshot here
-    syncLog.trace("Received sync step 2 from client in room:", room.roomId);
-  } else if (syncMessageType === syncProtocol.messageYjsUpdate) {
-    // This is an update - relay to others
-    broadcastToRoom(room, rawMessage, socket);
-
-    // Store update for recording (excluding noisy cursor updates)
-    // The update origin is determined by observing the doc changes
-    const update = decoding.readVarUint8Array(
-      decoding.createDecoder(new Uint8Array(rawMessage).slice(2))
-    );
-
-    // Classify the update by which shared types it touched (captured by the
-    // room's afterTransaction observer) so transient presence/pose/cursor
-    // traffic is skipped instead of mislabeled as chat and over-persisted.
-    const origin = detectUpdateOrigin(room);
-    room.storeUpdate(
-      update,
-      origin,
-      socket.userId || null,
-      socket.clientId || null
-    );
   }
 }
 
@@ -762,6 +785,11 @@ function handleAwarenessMessage(socket, room, decoder, rawMessage) {
 
   // Extract client IDs from this update
   const updatedClientIds = decodeAwarenessUpdateClientIds(update);
+
+  // Track every ID this socket has ever announced (a star-topology client
+  // only ever announces its own state, but this stays correct even if that
+  // ever changes) — this is the set removed on disconnect, below.
+  updatedClientIds.forEach((id) => socket.awarenessClientIds.add(id));
 
   // If this socket doesn't have a clientId yet, try to associate it
   // The first awareness update from a client typically contains their own state
@@ -1013,6 +1041,14 @@ async function checkRoomDocumentAccess(roomId, userId, projectId) {
  * Handle new WebSocket connection
  */
 wss.on("connection", async (socket, req) => {
+  // Liveness tracking for the ping/pong sweep below (see PING_INTERVAL_MS) —
+  // must be set for every connection, including ones that never make it past
+  // authentication, so a stuck half-open socket still gets reaped.
+  socket.isAlive = true;
+  socket.on("pong", () => {
+    socket.isAlive = true;
+  });
+
   // Parse URL and query params
   const url = new URL(req.url, `http://${req.headers.host}`);
   const rawRoomName =
@@ -1066,6 +1102,10 @@ wss.on("connection", async (socket, req) => {
   }
 
   socket.clientId = null; // Will be set from awareness
+  // Every awareness client ID this socket has ever announced (see
+  // handleAwarenessMessage) — used on disconnect to remove exactly the right
+  // presence entries instead of the shared, unrelated room.doc.clientID.
+  socket.awarenessClientIds = new Set();
 
   wsLog.info("Client connected to room:", roomName, "user:", socket.username);
 
@@ -1101,15 +1141,31 @@ wss.on("connection", async (socket, req) => {
   socket.on("close", async () => {
     room.clients.delete(socket);
 
-    // Clean up cursor state
-    cleanupClientCursor(socket.clientId);
+    // Clean up cursor state for every awareness ID this socket ever
+    // announced (room.doc.clientID — the room's own Y.Doc identity, never an
+    // awareness ID — is not a valid input here or below).
+    socket.awarenessClientIds.forEach((id) => cleanupClientCursor(id));
 
-    // Remove from awareness
-    awarenessProtocol.removeAwarenessStates(
-      room.awareness,
-      [room.doc.clientID],
-      "disconnect"
-    );
+    // Remove from awareness — and actually tell everyone else. Unlike
+    // removing on an incoming update, there's no raw client message to relay
+    // here, so the removal has to be encoded and broadcast explicitly, or
+    // every other client keeps this user's avatar/cursor/presence forever.
+    const idsToRemove = Array.from(socket.awarenessClientIds);
+    if (idsToRemove.length > 0) {
+      awarenessProtocol.removeAwarenessStates(
+        room.awareness,
+        idsToRemove,
+        "disconnect"
+      );
+
+      const encoder = encoding.createEncoder();
+      encoding.writeVarUint(encoder, MESSAGE_AWARENESS);
+      encoding.writeVarUint8Array(
+        encoder,
+        awarenessProtocol.encodeAwarenessUpdate(room.awareness, idsToRemove)
+      );
+      broadcastToRoom(room, encoding.toUint8Array(encoder));
+    }
 
     wsLog.info("Client disconnected from:", roomName);
     wsLog.debug("Remaining clients:", room.clients.size);
@@ -1136,6 +1192,27 @@ wss.on("connection", async (socket, req) => {
     wsLog.error("WebSocket error:", error.message);
   });
 });
+
+// Application-level liveness sweep. A dropped Wi-Fi link or a headset going
+// to sleep leaves a half-open TCP connection that neither side's OS reports
+// as closed — without this, that socket lingers in room.clients (and its
+// presence stays visible to everyone) until the underlying TCP stack times
+// out, which can take minutes. Standard ws-library pattern: mark every
+// socket dead by default each sweep, revive it on 'pong', and terminate
+// whatever's still marked dead — which fires 'close' and runs the normal
+// disconnect cleanup above.
+const PING_INTERVAL_MS = 30000;
+const pingInterval = setInterval(() => {
+  wss.clients.forEach((socket) => {
+    if (socket.isAlive === false) {
+      wsLog.warn("Terminating unresponsive Y.js connection (missed ping)");
+      return socket.terminate();
+    }
+    socket.isAlive = false;
+    socket.ping();
+  });
+}, PING_INTERVAL_MS);
+wss.on("close", () => clearInterval(pingInterval));
 
 // Listen for awareness changes to broadcast
 // This is done per-room when clients join

@@ -21,7 +21,15 @@
 
 import { vr as log } from '@Utils/logger.js';
 import { ydoc } from '@Collaboration/yjs/yjsSetup.js';
-import { getUserId, getUserName } from '@Collaboration/presence/userManagement.js';
+// Every identity check here answers "is this DEVICE the holder/host?", so it
+// must use the per-device participant id. With getUserId() (the account), two
+// headsets signed into one account both believed they held the token the
+// moment either of them took it.
+import {
+  getParticipantId,
+  getParticipantName,
+  isSelfIdentity,
+} from '@Collaboration/presence/userManagement.js';
 
 /**
  * A holder whose heartbeat has not been refreshed within this window counts as
@@ -51,6 +59,7 @@ export class VRManipulationLock {
    */
   constructor(session) {
     this._session = session;
+    this._boundSessionId = session.id;
     this._yLock = null;
     this._observers = [];
     /** @type {Set<Function>} */
@@ -77,7 +86,7 @@ export class VRManipulationLock {
     try {
       if (this._yLock) {
         if (this.isHeldByMe()) this._yLock.delete(HOLDER_KEY);
-        this._removeRequest(getUserId());
+        this._removeRequest(getParticipantId());
       }
     } catch (err) {
       log.warn(`VRManipulationLock stop failed: ${err?.message}`);
@@ -102,19 +111,20 @@ export class VRManipulationLock {
    * @param {string} newSessionId
    */
   rekey(newSessionId) {
-    if (!newSessionId || newSessionId === this._session.id) return;
+    if (!newSessionId || newSessionId === this._boundSessionId) return;
 
     // Vacate the OLD map first, exactly as VRParticipantSync does, so a stale
     // copy of us cannot squat there until MANIP_STALE_MS elapses.
     try {
       if (this._yLock && this.isHeldByMe()) this._yLock.delete(HOLDER_KEY);
-      this._removeRequest(getUserId());
+      this._removeRequest(getParticipantId());
     } catch (err) {
       log.warn(`VRManipulationLock rekey cleanup failed: ${err?.message}`);
     }
 
     this._detachObserver();
     this._session.id = newSessionId;
+    this._boundSessionId = newSessionId;
     this._yLock = ydoc.getMap(`vr-manipulation-${newSessionId}`);
     this._lastHeartbeatAt = 0;
     this._attachObserver();
@@ -140,7 +150,10 @@ export class VRManipulationLock {
 
   /** @returns {boolean} true when the local user owns this session. */
   isHost() {
-    return !!this._session?.ownerUserId && this._session.ownerUserId === getUserId();
+    // isSelfIdentity, not an exact compare: ownerUserId is a participant id
+    // when the session was claimed through the Y.js registry, but a bare
+    // account id when it came back from the server (joinSession).
+    return isSelfIdentity(this._session?.ownerUserId);
   }
 
   /**
@@ -159,7 +172,7 @@ export class VRManipulationLock {
 
   /** @returns {boolean} the local user is the live holder. */
   isHeldByMe() {
-    return this.getHolder()?.holderUserId === getUserId();
+    return this.getHolder()?.holderUserId === getParticipantId();
   }
 
   /**
@@ -174,7 +187,7 @@ export class VRManipulationLock {
   canManipulate() {
     const holder = this.getHolder();
     if (!holder) return true;
-    return holder.holderUserId === getUserId();
+    return holder.holderUserId === getParticipantId();
   }
 
   /**
@@ -201,7 +214,7 @@ export class VRManipulationLock {
    */
   claimAsHost() {
     if (!this._yLock || !this.isHost()) return false;
-    this._writeHolder(getUserId(), getUserName(), getUserId());
+    this._writeHolder(getParticipantId(), getParticipantName(), getParticipantId());
     return true;
   }
 
@@ -217,7 +230,7 @@ export class VRManipulationLock {
     if (!this.isHeldByMe() && !this.isHost()) return false;
 
     const pending = this._readRequests()[userId];
-    this._writeHolder(userId, userName || pending?.userName || userId, getUserId());
+    this._writeHolder(userId, userName || pending?.userName || userId, getParticipantId());
     this._removeRequest(userId);
     return true;
   }
@@ -232,13 +245,13 @@ export class VRManipulationLock {
     if (!this._yLock || !this.isHeldByMe()) return false;
 
     const hostId = this._session?.ownerUserId;
-    if (!hostId || hostId === getUserId()) {
+    if (!hostId || isSelfIdentity(hostId)) {
       // We ARE the host (or the session has no host at all): vacate outright
       // rather than re-granting ourselves the token we just gave up.
       this._yLock.delete(HOLDER_KEY);
       return true;
     }
-    this._writeHolder(hostId, this._session?.ownerUserName || hostId, getUserId());
+    this._writeHolder(hostId, this._session?.ownerUserName || hostId, getParticipantId());
     return true;
   }
 
@@ -253,7 +266,7 @@ export class VRManipulationLock {
     if (this.isHeldByMe()) return false;
 
     const next = this._prunedRequests();
-    next[getUserId()] = { userName: getUserName(), atMs: Date.now() };
+    next[getParticipantId()] = { userName: getParticipantName(), atMs: Date.now() };
     this._yLock.set(REQUESTS_KEY, next);
     return true;
   }
@@ -403,7 +416,7 @@ export class VRManipulationLock {
     });
     // Our own next heartbeat should not be suppressed by a stale throttle
     // stamp left over from before the token moved.
-    this._lastHeartbeatAt = holderUserId === getUserId() ? now : 0;
+    this._lastHeartbeatAt = holderUserId === getParticipantId() ? now : 0;
   }
 }
 

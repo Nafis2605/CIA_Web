@@ -43,6 +43,9 @@ vi.mock("@Collaboration/presence/userManagement.js", () => ({
   getUserId: vi.fn(() => "user-1"),
   getUserName: vi.fn(() => "Tester"),
   getUserColor: vi.fn(() => "#ff0000"),
+  getParticipantId: vi.fn(() => "user-1"),
+  getParticipantName: vi.fn(() => "Tester"),
+  isSelfIdentity: vi.fn((id) => id === "user-1"),
 }));
 vi.mock("@Core/instances/types/vtk/vr/VTKVRAvatars.js", () => ({
   vrAvatarSystem: { initialize: vi.fn(), dispose: vi.fn(), update: vi.fn() },
@@ -60,7 +63,7 @@ function makeFrame(inputSources, poseFor = () => ({ transform: TRANSFORM })) {
   };
 }
 
-describe("VRExplorationManager._gatherInputState — transient-pointer support", () => {
+describe("VRExplorationManager._gatherInputState â€” transient-pointer support", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -167,6 +170,6 @@ describe("VRExplorationManager._gatherInputState — transient-pointer support",
 // NOTE: The "one-shot gripless navigation-mode switch" feature has been
 // replaced by the always-on layered navigation model. With the new
 // architecture, Vision Pro's gripless input is handled transparently by the
-// grip engagement predicate in setWorldGrabEngagement — it routes pinches
+// grip engagement predicate in setWorldGrabEngagement â€” it routes pinches
 // to world-grab on Vision Pro (triggerPressed) and squeeze on tracked
 // controllers (squeezeValue > 0.7). No mode switch is needed.

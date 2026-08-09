@@ -1,7 +1,7 @@
 // src/core/vr/__tests__/VRExplorationManager.vizsync.test.js
 // VR visualization changes (clip gestures, representation cycling, glyph
 // toggling) must reach collaborators + persistence through the same
-// visualization-sync channel the desktop menus use — and for drag gestures,
+// visualization-sync channel the desktop menus use â€” and for drag gestures,
 // only on gesture end (final: true), never per drag frame.
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
@@ -36,6 +36,9 @@ vi.mock("@Collaboration/presence/userManagement.js", () => ({
   getUserId: vi.fn(() => "user-1"),
   getUserName: vi.fn(() => "Tester"),
   getUserColor: vi.fn(() => "#ff0000"),
+  getParticipantId: vi.fn(() => "user-1"),
+  getParticipantName: vi.fn(() => "Tester"),
+  isSelfIdentity: vi.fn((id) => id === "user-1"),
 }));
 vi.mock("@Core/instances/types/vtk/vr/VTKVRAvatars.js", () => ({
   vrAvatarSystem: { initialize: vi.fn(), dispose: vi.fn() },
@@ -92,7 +95,7 @@ import {
   getDisabledGlyphTypes,
 } from "@Core/instances/types/vtk/features/VTKGlyphFeature.js";
 
-describe("VRExplorationManager — VR visualization sync (clip/representation/glyphs)", () => {
+describe("VRExplorationManager â€” VR visualization sync (clip/representation/glyphs)", () => {
   beforeEach(() => {
     mockPush.mockClear();
     vi.mocked(instanceTools.setRepresentation).mockClear();
@@ -104,7 +107,7 @@ describe("VRExplorationManager — VR visualization sync (clip/representation/gl
     mockGlyphState.vectorArrays = [{ name: "velocity" }];
     mockGlyphState.scalarArrays = [];
     // cycleRepresentation/toggleGlyphs now defer their expensive call to the
-    // end of the next XR frame (see VRExplorationManager._deferHeavy) —
+    // end of the next XR frame (see VRExplorationManager._deferHeavy) â€”
     // start each test with an empty queue so one test's leftover deferred
     // task can never bleed into the next.
     vrExplorationManager._deferredWork = [];
@@ -112,6 +115,11 @@ describe("VRExplorationManager — VR visualization sync (clip/representation/gl
     vrExplorationManager._activeContext = {
       instance: {
         viewConfigId: "view-1",
+        // Deliberately different from viewConfigId: the peer headset opened
+        // this same dataset itself and holds its OWN viewConfigId, so every
+        // push below must carry the dataset id as the cross-client sync key
+        // or the peer drops it (see @Core/instances/viewSyncKey.js).
+        datasetId: "dataset-1",
         instanceId: "inst-1",
         instanceData: { polydata: { fake: true } },
       },
@@ -124,7 +132,7 @@ describe("VRExplorationManager — VR visualization sync (clip/representation/gl
       type: "clip-box-updated",
       data: { instanceId: "inst-1", final: true },
     });
-    expect(mockPush).toHaveBeenCalledWith("view-1", { clipBox: mockClipConfig });
+    expect(mockPush).toHaveBeenCalledWith("view-1", { clipBox: mockClipConfig }, "dataset-1");
   });
 
   it("does NOT push during drag frames (final: false)", () => {
@@ -137,16 +145,16 @@ describe("VRExplorationManager — VR visualization sync (clip/representation/gl
 
   it("cycleRepresentation returns the optimistic mode immediately, then renders + pushes once the frame drains", () => {
     const next = vrExplorationManager.cycleRepresentation();
-    expect(next).toBe("wireframe"); // surface → wireframe
+    expect(next).toBe("wireframe"); // surface â†’ wireframe
 
-    // Deferred (see VRExplorationManager._deferHeavy) — nothing has run yet.
+    // Deferred (see VRExplorationManager._deferHeavy) â€” nothing has run yet.
     expect(instanceTools.setRepresentation).not.toHaveBeenCalled();
     expect(mockPush).not.toHaveBeenCalled();
 
     vrExplorationManager._drainDeferredWork();
 
     expect(instanceTools.setRepresentation).toHaveBeenCalledWith("inst-1", "wireframe");
-    expect(mockPush).toHaveBeenCalledWith("view-1", { representation: "wireframe" });
+    expect(mockPush).toHaveBeenCalledWith("view-1", { representation: "wireframe" }, "dataset-1");
   });
 
   it("toggleGlyphs returns the optimistic enabled state immediately, then enables + pushes once the frame drains", () => {
@@ -178,7 +186,7 @@ describe("VRExplorationManager — VR visualization sync (clip/representation/gl
     expect(Number.isFinite(opts.scaleFactor)).toBe(true);
     expect(opts.scaleFactor).toBeGreaterThan(0);
 
-    expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig });
+    expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig }, "dataset-1");
   });
 
   it("toggleGlyphs disables when already enabled and still pushes the patch once drained", () => {
@@ -191,12 +199,12 @@ describe("VRExplorationManager — VR visualization sync (clip/representation/gl
     vrExplorationManager._drainDeferredWork();
 
     expect(vtkGlyphFeature.disableGlyphs).toHaveBeenCalledWith("inst-1");
-    expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig });
+    expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig }, "dataset-1");
   });
 
   // setGlyphType exposes the SAME desktop VTKGlyphFeature API as toggleGlyphs
   // above (mirrors VTKGlyphFeature.test.js's own setGlyphType coverage at the
-  // manager layer) — but lets the caller pick a shape rather than always
+  // manager layer) â€” but lets the caller pick a shape rather than always
   // auto-picking arrow-or-sphere, which is what made VR glyphs look "random".
   describe("setGlyphType", () => {
     it("enables WITH the requested type when not yet enabled, deferred", () => {
@@ -213,7 +221,7 @@ describe("VRExplorationManager — VR visualization sync (clip/representation/gl
         { fake: true },
         expect.objectContaining({ glyphType: "cone", orientationArray: "velocity" })
       );
-      expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig });
+      expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig }, "dataset-1");
     });
 
     it("swaps the shape synchronously (not deferred) when glyphs are already enabled", () => {
@@ -221,10 +229,10 @@ describe("VRExplorationManager — VR visualization sync (clip/representation/gl
       const accepted = vrExplorationManager.setGlyphType("sphere");
       expect(accepted).toBe(true);
 
-      // Cheap — setGlyphType only rebuilds the glyph source, not the mapper —
+      // Cheap â€” setGlyphType only rebuilds the glyph source, not the mapper â€”
       // so unlike the initial enable above it runs immediately, no drain needed.
       expect(vtkGlyphFeature.setGlyphType).toHaveBeenCalledWith("inst-1", "sphere");
-      expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig });
+      expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig }, "dataset-1");
     });
 
     it("disables with typeId === null, same as toggleGlyphs' disable branch", () => {
@@ -236,7 +244,7 @@ describe("VRExplorationManager — VR visualization sync (clip/representation/gl
       vrExplorationManager._drainDeferredWork();
 
       expect(vtkGlyphFeature.disableGlyphs).toHaveBeenCalledWith("inst-1");
-      expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig });
+      expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig }, "dataset-1");
     });
 
     it("refuses a type requiring orientation when the dataset has no vector array", () => {
@@ -246,7 +254,7 @@ describe("VRExplorationManager — VR visualization sync (clip/representation/gl
       expect(accepted).toBe(false);
       expect(vtkGlyphFeature.enableGlyphs).not.toHaveBeenCalled();
       expect(vtkGlyphFeature.setGlyphType).not.toHaveBeenCalled();
-      // Refusal is reported, not silent — see the notice-visibility fix.
+      // Refusal is reported, not silent â€” see the notice-visibility fix.
       expect(vrExplorationManager.getVRNotice()).toMatch(/vector array/i);
     });
 

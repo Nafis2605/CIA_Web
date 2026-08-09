@@ -51,14 +51,17 @@ vi.mock("@Collaboration/presence/userManagement.js", () => ({
   getUserId: vi.fn(() => "user-1"),
   getUserName: vi.fn(() => "Tester"),
   getUserColor: vi.fn(() => "#ff0000"),
+  getParticipantId: vi.fn(() => "user-1"),
+  getParticipantName: vi.fn(() => "Tester"),
+  isSelfIdentity: vi.fn((id) => id === "user-1"),
 }));
 vi.mock("@Core/instances/types/vtk/vr/VTKVRAvatars.js", () => ({
   vrAvatarSystem: { initialize: vi.fn(), dispose: vi.fn(), update: vi.fn() },
 }));
 
 // Spatial UI: control what hitTest() reports (hover / hand) per test. Split
-// into hitTest() (phase 1, before nav — raw input arbitration, what these
-// tests exercise) and layout() (phase 2, after nav — see the frame-order
+// into hitTest() (phase 1, before nav â€” raw input arbitration, what these
+// tests exercise) and layout() (phase 2, after nav â€” see the frame-order
 // test below) mirroring VRExplorationManager._onFrame's real call sites.
 const mockSpatialHitTest = vi.fn(() => ({ hovering: false, hand: "right", buttonId: null }));
 const mockSpatialLayout = vi.fn();
@@ -98,7 +101,7 @@ const PINCH_SOURCE = {
   hand: null,
 };
 
-describe("VRExplorationManager._onFrame — input arbitration (R2)", () => {
+describe("VRExplorationManager._onFrame â€” input arbitration (R2)", () => {
   let navUpdate;
   let toolUpdate;
   let activeTool;
@@ -218,7 +221,7 @@ describe("VRExplorationManager._onFrame — input arbitration (R2)", () => {
 
   // A4: hitTest() must run before nav (asserted throughout this file via
   // navUpdate/toolUpdate seeing hitTest's arbitration result), and layout()
-  // must run after nav, with THIS frame's post-nav transform — not the
+  // must run after nav, with THIS frame's post-nav transform â€” not the
   // pre-nav vrContext snapshot hitTest() itself never even receives.
   it("calls layout() once per frame, after nav, with the frame's vrScale/vrOrigin", () => {
     navUpdate.mockReturnValue({ vrScale: 2.5, position: { x: 4, y: 5, z: 6 } });
@@ -226,7 +229,7 @@ describe("VRExplorationManager._onFrame — input arbitration (R2)", () => {
 
     expect(mockSpatialLayout).toHaveBeenCalledTimes(1);
     expect(mockSpatialHitTest).toHaveBeenCalledTimes(1);
-    // hitTest() takes only inputState — no transform argument at all.
+    // hitTest() takes only inputState â€” no transform argument at all.
     expect(mockSpatialHitTest.mock.calls[0]).toHaveLength(1);
     // layout() sees the transform AFTER nav applied navUpdate's result to
     // vrContext (vrScale 2.5, origin [4,5,6]), not the pre-frame vrContext
@@ -235,7 +238,7 @@ describe("VRExplorationManager._onFrame — input arbitration (R2)", () => {
   });
 
   // A snap-turn rotates the XR reference space itself, which is deliberately
-  // built to leave head POSITION nearly unchanged — so vrSpatialUI's own
+  // built to leave head POSITION nearly unchanged â€” so vrSpatialUI's own
   // position-drift re-anchor gate never trips on its own, and its cached
   // anchor would silently desync from the camera and stay frozen there (the
   // "menu doesn't follow the user" bug). _onFrame watches vrManager's yaw
@@ -250,7 +253,7 @@ describe("VRExplorationManager._onFrame — input arbitration (R2)", () => {
     runFrame();
     expect(mockForceReanchor).toHaveBeenCalledTimes(1);
 
-    // Stays at the new offset next frame — must not keep re-forcing forever.
+    // Stays at the new offset next frame â€” must not keep re-forcing forever.
     runFrame();
     expect(mockForceReanchor).toHaveBeenCalledTimes(1);
   });

@@ -68,6 +68,10 @@ const {
   needsDisplayNamePrompt,
   clearUserName,
   setUserName,
+  getParticipantId,
+  getParticipantName,
+  getAccountId,
+  isSelfIdentity,
 } = userManagement;
 
 beforeEach(() => {
@@ -122,6 +126,35 @@ describe("userManagement identity — dev bypass with nothing stored", () => {
     clearUserName();
     mockHasDeviceName.mockReturnValue(true);
     expect(needsDisplayNamePrompt()).toBe(false);
+  });
+});
+
+describe("userManagement identity — participant id under dev bypass", () => {
+  // In dev bypass getUserId() is ALREADY the device id, so the composite has
+  // the same value on both halves. That is harmless and deliberate: presence
+  // keys stay per-device (which is all they need), and the production path —
+  // where getUserId() is the shared Keycloak subject — is what the composite
+  // actually exists to disambiguate.
+  it("composes account#device, which in dev are the same value", () => {
+    expect(getParticipantId()).toBe(`${DEVICE_ID}#${DEVICE_ID}`);
+    expect(getAccountId(getParticipantId())).toBe(DEVICE_ID);
+    expect(isSelfIdentity(getParticipantId())).toBe(true);
+  });
+
+  it("recognises the bare dev id as self, so pre-existing records still match", () => {
+    expect(isSelfIdentity(DEVICE_ID)).toBe(true);
+    expect(isSelfIdentity("some-other-device")).toBe(false);
+  });
+
+  it("leaves the display name alone — dev names are already per-device", () => {
+    setUserName("Fahim");
+    expect(getParticipantName()).toBe("Fahim");
+  });
+
+  it("still separates two mock users under one browser", () => {
+    mockGetStoredMockUserId.mockReturnValue(ALICE.id);
+    expect(getParticipantId()).toBe(`${ALICE.id}#${DEVICE_ID}`);
+    expect(getAccountId(getParticipantId())).toBe(ALICE.id);
   });
 });
 

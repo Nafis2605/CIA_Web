@@ -27,16 +27,90 @@ Y.js shared objects managed by `src/collaboration/yjs/yjsSetup.js`:
 | Map key | Contents |
 |---|---|
 | `yCursors` | `userId → {position, color, name, viewId, lastUpdate}` |
-| `yCameras` | `viewId → {camera, userId, clientId, lastUpdate}` |
-| `yVisualizationState` | `viewId → {visualization, userId, clientId, lastUpdate}` — representation, opacity, colormap, activeArray, transform, slice, windowLevel, glyph config, threshold config |
-| `yManipulatorState` | `viewId → {userId, kind, lastUpdate}` — who is interacting with what |
+| `yCameras` | `viewId → {camera, userId, syncKey, clientId, lastUpdate}` |
+| `yVisualizationState` | `viewId → {visualization, userId, syncKey, clientId, lastUpdate}` — representation, opacity, colormap, activeArray, transform, slice, windowLevel, glyph config, threshold config |
+| `yManipulatorState` | `participantId → {userId, kind, lastUpdate}` — who is interacting with what |
 | `yActiveDataset` | `roomId → {datasetId, version}` — shared dataset selection |
 | `yViewPresence` | `viewId → {viewers, lastUpdate}` |
-| `yAvatars` | `userId → {position, rotation, headPose, …}` |
-| `yVRControllers` | `${userId}_${hand} → {position, rotation, …}` |
+| `yAvatars` | `participantId → {position, rotation, headPose, …}` |
+| `yVRControllers` | `${participantId}_${hand} → {position, rotation, …}` |
+| `yVRSessions` | `datasetId → {sessionId, hostUserId, …}` — VR session convergence registry |
 | `yText` | Chat messages (Array) |
 
+Session-scoped VR maps are named dynamically rather than exported here:
+`vr-participants-<sessionId>` (poses), `vr-control-<sessionId>` (desktop→VR
+handoff), `vr-manipulation-<sessionId>` (the data-control token). All three
+converge automatically once the clients agree on one `sessionId`.
+
 Visualization settings ride the presence channel for real-time propagation *and* are written to the ViewConfiguration via REST for durability (`pushSharedVisualizationUpdate` in `src/services/visualizationSyncService.js`). Glyph and threshold filter settings sync as declarative configs (array names, modes, ranges) — never computed data; each client recomputes locally via `applyRemoteConfig` in the corresponding feature module.
+
+### 2.1 Two identifiers, two jobs
+
+**`syncKey` — which view is this about?**
+`viewId` is local to whoever sent the update. Every client that opens a dataset
+POSTs `/views` and gets its own fresh UUID, so two clients showing the same data
+hold two different, both valid, `viewConfigId`s. Matching a peer's update on
+`viewId` alone therefore drops it silently. Publishers also send a `syncKey`
+(the dataset id — see `resolveViewSyncKey` in
+`src/core/instances/viewSyncKey.js`), and `workspaceManager` applies an update to
+any instance matching *either* identifier. Clients that genuinely share one
+ViewConfiguration (saved workspace views, linked views) keep matching on
+`viewId` exactly as before.
+
+Note this converges the ephemeral channel only. The durable persist still writes
+to the sender's own ViewConfiguration, so a peer that reloads loses received
+state; cross-client durability needs clients to share one server-side
+ViewConfiguration.
+
+**`participantId` — which peer is this?**
+`getUserId()` is the *account* (the Keycloak subject) and stays the key for
+ownership, permissions, and server rows. It is not usable as a presence key:
+two devices signed into one account return the same string, so they collide on a
+single map entry that each then skips as its own — connected, but invisible to
+each other. `getParticipantId()` (`<accountId>#<deviceId>`, in
+`src/collaboration/presence/userManagement.js`) keys every VR presence map,
+self-vs-remote check, avatar colour, and the LiveKit identity. Use
+`getAccountId()` to recover the account half, and `isSelfIdentity()` for
+ownership checks that may see either form (server rows carry the bare account
+id).
+
+### 2.2 Share mode — how much of the pipeline a change may use
+
+`resolveShareMode()` in `src/services/visualizationSyncService.js` is the single
+gate for shared edits, and every publisher (VR menus, InstanceToolsPanel, and
+the VTK tools menu via `VTKInstanceHandler._syncVizPatch`) goes through it.
+
+| Active workspace | Role permits | Mode | Y.js | REST persist |
+|---|---|---|---|---|
+| none | n/a | `ephemeral` | yes | no |
+| yes | yes | `full` | yes | yes |
+| yes | no | `blocked` | no | no |
+
+**No workspace is not a denial.** Opening a local file never activates a
+workspace, so folding that case into "permission denied" refused every change
+and told the user their *role* was read-only — for a role that did not exist.
+There is nothing to persist to, so the change transmits and skips only the
+durable write; `pushShared*` returns `{ transmitted: true, persisted: false }`
+so callers can tell a working ephemeral sync from a real refusal. The role check
+is unchanged whenever a workspace does exist.
+
+### 2.3 Diagnosing two clients that cannot see each other
+
+`CIA.vrDiagnostics()` in the browser console (works over `chrome://inspect` on a
+Quest) dumps every id involved:
+
+- **must MATCH** — `roomId`, `datasetId`, `sessionKey`, `vrSessionId`, `participantMap`
+- **must DIFFER** — `viewConfigId`, `participantId`, `yjsClientId`
+
+A differing `viewConfigId` is normal and expected (§2.1); a differing `sessionKey`
+means the two clients are not on the same dataset. The same snapshot is logged at
+`warn` level on session start and on convergence re-key — deliberately `warn`,
+because the logger defaults to that level on any non-localhost host and a headset
+is never localhost.
+
+An update that arrives but matches no local instance is logged by
+`workspaceManager._warnUnroutableUpdate` (throttled), which distinguishes
+"nothing was sent" from "it was sent and dropped on arrival".
 
 Y.js snapshots are persisted to PostgreSQL through `server/src/services/yjsPersistence.js`. This is separate from the persistent sync channel.
 

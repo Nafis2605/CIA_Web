@@ -268,6 +268,8 @@ const starRoutes = require("./routes/stars");
 
 // Room management routes (Space Navigation system)
 const roomsRouter = require("./routes/rooms");
+// Legacy room->project lookup (compat for pre-URL-scheme /rooms/:roomId links)
+const roomLookupRouter = require("./routes/roomLookup");
 
 // Chat routes (Phase 2E - Y.js persistence)
 const chatRouter = require("./routes/chat");
@@ -327,6 +329,8 @@ app.use("/api/projects/:projectId/stars", optionalAuth, starRoutes);
 
 // Room management routes (Space Navigation system)
 app.use("/api/projects/:projectId/rooms", optionalAuth, roomsRouter);
+// Legacy room->project lookup — compat only, see routes/roomLookup.js
+app.use("/api/rooms", optionalAuth, roomLookupRouter);
 
 // Recording routes (nested under projects)
 app.use("/api/projects/:projectId/recordings", optionalAuth, recordingsRouter);
@@ -436,7 +440,10 @@ if (fs.existsSync(distIndexPath)) {
   app.get('/rooms/*', (req, res) => {
     res.sendFile(distIndexPath);
   });
-  log.info('SPA fallback enabled — serving dist/index.html for /rooms/*');
+  app.get('/projects/*/rooms/*', (req, res) => {
+    res.sendFile(distIndexPath);
+  });
+  log.info('SPA fallback enabled — serving dist/index.html for /rooms/* and /projects/*/rooms/*');
 }
 
 // ============================================================================

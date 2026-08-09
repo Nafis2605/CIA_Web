@@ -20,6 +20,7 @@ import { config } from "@Core/config/clientConfig.js";
 import { authService } from "@Services/authService.js";
 import { resolveHttpUrl } from "@Utils/resolveHttpUrl.js";
 import { sessionManager } from "@Core/session/sessionManager.js";
+import { getParticipantId } from "@Collaboration/presence/userManagement.js";
 
 /**
  * Connection status enum
@@ -146,6 +147,14 @@ class VoiceRoomService {
   async getToken(roomName, userName) {
     log.debug(`Fetching token for room: ${roomName}, user: ${userName}`);
 
+    // LiveKit enforces ONE connection per identity in a room: a second join
+    // with the same identity force-disconnects the first. Defaulting the
+    // identity to the account id therefore made two headsets signed into one
+    // account kick each other out of voice, alternating forever. Send the
+    // per-device participant id instead; the token server validates that its
+    // account half really is this caller before honouring it.
+    const participantId = getParticipantId();
+
     const authToken = await authService.getAccessToken();
     const headers = { "Content-Type": "application/json" };
     if (authToken) {
@@ -158,7 +167,7 @@ class VoiceRoomService {
     const response = await fetch(tokenUrl, {
       method: "POST",
       headers,
-      body: JSON.stringify({ roomName, userName }),
+      body: JSON.stringify({ roomName, userName, participantId }),
     });
 
     if (!response.ok) {

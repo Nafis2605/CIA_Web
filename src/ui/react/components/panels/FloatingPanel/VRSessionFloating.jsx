@@ -14,7 +14,7 @@ import { useFloatingPanels } from "./FloatingPanelContext";
 import { VRSessionPanel } from "@UI/react/components/panels/VRSessionPanel";
 import { useVRSession } from "@UI/react/hooks/useVRSession";
 import { vrManager } from "@Core/vr/VRManager.js";
-import { getUserId } from "@Collaboration/presence/userManagement.js";
+import { getParticipantId } from "@Collaboration/presence/userManagement.js";
 
 // =============================================================================
 // CONSTANTS
@@ -210,7 +210,9 @@ export const VRSessionFloating = memo(function VRSessionFloating({
   // Don't render if not open
   if (!panelState) return null;
 
-  const currentUserId = getUserId();
+  // Per-device: the roster's odUserIds are participant ids, so comparing the
+  // account id here would mark BOTH of one account's headsets as "you".
+  const currentUserId = getParticipantId();
 
   return (
     <FloatingPanel

@@ -7,6 +7,8 @@ import {
   getUserId,
   getUserName,
   getUserColor,
+  getParticipantId,
+  getParticipantName,
 } from "@Collaboration/presence/userManagement.js";
 import { awareness } from "@Collaboration/yjs/yjsSetup.js";
 import { presence as log } from "@Utils/logger.js";
@@ -43,7 +45,8 @@ class PresenceSystem {
     }
 
     const userId = getUserId();
-    const userName = getUserName();
+    const participantId = getParticipantId();
+    const userName = getParticipantName();
 
     if (!userId || !userName) {
       log.error("Cannot initialize presence without user ID and name");
@@ -53,8 +56,12 @@ class PresenceSystem {
     // Set initial presence
     this.localPresence = {
       userId: userId,
+      // Per-device. The roster dedupes on this so two headsets signed into one
+      // account are two rows, not one; userId above stays the account so
+      // permission and ownership checks elsewhere are unaffected.
+      participantId,
       userName: userName,
-      userColor: getUserColor(),
+      userColor: getUserColor(participantId),
       status: "active",
       cursor: null,
       joinedAt: Date.now(),
@@ -334,7 +341,12 @@ class PresenceSystem {
 
   /**
    * Get all online users including yourself
-   * Deduplicates users by userId (handles multiple tabs from same user)
+   *
+   * Deduplicates by participantId — per DEVICE, not per account. Collapsing on
+   * userId (the old behaviour) folded two headsets signed into one account into
+   * a single row and marked BOTH of them `isYou`, so neither could see that the
+   * other was in the room. Multiple tabs on one device still collapse, which is
+   * the case that rule was written for.
    */
   getOnlineUsers() {
     if (!this.awareness) {
@@ -342,14 +354,17 @@ class PresenceSystem {
       return [];
     }
 
-    const currentUserId = getUserId();
-    // Use a Map to deduplicate by userId, keeping the most recent entry
+    const currentParticipantId = getParticipantId();
+    // Use a Map to deduplicate by participantId, keeping the most recent entry
     const userMap = new Map();
 
     // awareness.getStates() returns a Map of clientId → state
     this.awareness.getStates().forEach((state, clientId) => {
       if (state && state.userId) {
-        const existingUser = userMap.get(state.userId);
+        // Fall back to userId for a peer that predates participantId, so an
+        // older client still appears rather than vanishing from the roster.
+        const key = state.participantId || state.userId;
+        const existingUser = userMap.get(key);
 
         // Keep the entry with the most recent lastSeen timestamp
         // This ensures we show the most active tab's state
@@ -357,10 +372,10 @@ class PresenceSystem {
           !existingUser ||
           (state.lastSeen || 0) > (existingUser.lastSeen || 0)
         ) {
-          userMap.set(state.userId, {
+          userMap.set(key, {
             clientId,
             ...state,
-            isYou: state.userId === currentUserId,
+            isYou: key === currentParticipantId,
           });
         }
       }

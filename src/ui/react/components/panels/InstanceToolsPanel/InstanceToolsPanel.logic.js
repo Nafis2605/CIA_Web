@@ -5,6 +5,7 @@
 
 import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { workspaceManager } from '@Core/instances/workspaceManager.js';
+import { resolveViewSyncKey } from '@Core/instances/viewSyncKey.js';
 import { getViewConfigurationManager, getDatasetManager } from '@Init/appInitializer.js';
 import { canvasManager } from '@Core/data/managers/CanvasManager.js';
 import { getCellColorHex } from '@UI/react/utils/canvasColors.js';
@@ -397,6 +398,34 @@ export function useInstanceToolsPanel({ workspaceId } = {}) {
   const activeViewId = instanceInfo?.viewId || null;
 
   // -------------------------------------------------------------------------
+  // Shared-edit push helpers
+  //
+  // Every setter below broadcasts with TWO identifiers: activeViewId (this
+  // client's own ViewConfiguration, for the durable persist) and the sync key
+  // (the dataset, which peers who opened it themselves also agree on — see
+  // @Core/instances/viewSyncKey.js). Both are read through a ref rather than
+  // captured, so the ~18 useCallbacks below keep their existing dependency
+  // lists and can never broadcast against a stale target: loading a different
+  // dataset into the same view changes the sync key while activeViewId, which
+  // is all those lists track, stays put.
+  // -------------------------------------------------------------------------
+  const syncTargetRef = useRef({ viewId: null, syncKey: null });
+  syncTargetRef.current = {
+    viewId: activeViewId,
+    syncKey: resolveViewSyncKey(activeInstance),
+  };
+
+  const pushViz = useCallback((patch) => {
+    const { viewId, syncKey } = syncTargetRef.current;
+    return pushSharedVisualizationUpdate(viewId, patch, syncKey);
+  }, []);
+
+  const pushCamera = useCallback((patch) => {
+    const { viewId, syncKey } = syncTargetRef.current;
+    return pushSharedCameraUpdate(viewId, patch, syncKey);
+  }, []);
+
+  // -------------------------------------------------------------------------
   // Permission Gating (shared ViewConfiguration edits)
   // -------------------------------------------------------------------------
   const [permissionDeniedReason, setPermissionDeniedReason] = useState(null);
@@ -458,7 +487,7 @@ export function useInstanceToolsPanel({ workspaceId } = {}) {
     if (!activeInstance?.instanceId) return;
     const posArr = [newPosition.x, newPosition.y, newPosition.z];
     instanceTools.setPosition(activeInstance.instanceId, ...posArr);
-    pushSharedVisualizationUpdate(activeViewId, {
+    pushViz({
       transform: {
         position: posArr,
         rotation: [rotation.x, rotation.y, rotation.z],
@@ -473,7 +502,7 @@ export function useInstanceToolsPanel({ workspaceId } = {}) {
     if (!activeInstance?.instanceId) return;
     const rotArr = [newRotation.x, newRotation.y, newRotation.z];
     instanceTools.setRotation(activeInstance.instanceId, ...rotArr);
-    pushSharedVisualizationUpdate(activeViewId, {
+    pushViz({
       transform: {
         position: [position.x, position.y, position.z],
         rotation: rotArr,
@@ -494,7 +523,7 @@ export function useInstanceToolsPanel({ workspaceId } = {}) {
     // UI uses percentage (10-200%), VTK uses multiplier (0.1-2.0)
     const scaleArr = [newScale.x / 100, newScale.y / 100, newScale.z / 100];
     instanceTools.setScale(activeInstance.instanceId, ...scaleArr);
-    pushSharedVisualizationUpdate(activeViewId, {
+    pushViz({
       transform: {
         position: [position.x, position.y, position.z],
         rotation: [rotation.x, rotation.y, rotation.z],
@@ -509,7 +538,7 @@ export function useInstanceToolsPanel({ workspaceId } = {}) {
     setScale({ x: 100, y: 100, z: 100 });
     if (!activeInstance?.instanceId) return;
     instanceTools.resetTransform(activeInstance.instanceId);
-    pushSharedVisualizationUpdate(activeViewId, {
+    pushViz({
       transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
     });
   }, [activeInstance?.instanceId, activeViewId]);
@@ -540,7 +569,7 @@ export function useInstanceToolsPanel({ workspaceId } = {}) {
     const newState = instanceTools.getCameraState(activeInstance.instanceId);
     if (newState) {
       setCameraState(prev => ({ ...prev, ...newState }));
-      pushSharedCameraUpdate(activeViewId, newState);
+      pushCamera(newState);
     }
   }, [activeInstance?.instanceId, activeViewId]);
 
@@ -559,7 +588,7 @@ export function useInstanceToolsPanel({ workspaceId } = {}) {
       position: newPosition,
     };
     instanceTools.setCameraState(activeInstance.instanceId, state);
-    pushSharedCameraUpdate(activeViewId, state);
+    pushCamera(state);
   }, [activeInstance?.instanceId, cameraState, activeViewId]);
 
   // Camera focal point change handler
@@ -577,7 +606,7 @@ export function useInstanceToolsPanel({ workspaceId } = {}) {
       focalPoint: newFocalPoint,
     };
     instanceTools.setCameraState(activeInstance.instanceId, state);
-    pushSharedCameraUpdate(activeViewId, state);
+    pushCamera(state);
   }, [activeInstance?.instanceId, cameraState, activeViewId]);
 
   // Camera view angle change handler
@@ -592,7 +621,7 @@ export function useInstanceToolsPanel({ workspaceId } = {}) {
       viewAngle: value,
     };
     instanceTools.setCameraState(activeInstance.instanceId, state);
-    pushSharedCameraUpdate(activeViewId, state);
+    pushCamera(state);
   }, [activeInstance?.instanceId, cameraState, activeViewId]);
 
   // Toggle camera transform subsection
@@ -635,7 +664,7 @@ export function useInstanceToolsPanel({ workspaceId } = {}) {
     // Apply to VTK
     const state = { position, focalPoint, viewUp, viewAngle, parallelScale, clippingRange };
     instanceTools.setCameraState(activeInstance.instanceId, state);
-    pushSharedCameraUpdate(activeViewId, state);
+    pushCamera(state);
   }, [activeInstance?.instanceId, activeViewId]);
 
   // Delete a saved camera state
@@ -751,7 +780,7 @@ export function useInstanceToolsPanel({ workspaceId } = {}) {
     setSliceOrientation(orientation);
     if (!activeInstance?.instanceId) return;
     instanceTools.setSliceOrientation(activeInstance.instanceId, orientation);
-    pushSharedVisualizationUpdate(activeViewId, { slice: { orientation, position: slicePosition } });
+    pushViz({ slice: { orientation, position: slicePosition } });
 
     // Update slice max based on data dimensions
     const dimensions = instanceTools.getDataDimensions(activeInstance.instanceId);
@@ -769,7 +798,7 @@ export function useInstanceToolsPanel({ workspaceId } = {}) {
     // Convert absolute position to percentage for VTK
     const percentage = (position / sliceMax) * 100;
     instanceTools.setSlicePosition(activeInstance.instanceId, percentage);
-    pushSharedVisualizationUpdate(activeViewId, { slice: { orientation: sliceOrientation, position: percentage } });
+    pushViz({ slice: { orientation: sliceOrientation, position: percentage } });
   }, [activeInstance?.instanceId, sliceMax, sliceOrientation, activeViewId]);
 
   // -------------------------------------------------------------------------
@@ -779,14 +808,14 @@ export function useInstanceToolsPanel({ workspaceId } = {}) {
     setWindowValue(value);
     if (!activeInstance?.instanceId) return;
     instanceTools.setWindowLevel(activeInstance.instanceId, value, levelValue);
-    pushSharedVisualizationUpdate(activeViewId, { windowLevel: { window: value, level: levelValue } });
+    pushViz({ windowLevel: { window: value, level: levelValue } });
   }, [activeInstance?.instanceId, levelValue, activeViewId]);
 
   const handleLevelChange = useCallback((value) => {
     setLevelValue(value);
     if (!activeInstance?.instanceId) return;
     instanceTools.setWindowLevel(activeInstance.instanceId, windowValue, value);
-    pushSharedVisualizationUpdate(activeViewId, { windowLevel: { window: windowValue, level: value } });
+    pushViz({ windowLevel: { window: windowValue, level: value } });
   }, [activeInstance?.instanceId, windowValue, activeViewId]);
 
   const handleWindowLevelPreset = useCallback((presetId, windowWidth, windowLevel) => {
@@ -795,7 +824,7 @@ export function useInstanceToolsPanel({ workspaceId } = {}) {
     setLevelValue(windowLevel);
     if (!activeInstance?.instanceId) return;
     instanceTools.applyWindowLevelPreset(activeInstance.instanceId, presetId, windowWidth, windowLevel);
-    pushSharedVisualizationUpdate(activeViewId, { windowLevel: { window: windowWidth, level: windowLevel } });
+    pushViz({ windowLevel: { window: windowWidth, level: windowLevel } });
   }, [activeInstance?.instanceId, activeViewId]);
 
   // -------------------------------------------------------------------------
@@ -806,28 +835,28 @@ export function useInstanceToolsPanel({ workspaceId } = {}) {
     if (!activeInstance?.instanceId) return;
     // VTK uses 0-1 scale, UI uses 0-100
     instanceTools.setOpacity(activeInstance.instanceId, value / 100);
-    pushSharedVisualizationUpdate(activeViewId, { opacity: value / 100 });
+    pushViz({ opacity: value / 100 });
   }, [activeInstance?.instanceId, activeViewId]);
 
   const handleRepresentationChange = useCallback((mode) => {
     setRepresentation(mode);
     if (!activeInstance?.instanceId) return;
     instanceTools.setRepresentation(activeInstance.instanceId, mode);
-    pushSharedVisualizationUpdate(activeViewId, { representation: mode });
+    pushViz({ representation: mode });
   }, [activeInstance?.instanceId, activeViewId]);
 
   const handlePointSizeChange = useCallback((size) => {
     setPointSize(size);
     if (!activeInstance?.instanceId) return;
     instanceTools.setPointSize(activeInstance.instanceId, size);
-    pushSharedVisualizationUpdate(activeViewId, { pointSize: size });
+    pushViz({ pointSize: size });
   }, [activeInstance?.instanceId, activeViewId]);
 
   const handleLineWidthChange = useCallback((width) => {
     setLineWidth(width);
     if (!activeInstance?.instanceId) return;
     instanceTools.setLineWidth(activeInstance.instanceId, width);
-    pushSharedVisualizationUpdate(activeViewId, { lineWidth: width });
+    pushViz({ lineWidth: width });
   }, [activeInstance?.instanceId, activeViewId]);
 
   // -------------------------------------------------------------------------
@@ -904,7 +933,7 @@ export function useInstanceToolsPanel({ workspaceId } = {}) {
     if (!activeInstance?.instanceId) return;
     instanceTools.setColorMap?.(activeInstance.instanceId, colormapId);
     setCurrentColormap(colormapId);
-    pushSharedVisualizationUpdate(activeViewId, { colormap: colormapId });
+    pushViz({ colormap: colormapId });
   }, [activeInstance?.instanceId, activeViewId]);
 
   // -------------------------------------------------------------------------

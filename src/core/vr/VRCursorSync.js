@@ -105,8 +105,13 @@ export class VRCursorSync {
     // Hand tracking updates (separate for higher frequency)
     const handObserver = (event) => {
       event.changes.keys.forEach((change, key) => {
-        // Key format: odUserId_left or odUserId_right
-        const [odUserId, hand] = key.split("_");
+        // Key format: <participantId>_left or <participantId>_right. Split on
+        // the LAST underscore — the id half is opaque (it is now a composite,
+        // see getParticipantId) and splitting on the first would truncate it.
+        const sep = key.lastIndexOf("_");
+        if (sep === -1) return;
+        const odUserId = key.slice(0, sep);
+        const hand = key.slice(sep + 1);
         if (odUserId === this._localUserId) return;
 
         if (change.action === "delete") {
