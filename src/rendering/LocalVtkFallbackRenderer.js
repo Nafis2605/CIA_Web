@@ -56,7 +56,9 @@ export async function fetchServerDatasets() {
     const serverUrl = config.renderServerUrl || 'http://localhost:7001';
 
     try {
-        const resp = await fetch(`${serverUrl}/datasets`);
+        const resp = await fetch(`${serverUrl}/datasets`, {
+            headers: config.renderServerToken ? { 'X-Render-Token': config.renderServerToken } : undefined,
+        });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const datasets = await resp.json();
         console.log('[RenderServer] server datasets:', datasets.map(d => d.id));

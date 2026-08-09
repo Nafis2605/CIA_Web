@@ -54,6 +54,11 @@ vi.mock("@Collaboration/yjs/yjsObservers.js", () => ({
   onActiveDatasetChange: vi.fn(),
 }));
 
+const mockClaimCollaborationViewId = vi.fn((syncKey) => (syncKey ? `cview-for-${syncKey}` : null));
+vi.mock("@Collaboration/yjs/yjsSetup.js", () => ({
+  claimCollaborationViewId: (...a) => mockClaimCollaborationViewId(...a),
+}));
+
 import { workspaceManager } from "../workspaceManager.js";
 import { instance as log } from "@Utils/logger.js";
 
@@ -81,6 +86,31 @@ describe("workspaceManager — inbound view update routing", () => {
     // singleton, so its dedupe map has to be cleared between tests.
     workspaceManager._unroutableWarnedAt.clear();
     mockIsCameraShared.mockReturnValue(true);
+    mockClaimCollaborationViewId.mockClear();
+  });
+
+  // H5: createInstance additionally claims/attaches a collaborationViewId —
+  // additive only, must not change the dataset-key-based routing asserted by
+  // every other test in this file (_handleYjsCameraUpdate/_handleYjsVisualizationUpdate
+  // are untouched by the H5 change).
+  describe("createInstance — collaborationViewId (H5, additive)", () => {
+    test("attaches a collaborationViewId claimed for the instance's dataset-based sync key", async () => {
+      const instanceId = await workspaceManager.createInstance({}, null, {
+        datasetId: "dataset-1",
+      });
+
+      const instance = workspaceManager.instances.get(instanceId);
+      expect(instance.collaborationViewId).toBe("cview-for-dataset-1");
+      expect(mockClaimCollaborationViewId).toHaveBeenCalledWith("dataset-1", "user-1");
+    });
+
+    test("resolves to null (no claim) when the instance has neither datasetId nor viewConfigId yet", async () => {
+      const instanceId = await workspaceManager.createInstance({}, null, {});
+
+      const instance = workspaceManager.instances.get(instanceId);
+      expect(instance.collaborationViewId).toBeNull();
+      expect(mockClaimCollaborationViewId).not.toHaveBeenCalled();
+    });
   });
 
   describe("visualization", () => {

@@ -520,9 +520,12 @@ class Room {
       this.lastUpdateId = docRecord.lastUpdateId;
       this.isLoaded = true;
 
-      // Schedule periodic snapshots
+      // Schedule periodic snapshots — durable roots only (see
+      // buildDurableSnapshotState); this runs continuously for any active
+      // room, so an unfiltered encode here was the highest-impact instance
+      // of the H8 bug, not just the shutdown-only close() below.
       persistence.scheduleSnapshots(this.roomId, () =>
-        Y.encodeStateAsUpdate(this.doc)
+        buildDurableSnapshotState(this.doc)
       );
     } catch (err) {
       syncLog.error("Failed to load document:", this.roomId, err.message);
@@ -584,7 +587,7 @@ class Room {
     if (!persistence) return;
 
     try {
-      const state = Y.encodeStateAsUpdate(this.doc);
+      const state = buildDurableSnapshotState(this.doc);
       await persistence.finalSnapshot(this.roomId, state);
     } catch (err) {
       syncLog.error("Failed to save final snapshot:", err.message);
@@ -885,8 +888,14 @@ function rootNameOf(doc, type) {
 }
 
 // Top-level shared types that carry transient presence/pose/cursor state. These
-// are self-cleaning, high-frequency, and must NOT be persisted to yjs_updates or
-// recorded — mapped to the origins that storeUpdate()/recordEvent() skip.
+// are self-cleaning, high-frequency, and must NOT be persisted to yjs_updates,
+// recorded, or included in a durable snapshot — mapped to the origins that
+// storeUpdate()/recordEvent() skip. Single source of truth for both live
+// update-origin tagging (detectUpdateOrigin) and snapshot filtering
+// (buildDurableSnapshotState) — a root missing from here used to be silently
+// treated as durable in BOTH places, which is how stale avatars, VR
+// controller poses, manipulation/control locks, and VR session registries
+// came back to life after a server restart.
 const TRANSIENT_ROOT_ORIGINS = {
   cursors: "cursor",
   vrCursors: "cursor",
@@ -894,7 +903,44 @@ const TRANSIENT_ROOT_ORIGINS = {
   avatars: "avatar",
   manipulatorState: "presence",
   viewPresence: "presence",
+  vrControllers: "presence", // yjsSetup.js's yVRControllers
+  "vr-sessions": "presence", // yjsSetup.js's yVRSessions — VR session registry
 };
+
+// Root names that are minted per-session (`${prefix}${sessionId}`), so they
+// can't be listed exactly in TRANSIENT_ROOT_ORIGINS above.
+const TRANSIENT_ROOT_PREFIXES = [
+  { prefix: "vr-participants-", origin: "presence" }, // VRParticipantSync.js
+  { prefix: "vr-manipulation-", origin: "presence" }, // VRManipulationLock.js
+  { prefix: "vr-control-", origin: "presence" },      // VRControlManager.js
+  { prefix: "vr-join-order-", origin: "presence" },   // VRParticipantSync.js join-order array
+];
+
+/**
+ * Classify a single top-level shared-type root name.
+ * @param {string} name
+ * @returns {"cursor"|"avatar"|"presence"|null} the transient origin, or null if durable.
+ */
+function classifyTransientRoot(name) {
+  if (Object.prototype.hasOwnProperty.call(TRANSIENT_ROOT_ORIGINS, name)) {
+    return TRANSIENT_ROOT_ORIGINS[name];
+  }
+  for (const { prefix, origin } of TRANSIENT_ROOT_PREFIXES) {
+    if (name.startsWith(prefix)) return origin;
+  }
+  return null;
+}
+
+/**
+ * Whether a root belongs in a durable snapshot. `chatMessages` is not in
+ * TRANSIENT_ROOT_ORIGINS/PREFIXES (it's persisted+recorded, not skipped —
+ * see detectUpdateOrigin's separate "chat" origin below), so it naturally
+ * classifies as durable here too, same as visualizationState/cameras/etc.
+ * @param {string} name
+ */
+function isDurableRootName(name) {
+  return classifyTransientRoot(name) === null;
+}
 
 /**
  * Classify an applied update by which top-level shared types it touched (captured
@@ -917,22 +963,51 @@ function detectUpdateOrigin(room) {
   for (const name of roots) {
     if (name === "chatMessages") {
       sawChat = true;
-    } else if (name.startsWith("vr-participants-")) {
-      transient = transient || "presence";
-    } else if (Object.prototype.hasOwnProperty.call(TRANSIENT_ROOT_ORIGINS, name)) {
-      const origin = TRANSIENT_ROOT_ORIGINS[name];
-      // Prefer the most specific transient label; any is skippable.
-      transient = transient === "avatar" ? transient : origin;
-    } else {
+      continue;
+    }
+    const origin = classifyTransientRoot(name);
+    if (origin === null) {
       // Any other root (visualizationState, cameras, activeDataset, ...) is
       // durable document state.
       sawDurable = true;
+    } else {
+      // Prefer the most specific transient label; any is skippable.
+      transient = transient === "avatar" ? transient : origin;
     }
   }
 
   if (sawDurable) return "document";
   if (sawChat) return "chat";
   return transient;
+}
+
+/**
+ * Build a snapshot Y.js update containing only durable roots — used for both
+ * Room.close()'s shutdown snapshot and the periodic scheduleSnapshots
+ * callback, so persisted state can never resurrect transient presence/pose/
+ * lock/session data after a restart. Y.js has no native per-root filtered
+ * encoding, so this copies durable root content into a scratch Y.Doc and
+ * encodes that instead. This collapses per-op CRDT history for the copied
+ * roots, which is fine — storeSnapshot already does a full overwrite
+ * (`UPDATE ... SET document_state = $2`), i.e. snapshots are squashes today
+ * regardless.
+ * @param {Y.Doc} doc
+ * @returns {Uint8Array}
+ */
+function buildDurableSnapshotState(doc) {
+  const scratch = new Y.Doc();
+  for (const [name, type] of doc.share.entries()) {
+    if (!isDurableRootName(name)) continue;
+    if (type instanceof Y.Map) {
+      const target = scratch.getMap(name);
+      type.forEach((value, key) => target.set(key, value));
+    } else if (type instanceof Y.Array) {
+      scratch.getArray(name).push(type.toArray());
+    } else {
+      syncLog.warn("Skipping unrecognized root type during snapshot filter:", name);
+    }
+  }
+  return Y.encodeStateAsUpdate(scratch);
 }
 
 /**
@@ -1289,3 +1364,9 @@ process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
 serverLog.info("Starting Y.js WebSocket server with persistence...");
+
+// Additive: exposes pure helper functions for unit testing (this file has no
+// other exports — it's the process entry point, started via `node server.js`,
+// not normally required as a module — requiring it still runs the startup
+// sequence above; only these functions are useful to import elsewhere).
+module.exports = { classifyTransientRoot, isDurableRootName, buildDurableSnapshotState };

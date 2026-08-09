@@ -120,12 +120,6 @@ const POINTER_PICK_MS = 100;
 // per-frame budget entirely.
 const VR_SESSION_HEARTBEAT_MS = 1000;
 
-// How long _watchVRSessionConvergence keeps listening to yVRSessions after a
-// claim/adopt, to catch a competing write that resolves the claim race AFTER
-// our own synchronous claimVRSession() call already returned (see its
-// docstring in yjsSetup.js).
-const VR_SESSION_CONVERGE_WATCH_MS = 3000;
-
 // How long an in-VR notice ("X has data control") stays on the spatial menu's
 // status line. Long enough to read at arm's length inside a headset, short
 // enough that it never masks the dataset/scale/mode line for a whole gesture.
@@ -736,18 +730,31 @@ class VRExplorationManager extends BaseManager {
   }
 
   /**
-   * Watch the shared `vr-sessions` registry for VR_SESSION_CONVERGE_WATCH_MS
-   * after claiming/adopting the slot for this session key (see
-   * _resolveSessionKey). Two clients can claim
-   * "simultaneously" (see claimVRSession's docstring) — each wins its own
-   * synchronous local claim, but once the competing write propagates over the
-   * network, Y.js's last-writer-wins resolution can silently overwrite our
-   * entry with someone else's. If that happens, our sub-managers are still
-   * keyed by our own (losing) session id and would be invisible to the
-   * winner — so re-key onto the survivor the moment we see it.
+   * Watch the shared `vr-sessions` registry for the lifetime of this
+   * session (not just a brief window after claiming — see history below),
+   * handling two distinct cases as the record for `sessionKey` changes:
    *
-   * Self-unsubscribes after the window; also torn down early by leaveSession
-   * via _offVRSessionObserver.
+   *  - Different `sessionId`: a claim-race resolution. Two clients can claim
+   *    the registry slot "simultaneously" (see claimVRSession's docstring) —
+   *    each wins its own synchronous local claim, but once the competing
+   *    write propagates over the network, Y.js's last-writer-wins resolution
+   *    can silently overwrite our entry with someone else's. If that
+   *    happens, our sub-managers are still keyed by our own (losing) session
+   *    id and would be invisible to the winner — so re-key onto the survivor
+   *    the moment we see it.
+   *
+   *  - Same `sessionId`, but a different `hostUserId`: a host-promotion
+   *    committed by _tickVRSessionRegistry (elsewhere, possibly by another
+   *    client) after the previous host's registry record went stale. Every
+   *    other client must learn the new host, not just the one that
+   *    performed the promotion — update local state and notify listeners.
+   *
+   * Used to self-unsubscribe after a fixed window (the claim-race case is
+   * usually resolved within seconds of session start), which meant no
+   * client was listening for #2 at all once that window elapsed — host
+   * promotions after the first few seconds of a session were visible only
+   * to the client that performed them. Now stays attached for the session's
+   * lifetime; torn down by leaveSession via _offVRSessionObserver.
    *
    * @param {string} sessionKey - see _resolveSessionKey()
    * @param {VRExplorationSession} session
@@ -757,47 +764,52 @@ class VRExplorationManager extends BaseManager {
     if (!sessionKey) return;
 
     // A previous call (shouldn't normally overlap, but startExploration can
-    // in principle run again before this window elapses) must not leak.
+    // in principle run again) must not leak.
     this._offVRSessionObserver?.();
 
     const observer = (event) => {
       if (!event.changes.keys.has(sessionKey)) return;
 
       const record = getVRSessionForView(sessionKey);
-      if (!record || record.sessionId === session.id) return;
+      if (!record) return;
 
-      log.info(`VR session claim race resolved against us — re-keying ${session.id} -> ${record.sessionId}`);
+      if (record.sessionId !== session.id) {
+        log.info(`VR session claim race resolved against us — re-keying ${session.id} -> ${record.sessionId}`);
 
-      // ORDER MATTERS. Mutate the session FIRST: AvatarManager holds this same
-      // object and reads `session.id` live (it used to cache a copy, which then
-      // went stale here and made both headsets filter out each other's avatar
-      // metadata). The three managers below take the id as an argument and so
-      // don't care, but vrAvatarSystem.rekey re-broadcasts using the live value
-      // and would announce the LOSING id if it ran before this line.
-      session.id = record.sessionId;
-      session.ownerUserId = record.hostUserId;
-      session.ownerUserName = record.hostUserName;
+        // ORDER MATTERS. Mutate the session FIRST: AvatarManager holds this same
+        // object and reads `session.id` live (it used to cache a copy, which then
+        // went stale here and made both headsets filter out each other's avatar
+        // metadata). The three managers below take the id as an argument and so
+        // don't care, but vrAvatarSystem.rekey re-broadcasts using the live value
+        // and would announce the LOSING id if it ran before this line.
+        session.id = record.sessionId;
+        session.ownerUserId = record.hostUserId;
+        session.ownerUserName = record.hostUserName;
 
-      this._participantSync?.rekey(record.sessionId);
-      this._controlManager?.rekey(record.sessionId);
-      this._manipulationLock?.rekey(record.sessionId);
-      vrAvatarSystem.rekey?.(record.sessionId);
+        this._participantSync?.rekey(record.sessionId);
+        this._controlManager?.rekey(record.sessionId);
+        this._manipulationLock?.rekey(record.sessionId);
+        vrAvatarSystem.rekey?.(record.sessionId);
 
-      // The ids every peer must agree on just changed — re-dump them.
-      this._logCollaborationDiagnostics('session-rekey');
+        // The ids every peer must agree on just changed — re-dump them.
+        this._logCollaborationDiagnostics('session-rekey');
+        return;
+      }
+
+      if (record.hostUserId !== session.ownerUserId) {
+        log.info(`VR session host changed: ${session.ownerUserId} -> ${record.hostUserId}`);
+
+        session.ownerUserId = record.hostUserId;
+        session.ownerUserName = record.hostUserName;
+
+        window.dispatchEvent(new CustomEvent('cia:vr-session-host-changed', {
+          detail: { sessionId: session.id, hostUserId: record.hostUserId, hostUserName: record.hostUserName }
+        }));
+      }
     };
 
     yVRSessions.observe(observer);
-
-    const timeoutId = setTimeout(() => {
-      yVRSessions.unobserve(observer);
-      this._offVRSessionObserver = null;
-    }, VR_SESSION_CONVERGE_WATCH_MS);
-
-    this._offVRSessionObserver = () => {
-      clearTimeout(timeoutId);
-      yVRSessions.unobserve(observer);
-    };
+    this._offVRSessionObserver = () => yVRSessions.unobserve(observer);
   }
 
   /**
@@ -806,10 +818,21 @@ class VRExplorationManager extends BaseManager {
    *  - refresh our record's heartbeat so the stale sweep (VR_SESSION_STALE_MS)
    *    never evicts a session that is still live;
    *  - if the host's record has disappeared (clean release, or its heartbeat
-   *    went stale), deterministically promote exactly one remaining client —
-   *    the live VR participant with the lowest joinedAt — instead of running
-   *    a voting protocol. Every remaining client runs this same computation;
-   *    only the one that agrees it is the winner writes the claim.
+   *    went stale), deterministically promote exactly one remaining client
+   *    instead of running a voting protocol. Every remaining client runs this
+   *    same computation; only the one that agrees it is the winner writes the
+   *    claim.
+   *
+   * Winner selection uses the shared join-order Y.Array (see
+   * VRParticipantSync.getJoinOrder()) — the first live participant to appear
+   * in it — rather than each client's local `joinedAt`. `joinedAt` is a local
+   * Date.now() stamped the moment each client first observes a peer, never
+   * broadcast, so two clients can disagree on it under clock skew or packet
+   * arrival order and elect different hosts. Y.Array insertion order is
+   * CRDT-consistent across synced replicas, so this can't diverge. The old
+   * `joinedAt` reduce is kept only as a defensive fallback for the case where
+   * the join-order array hasn't yet populated for a live participant.
+   *
    * Must key on the same value startExploration claimed/watched under (see
    * _resolveSessionKey) — otherwise this heartbeats/promotes against a
    * DIFFERENT registry slot than the one the session actually lives at,
@@ -830,11 +853,17 @@ class VRExplorationManager extends BaseManager {
     const vrParticipants = session.getVRParticipants?.() || [];
     if (!vrParticipants.length) return;
 
-    const winner = vrParticipants.reduce((best, p) =>
+    const liveIds = new Set(vrParticipants.map(p => p.odUserId));
+    const joinOrder = this._participantSync?.getJoinOrder?.() || [];
+    const orderedWinnerId = joinOrder.find(record => liveIds.has(record.participantId))?.participantId;
+
+    const fallbackWinnerId = vrParticipants.reduce((best, p) =>
       !best || p.joinedAt < best.joinedAt ? p : best,
       null
-    );
-    if (!winner || winner.odUserId !== getParticipantId()) return; // not our turn
+    )?.odUserId;
+
+    const winnerId = orderedWinnerId ?? fallbackWinnerId;
+    if (!winnerId || winnerId !== getParticipantId()) return; // not our turn
 
     const claimed = claimVRSession(sessionKey, {
       sessionId: session.id,

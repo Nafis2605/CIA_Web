@@ -214,6 +214,12 @@ services:
       RENDER_WIDTH: ${RENDER_WIDTH:-1024}
       RENDER_HEIGHT: ${RENDER_HEIGHT:-768}
       MAX_SESSIONS: ${MAX_SESSIONS:-10}
+      # H14: access gate + resource bounds — override RENDER_SERVER_TOKEN in
+      # production; the frontend build must be given the same value.
+      RENDER_SERVER_TOKEN: ${RENDER_SERVER_TOKEN:-dev-render-token}
+      RENDER_ALLOWED_ORIGINS: ${RENDER_ALLOWED_ORIGINS:-https://localhost:8081,http://localhost:8081}
+      MAX_DATASET_SIZE_MB: ${MAX_DATASET_SIZE_MB:-500}
+      RATE_LIMIT_MAX_LOADS_PER_MIN: ${RATE_LIMIT_MAX_LOADS_PER_MIN:-20}
     restart: unless-stopped
 
 

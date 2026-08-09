@@ -94,7 +94,30 @@ export class VRParticipantSync {
     this._yParticipants.observe(observer);
     this._observers.push(() => this._yParticipants.unobserve(observer));
 
+    // Shared, append-only join order for this session. Unlike a local
+    // `joinedAt` (Date.now(), never broadcast), Y.Array insertion order is
+    // CRDT-consistent across every synced replica, so all clients agree on
+    // who joined first — see VRExplorationManager._tickVRSessionRegistry,
+    // which uses this instead of local timestamps to elect a host.
+    this._yJoinOrder = ydoc.getArray(`vr-join-order-${this._session.id}`);
+    const alreadyJoined = this._yJoinOrder
+      .toArray()
+      .some((record) => record.participantId === this._localParticipantId);
+    if (!alreadyJoined) {
+      // Guarded so a rejoin (getParticipantId() is stable per device) doesn't
+      // append a second entry and re-race the election ordering.
+      this._yJoinOrder.push([{ participantId: this._localParticipantId, joinedAt: Date.now() }]);
+    }
+
     log.debug('VRParticipantSync started');
+  }
+
+  /**
+   * The session's join order, in CRDT-consistent (not local-clock) order.
+   * @returns {{participantId: string, joinedAt: number}[]}
+   */
+  getJoinOrder() {
+    return this._yJoinOrder ? this._yJoinOrder.toArray() : [];
   }
 
   stop() {

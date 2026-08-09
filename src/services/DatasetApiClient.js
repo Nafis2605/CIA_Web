@@ -16,6 +16,11 @@ function serverUrl(path) {
     return `/render-api${path}`;
 }
 
+/** Auth header for the render server's gated endpoints (see H14). */
+function authHeaders() {
+    return config.renderServerToken ? { 'X-Render-Token': config.renderServerToken } : {};
+}
+
 /**
  * Check render server health.
  * @returns {Promise<{ ok, vtk_available, vtk_version, dataset_count } | null>}
@@ -39,7 +44,7 @@ export async function checkServerHealth() {
  * @returns {Promise<Array<{ id, name, path, type, sizeBytes, sizeMB }>>}
  */
 export async function fetchDatasets() {
-    const resp = await fetch(serverUrl('/datasets'));
+    const resp = await fetch(serverUrl('/datasets'), { headers: authHeaders() });
     if (!resp.ok) throw new Error(`Datasets fetch failed: HTTP ${resp.status}`);
     const list = await resp.json();
     console.log('[DatasetApiClient] datasets returned by server:', list.map(d => d.id));
@@ -58,7 +63,7 @@ export async function loadDataset(datasetId, path, sessionId = null) {
     console.log('[DatasetApiClient] POST /load:', { datasetId, path });
     const resp = await fetch(serverUrl('/load'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ datasetId, path, sessionId }),
     });
     if (!resp.ok) {
@@ -81,7 +86,7 @@ export async function loadDataset(datasetId, path, sessionId = null) {
 export async function updateCamera(sessionId, camera) {
     const resp = await fetch(serverUrl('/camera'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ sessionId, ...camera }),
     });
     if (!resp.ok) {
@@ -98,7 +103,9 @@ export async function updateCamera(sessionId, camera) {
  * @returns {Promise<string>} Object URL pointing to PNG data
  */
 export async function getFrameUrl(sessionId) {
-    const resp = await fetch(`${serverUrl('/frame')}?sessionId=${encodeURIComponent(sessionId)}`);
+    const resp = await fetch(`${serverUrl('/frame')}?sessionId=${encodeURIComponent(sessionId)}`, {
+        headers: authHeaders(),
+    });
     if (!resp.ok) throw new Error(`Frame fetch failed: HTTP ${resp.status}`);
     const blob = await resp.blob();
     return URL.createObjectURL(blob);

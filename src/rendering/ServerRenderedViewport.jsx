@@ -13,7 +13,7 @@
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import remoteRenderClient from '@Services/RemoteRenderClient.js';
+import RemoteRenderClient from '@Services/RemoteRenderClient.js';
 import { config } from '@Core/config/clientConfig.js';
 import './ServerRenderedViewport.scss';
 
@@ -28,6 +28,11 @@ export function ServerRenderedViewport({ datasetId, path, fileType, onClose }) {
     const dragRef = useRef({ active: false, lastX: 0, lastY: 0, button: 0 });
     const cameraRef = useRef(null); // mirror of cameraState for callbacks
     const pendingUpdate = useRef(false);
+    // Each mounted viewport gets its own client → its own WebSocket → its own
+    // server-side render session, so concurrent viewports never overwrite
+    // each other's dataset/camera/pending requests (see H13).
+    const clientRef = useRef(null);
+    if (!clientRef.current) clientRef.current = new RemoteRenderClient();
 
     // =========================================================================
     // MOUNT: Load dataset
@@ -46,7 +51,7 @@ export function ServerRenderedViewport({ datasetId, path, fileType, onClose }) {
 
             try {
                 console.log('[RenderServer] loading dataset:', { id: datasetId, path });
-                const result = await remoteRenderClient.loadDataset(datasetId, path);
+                const result = await clientRef.current.loadDataset(datasetId, path);
                 if (cancelled) return;
 
                 console.log('[RenderServer] server response metadata:', result.metadata);
@@ -71,7 +76,7 @@ export function ServerRenderedViewport({ datasetId, path, fileType, onClose }) {
 
         load();
 
-        const unsubFrame = remoteRenderClient.onFrame((frame) => {
+        const unsubFrame = clientRef.current.onFrame((frame) => {
             if (!cancelled) {
                 setFrameUrl(frame.image);
                 if (frame.camera) {
@@ -81,7 +86,7 @@ export function ServerRenderedViewport({ datasetId, path, fileType, onClose }) {
             }
         });
 
-        const unsubError = remoteRenderClient.onError(({ message }) => {
+        const unsubError = clientRef.current.onError(({ message }) => {
             if (!cancelled) setError(message);
         });
 
@@ -91,6 +96,12 @@ export function ServerRenderedViewport({ datasetId, path, fileType, onClose }) {
             unsubError();
         };
     }, [datasetId, path]);
+
+    // Separate from the load effect above: this client/session must survive
+    // a datasetId/path change (same viewport switching content), and only
+    // close when the viewport itself unmounts — otherwise every removed
+    // viewport leaks an open WebSocket + server-side RenderSession.
+    useEffect(() => () => clientRef.current?.disconnect(), []);
 
     // =========================================================================
     // CAMERA MATH
@@ -204,7 +215,7 @@ export function ServerRenderedViewport({ datasetId, path, fileType, onClose }) {
 
         pendingUpdate.current = true;
         try {
-            await remoteRenderClient.updateCamera(newCam);
+            await clientRef.current.updateCamera(newCam);
             cameraRef.current = { ...cameraRef.current, ...newCam };
         } catch (err) {
             console.warn('[RenderServer] camera update failed:', err.message);
@@ -228,7 +239,7 @@ export function ServerRenderedViewport({ datasetId, path, fileType, onClose }) {
 
         pendingUpdate.current = true;
         try {
-            await remoteRenderClient.updateCamera(newCam);
+            await clientRef.current.updateCamera(newCam);
             cameraRef.current = { ...cameraRef.current, ...newCam };
         } catch (err) {
             console.warn('[RenderServer] zoom failed:', err.message);
@@ -239,7 +250,7 @@ export function ServerRenderedViewport({ datasetId, path, fileType, onClose }) {
 
     const handleResetCamera = useCallback(async () => {
         try {
-            await remoteRenderClient.resetCamera();
+            await clientRef.current.resetCamera();
         } catch (err) {
             console.warn('[RenderServer] reset camera failed:', err.message);
         }

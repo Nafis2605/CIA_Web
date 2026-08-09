@@ -77,7 +77,9 @@ export function DatasetSelectorModal({
         console.log('[DatasetSelector] render mode:', config.renderMode);
         console.log('[DatasetSelector] fetching server datasets from:', SERVER_DATASETS_URL);
 
-        fetch(SERVER_DATASETS_URL)
+        fetch(SERVER_DATASETS_URL, {
+            headers: config.renderServerToken ? { 'X-Render-Token': config.renderServerToken } : undefined,
+        })
             .then(r => {
                 if (!r.ok) throw new Error(`HTTP ${r.status}`);
                 return r.json();
@@ -104,6 +106,25 @@ export function DatasetSelectorModal({
             setIsServerSectionExpanded(false);
         }
     }, [isOpen]);
+
+    // ── H7: notify when a concurrent room-mate's selection raced out ours ────
+    // syncActiveDatasetToYjs is last-writer-wins (only one dataset can be
+    // "active" per room); the losing client used to get zero signal that
+    // their pick didn't stick. workspaceManager dispatches this once it
+    // detects (via yjsObservers' oldValue diff) that the incoming remote
+    // write overwrote OUR very-recent local write.
+    useEffect(() => {
+        function handleOverridden(event) {
+            const { overriddenBy } = event.detail || {};
+            toast.info(
+                overriddenBy
+                    ? `${overriddenBy} picked a different dataset at the same time — their choice was applied.`
+                    : 'Another user picked a different dataset at the same time — their choice was applied.'
+            );
+        }
+        window.addEventListener('cia:dataset-selection-overridden', handleOverridden);
+        return () => window.removeEventListener('cia:dataset-selection-overridden', handleOverridden);
+    }, []);
 
     // ── Fetch local manifest fallback (always — samples are always shown) ────
     useEffect(() => {

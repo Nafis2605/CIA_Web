@@ -71,8 +71,9 @@ const PORT = process.env.YJS_PORT;
 const WS_URL = `ws://localhost:${PORT}`;
 
 // Requiring this starts the real server (server.listen(PORT, ...)) — must
-// happen last, after all env vars and mocks above are in place.
-require('../../../server.js');
+// happen last, after all env vars and mocks above are in place. It also
+// starts server.js's own module.exports (pure helpers, additive — see H8).
+const { classifyTransientRoot, isDurableRootName, buildDurableSnapshotState } = require('../../../server.js');
 
 // A real 'ws' client can receive its unsolicited initial pushes (sync step 1,
 // and an awareness update whenever the room already has ANY awareness state)
@@ -307,5 +308,79 @@ describe('Y.js WebSocket server — sync propagation', () => {
     expect(removedState).toBe('null'); // JSON-encoded null = "this client is gone"
 
     clientB.close();
+  });
+});
+
+// H8: the transient-root classifier used to miss vrControllers, vr-sessions,
+// vr-manipulation-<id>, vr-control-<id>, and vr-join-order-<id> — all real
+// Y.js roots (see yjsSetup.js / VRManipulationLock.js / VRControlManager.js /
+// VRParticipantSync.js) that carry pose/lock/session state, not durable
+// document content. Misclassifying them as durable meant Room.close()'s
+// unfiltered Y.encodeStateAsUpdate(this.doc) snapshotted them too, so stale
+// avatars/locks/sessions came back to life on the next server restart. These
+// are pure-function tests against server.js's module.exports — no WebSocket
+// connection needed.
+describe('H8: transient-root classification and durable snapshot filtering', () => {
+  test('classifies every previously-missed root as transient (presence)', () => {
+    expect(classifyTransientRoot('vrControllers')).toBe('presence');
+    expect(classifyTransientRoot('vr-sessions')).toBe('presence');
+    expect(classifyTransientRoot('vr-manipulation-session1')).toBe('presence');
+    expect(classifyTransientRoot('vr-control-session1')).toBe('presence');
+    expect(classifyTransientRoot('vr-join-order-session1')).toBe('presence');
+    // Pre-existing rule, must still work after generalizing to a prefix list.
+    expect(classifyTransientRoot('vr-participants-session1')).toBe('presence');
+  });
+
+  test('classifies pre-existing transient roots unchanged', () => {
+    expect(classifyTransientRoot('cursors')).toBe('cursor');
+    expect(classifyTransientRoot('vrCursors')).toBe('cursor');
+    expect(classifyTransientRoot('vrHands')).toBe('cursor');
+    expect(classifyTransientRoot('avatars')).toBe('avatar');
+    expect(classifyTransientRoot('manipulatorState')).toBe('presence');
+    expect(classifyTransientRoot('viewPresence')).toBe('presence');
+  });
+
+  test('classifies durable document roots as null (not transient)', () => {
+    expect(classifyTransientRoot('visualizationState')).toBeNull();
+    expect(classifyTransientRoot('cameras')).toBeNull();
+    expect(classifyTransientRoot('activeDataset')).toBeNull();
+    expect(classifyTransientRoot('collaboration-views')).toBeNull();
+    expect(classifyTransientRoot('chatMessages')).toBeNull(); // persisted, just via a separate "chat" origin
+  });
+
+  test('isDurableRootName agrees with classifyTransientRoot', () => {
+    expect(isDurableRootName('vrControllers')).toBe(false);
+    expect(isDurableRootName('vr-manipulation-session1')).toBe(false);
+    expect(isDurableRootName('visualizationState')).toBe(true);
+    expect(isDurableRootName('chatMessages')).toBe(true);
+  });
+
+  test('buildDurableSnapshotState excludes every transient root and keeps durable roots intact', () => {
+    const doc = new Y.Doc();
+    doc.getMap('visualizationState').set('view-1', { opacity: 0.5 });
+    doc.getMap('activeDataset').set('room-1', { datasetId: 'ds-1' });
+    doc.getMap('vrControllers').set('user-1', { pose: [0, 0, 0] });
+    doc.getMap('vr-sessions').set('view-1', { hostUserId: 'user-1' });
+    doc.getMap('vr-manipulation-session1').set('lockedBy', 'user-1');
+    doc.getMap('vr-control-session1').set('pending', true);
+    doc.getArray('vr-join-order-session1').push([{ participantId: 'user-1' }]);
+    doc.getMap('avatars').set('user-1', { displayName: 'Alice' });
+
+    const state = buildDurableSnapshotState(doc);
+
+    const restored = new Y.Doc();
+    Y.applyUpdate(restored, state);
+
+    // Durable roots survive.
+    expect(restored.getMap('visualizationState').get('view-1')).toEqual({ opacity: 0.5 });
+    expect(restored.getMap('activeDataset').get('room-1')).toEqual({ datasetId: 'ds-1' });
+
+    // Transient roots are entirely absent from the snapshot.
+    expect(restored.getMap('vrControllers').size).toBe(0);
+    expect(restored.getMap('vr-sessions').size).toBe(0);
+    expect(restored.getMap('vr-manipulation-session1').size).toBe(0);
+    expect(restored.getMap('vr-control-session1').size).toBe(0);
+    expect(restored.getArray('vr-join-order-session1').length).toBe(0);
+    expect(restored.getMap('avatars').size).toBe(0);
   });
 });

@@ -60,6 +60,7 @@ vi.mock("@Core/vr/VRParticipantSync.js", () => ({
       this._session.id = newSessionId;
       this._boundSessionId = newSessionId;
     });
+    this.getJoinOrder = vi.fn(() => []);
     mockParticipantSyncInstances.push(this);
   }),
 }));
@@ -143,6 +144,7 @@ import { workspaceManager } from "@Core/instances/workspaceManager.js";
 import { apiClient } from "@Services/apiClient.js";
 import { yVRSessions, getVRSessionForView } from "@Collaboration/yjs/yjsSetup.js";
 import { vrAvatarSystem } from "@Core/instances/types/vtk/vr/VTKVRAvatars.js";
+import { PARTICIPATION_MODE } from "@Core/data/models/VRExplorationSession.js";
 
 // datasetId defaults to "ds-1" (matching most tests below); pass null to
 // simulate an instance with no dataset metadata attached yet, which is what
@@ -325,5 +327,146 @@ describe("VRExplorationManager â€” session convergence (Y.js vr-sessions re
     });
 
     expect(idAtAvatarRekey).toBe("vrsession_winner");
+  });
+
+  // H4: election used to reduce over each VR participant's LOCAL `joinedAt`
+  // (Date.now(), never broadcast) — clients could disagree under clock skew.
+  // It now consults the shared, CRDT-ordered join-order array instead; these
+  // pin that the array wins even when local joinedAt disagrees with it.
+  describe("host election — shared join-order array overrides local joinedAt", () => {
+    it("promotes the array's winner even though local joinedAt says someone else joined first", async () => {
+      workspaceManager.getInstance.mockReturnValueOnce(makeInstance("view-1", "inst-1"));
+      const session = await vrExplorationManager.startExploration("inst-1", {});
+
+      // A second VR participant, locally observed to have joined BEFORE us —
+      // the old reduce-over-joinedAt logic would pick this participant.
+      session.addParticipant("user-2", "Other", "#0000ff", PARTICIPATION_MODE.VR_EXPLORER);
+      session.getParticipant("user-1").joinedAt = 5000;
+      session.getParticipant("user-2").joinedAt = 1000;
+
+      // But the shared join-order array says WE (user-1) joined first.
+      const participantSync = mockParticipantSyncInstances[mockParticipantSyncInstances.length - 1];
+      participantSync.getJoinOrder.mockReturnValue([
+        { participantId: "user-1", joinedAt: 1000 },
+        { participantId: "user-2", joinedAt: 5000 },
+      ]);
+
+      // Host's registry slot has to look absent/stale for promotion to run.
+      yVRSessions.delete("ds-1");
+
+      vrExplorationManager._tickVRSessionRegistry("ds-1", session);
+
+      expect(getVRSessionForView("ds-1")?.hostUserId).toBe("user-1");
+    });
+
+    it("does NOT promote us when the array says another live participant joined first, even if our local joinedAt is lowest", async () => {
+      workspaceManager.getInstance.mockReturnValueOnce(makeInstance("view-1", "inst-1"));
+      const session = await vrExplorationManager.startExploration("inst-1", {});
+
+      session.addParticipant("user-2", "Other", "#0000ff", PARTICIPATION_MODE.VR_EXPLORER);
+      session.getParticipant("user-1").joinedAt = 1000; // lowest local — old logic would pick us
+      session.getParticipant("user-2").joinedAt = 5000;
+
+      const participantSync = mockParticipantSyncInstances[mockParticipantSyncInstances.length - 1];
+      participantSync.getJoinOrder.mockReturnValue([
+        { participantId: "user-2", joinedAt: 500 },
+        { participantId: "user-1", joinedAt: 1000 },
+      ]);
+
+      yVRSessions.delete("ds-1");
+
+      vrExplorationManager._tickVRSessionRegistry("ds-1", session);
+
+      // getParticipantId() is mocked to "user-1" for this whole file, so
+      // "not our turn" means nobody claims in this single-client test.
+      expect(getVRSessionForView("ds-1")).toBeNull();
+    });
+  });
+
+  // H4: _watchVRSessionConvergence used to self-unsubscribe 3s after session
+  // start, so a host-promotion that happened later than that was visible only
+  // to the client that performed it. It now stays attached for the session's
+  // lifetime and propagates ANY host change for the same sessionId to every
+  // observing client — this pins that propagation for a client that did NOT
+  // perform the promotion itself.
+  describe("host-change propagation — same sessionId, different hostUserId", () => {
+    it("updates ownerUserId on a client that did not perform the promotion", async () => {
+      workspaceManager.getInstance.mockReturnValueOnce(makeInstance("view-1", "inst-1"));
+      const session = await vrExplorationManager.startExploration("inst-1", {});
+      const ourSessionId = session.id;
+      expect(session.ownerUserId).toBe("user-1");
+
+      // Simulate another client's _tickVRSessionRegistry promoting a new host
+      // for the SAME session after our original host's record went stale —
+      // this client never called claimVRSession itself.
+      yVRSessions.set("ds-1", {
+        sessionId: ourSessionId,
+        viewConfigurationId: "ds-1",
+        hostUserId: "user-2",
+        hostUserName: "Other User",
+        datasetId: "ds-1",
+        projectId: null,
+        createdAt: Date.now(),
+        lastHeartbeat: Date.now(),
+        participantCount: 1,
+      });
+
+      expect(session.ownerUserId).toBe("user-2");
+      expect(session.id).toBe(ourSessionId); // same session — no re-key needed
+    });
+
+    it("keeps propagating host changes well past the old 3-second convergence window", async () => {
+      vi.useFakeTimers();
+      try {
+        workspaceManager.getInstance.mockReturnValueOnce(makeInstance("view-1", "inst-1"));
+        const session = await vrExplorationManager.startExploration("inst-1", {});
+        const ourSessionId = session.id;
+
+        vi.advanceTimersByTime(10000); // well past the removed 3000ms window
+
+        yVRSessions.set("ds-1", {
+          sessionId: ourSessionId,
+          viewConfigurationId: "ds-1",
+          hostUserId: "user-3",
+          hostUserName: "Yet Another User",
+          datasetId: "ds-1",
+          projectId: null,
+          createdAt: Date.now(),
+          lastHeartbeat: Date.now(),
+          participantCount: 1,
+        });
+
+        expect(session.ownerUserId).toBe("user-3");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  it("leaveSession() still unsubscribes the convergence observer (regression guard)", async () => {
+    workspaceManager.getInstance.mockReturnValueOnce(makeInstance("view-1", "inst-1"));
+    const session = await vrExplorationManager.startExploration("inst-1", {});
+    const ourSessionId = session.id;
+    expect(vrExplorationManager._offVRSessionObserver).toBeTypeOf("function");
+
+    await vrExplorationManager.leaveSession();
+
+    expect(vrExplorationManager._offVRSessionObserver).toBeNull();
+
+    // A later registry change must no longer reach the now-detached session
+    // object — proof the observer was actually torn down, not just the field.
+    yVRSessions.set("ds-1", {
+      sessionId: ourSessionId,
+      viewConfigurationId: "ds-1",
+      hostUserId: "user-2",
+      hostUserName: "Other User",
+      datasetId: "ds-1",
+      projectId: null,
+      createdAt: Date.now(),
+      lastHeartbeat: Date.now(),
+      participantCount: 1,
+    });
+
+    expect(session.ownerUserId).toBe("user-1"); // unchanged — no longer listening
   });
 });

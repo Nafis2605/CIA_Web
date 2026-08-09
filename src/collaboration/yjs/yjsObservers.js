@@ -14,6 +14,7 @@
 // - Views → /api/views + serverSync.js
 // ============================================================================
 
+import * as Y from "yjs";
 import {
   ydoc,
   yCursors,
@@ -65,7 +66,7 @@ export function onCursorChange(callback) {
 export function initializeCursorObserver() {
   log.debug("Setting up cursor presence observer");
 
-  yCursors.observe((event) => {
+  const handler = (event) => {
     const myId = getUserId();
 
     event.changes.keys.forEach((change, cursorUserId) => {
@@ -81,9 +82,11 @@ export function initializeCursorObserver() {
         }
       });
     });
-  });
+  };
+  yCursors.observe(handler);
 
   log.debug("Cursor observer initialized");
+  return () => yCursors.unobserve(handler);
 }
 
 /**
@@ -104,7 +107,7 @@ export function onAvatarChange(callback) {
 export function initializeAvatarObserver() {
   log.debug("Setting up avatar presence observer");
 
-  yAvatars.observe((event) => {
+  const handler = (event) => {
     // yAvatars is keyed per DEVICE, so the self-skip must be too — comparing
     // against getUserId() made a second headset on the same account look like
     // "me" and silently dropped its avatar.
@@ -123,9 +126,11 @@ export function initializeAvatarObserver() {
         }
       });
     });
-  });
+  };
+  yAvatars.observe(handler);
 
   log.debug("Avatar observer initialized");
+  return () => yAvatars.unobserve(handler);
 }
 
 /**
@@ -146,7 +151,7 @@ export function onViewPresenceChange(callback) {
 export function initializeViewPresenceObserver() {
   log.debug("Setting up view presence observer");
 
-  yViewPresence.observe((event) => {
+  const handler = (event) => {
     event.changes.keys.forEach((change, viewId) => {
       const presenceData = yViewPresence.get(viewId);
       viewPresenceChangeCallbacks.forEach((cb) => {
@@ -157,9 +162,11 @@ export function initializeViewPresenceObserver() {
         }
       });
     });
-  });
+  };
+  yViewPresence.observe(handler);
 
   log.debug("View presence observer initialized");
+  return () => yViewPresence.unobserve(handler);
 }
 
 /**
@@ -181,7 +188,7 @@ export function onCameraChange(callback) {
 export function initializeCameraObserver() {
   log.debug("Setting up camera presence observer");
 
-  yCameras.observe((event) => {
+  const handler = (event) => {
     const myId = getUserId();
 
     event.changes.keys.forEach((change, viewId) => {
@@ -200,15 +207,18 @@ export function initializeCameraObserver() {
             camera: cameraData?.camera,
             userId: cameraData?.userId,
             syncKey: cameraData?.syncKey,
+            collaborationViewId: cameraData?.collaborationViewId,
           });
         } catch (error) {
           log.error("Camera observer callback error:", error);
         }
       });
     });
-  });
+  };
+  yCameras.observe(handler);
 
   log.debug("Camera observer initialized");
+  return () => yCameras.unobserve(handler);
 }
 
 // ============================================================================
@@ -229,33 +239,57 @@ export function onVisualizationChange(callback) {
 export function initializeVisualizationObserver() {
   log.debug("Setting up visualization state observer");
 
-  yVisualizationState.observe((event) => {
-    event.changes.keys.forEach((change, viewId) => {
-      const data = yVisualizationState.get(viewId);
-      if (!data) return;
+  // observeDeep, not observe: each viewId's entry is now a nested Y.Map (see
+  // syncVisualizationToYjs), so a field-level patch to an EXISTING entry
+  // mutates the nested map in place rather than replacing the top-level key
+  // — a plain top-level .observe() would only fire the first time a viewId's
+  // entry is created, never on later per-field patches.
+  const handler = (events) => {
+    const changedViewIds = new Set();
+    events.forEach((event) => {
+      if (event.path.length === 0) {
+        // Fired directly on yVisualizationState: a viewId key was added/removed.
+        event.changes.keys.forEach((_change, viewId) => changedViewIds.add(viewId));
+      } else {
+        // Fired on a nested entry/visualization Y.Map: path[0] is the viewId.
+        changedViewIds.add(event.path[0]);
+      }
+    });
+
+    changedViewIds.forEach((viewId) => {
+      const entry = yVisualizationState.get(viewId);
+      // Legacy plain-object entry from before this migration (or the entry
+      // was deleted) — skip rather than throw; self-heals on the next write.
+      if (!(entry instanceof Y.Map)) return;
 
       // Skip updates that came from this browser connection
-      if (data.clientId === ydoc.clientID) return;
+      if (entry.get("clientId") === ydoc.clientID) return;
 
-      log.debug(`[CIA Collab] ← viz from ${data.userId} for view ${viewId}`, data.visualization);
+      const vizMap = entry.get("visualization");
+      const visualization = vizMap instanceof Y.Map ? vizMap.toJSON() : null;
+
+      log.debug(`[CIA Collab] ← viz from ${entry.get("userId")} for view ${viewId}`, visualization);
 
       visualizationChangeCallbacks.forEach((cb) => {
         try {
           cb({
-            action: change.action,
+            action: "update",
             viewId,
-            visualization: data.visualization,
-            userId: data.userId,
-            syncKey: data.syncKey,
+            visualization,
+            userId: entry.get("userId"),
+            syncKey: entry.get("syncKey"),
+            collaborationViewId: entry.get("collaborationViewId"),
           });
         } catch (error) {
           log.error("Visualization observer callback error:", error);
         }
       });
     });
-  });
+  };
+  yVisualizationState.observeDeep(handler);
 
   log.debug("Visualization state observer initialized");
+  return () => yVisualizationState.unobserveDeep(handler);
 }
 
 // ============================================================================
@@ -276,7 +310,7 @@ export function onManipulatorChange(callback) {
 export function initializeManipulatorObserver() {
   log.debug("Setting up manipulator state observer");
 
-  yManipulatorState.observe((event) => {
+  const handler = (event) => {
     event.changes.keys.forEach((change, userId) => {
       const data = yManipulatorState.get(userId);
 
@@ -295,9 +329,11 @@ export function initializeManipulatorObserver() {
         }
       });
     });
-  });
+  };
+  yManipulatorState.observe(handler);
 
   log.debug("Manipulator state observer initialized");
+  return () => yManipulatorState.unobserve(handler);
 }
 
 // ============================================================================
@@ -318,13 +354,25 @@ export function onActiveDatasetChange(callback) {
 export function initializeActiveDatasetObserver() {
   log.debug("Setting up active dataset observer");
 
-  yActiveDataset.observe((event) => {
+  const handler = (event) => {
     event.changes.keys.forEach((change, roomId) => {
       const data = yActiveDataset.get(roomId);
       if (!data) return;
 
       // Skip updates that came from this browser connection
       if (data.clientId === ydoc.clientID) return;
+
+      // Y.js's YMapEvent already carries the pre-change value for 'update'/
+      // 'delete' actions — use it to detect, with no extra bookkeeping, when
+      // THIS client's own very-recent selection got raced out by another
+      // client's concurrent write (last-writer-wins on the whole value is
+      // correct for an exclusive "active dataset" — the gap being closed
+      // here is that the losing client previously got zero signal).
+      const oldValue = change.oldValue;
+      const overroteLocalSelection =
+        change.action === "update" &&
+        oldValue?.clientId === ydoc.clientID &&
+        oldValue?.datasetId !== data.datasetId;
 
       console.log(
         '[CIA Collab] ← activeDataset received',
@@ -334,31 +382,51 @@ export function initializeActiveDatasetObserver() {
 
       activeDatasetChangeCallbacks.forEach((cb) => {
         try {
-          cb({ roomId, ...data });
+          cb({ roomId, ...data, overroteLocalSelection });
         } catch (e) {
           log.error("activeDataset observer callback error:", e);
         }
       });
     });
-  });
+  };
+  yActiveDataset.observe(handler);
 
   log.debug("Active dataset observer initialized");
+  return () => yActiveDataset.unobserve(handler);
 }
 
 // ============================================================================
 // Initialize All Observers
 // ============================================================================
 
+let _initialized = false;
+let _cleanupFns = [];
+
+/**
+ * Idempotent: re-registering observers on every Y.js "sync" event (which
+ * fires on every reconnect, not just the first connection — see
+ * yjsSetup.js's provider.on("sync", ...) listener) used to stack a fresh
+ * set of .observe() callbacks on the same Y.Map every time, compounding
+ * forever. Guard against that here rather than at each call site.
+ */
 export function initializeAllObservers() {
+  if (_initialized) {
+    log.debug("Y.js observers already initialized — skipping re-registration");
+    return teardownAllObservers;
+  }
+  _initialized = true;
+
   log.debug("Setting up Y.js observers (v2.1 - presence + visualization sync)");
 
-  initializeCursorObserver();
-  initializeAvatarObserver();
-  initializeViewPresenceObserver();
-  initializeCameraObserver();
-  initializeVisualizationObserver();
-  initializeManipulatorObserver();
-  initializeActiveDatasetObserver();
+  _cleanupFns = [
+    initializeCursorObserver(),
+    initializeAvatarObserver(),
+    initializeViewPresenceObserver(),
+    initializeCameraObserver(),
+    initializeVisualizationObserver(),
+    initializeManipulatorObserver(),
+    initializeActiveDatasetObserver(),
+  ];
 
   // Persistent state (datasets, views, annotations) still comes from server:
   // - REST API: useProjectFiles, DatasetManager.fetchDatasetsFromServer
@@ -374,4 +442,23 @@ export function initializeAllObservers() {
   console.groupEnd();
 
   log.info("Y.js observers initialized (v2.1)");
+
+  return teardownAllObservers;
+}
+
+/**
+ * Unobserves every Y.Map registered by initializeAllObservers() and resets
+ * state so a later initializeAllObservers() call re-registers cleanly.
+ */
+export function teardownAllObservers() {
+  _cleanupFns.forEach((fn) => {
+    try {
+      fn?.();
+    } catch (error) {
+      log.error("Error tearing down Y.js observer:", error);
+    }
+  });
+  _cleanupFns = [];
+  _initialized = false;
+  log.debug("Y.js observers torn down");
 }

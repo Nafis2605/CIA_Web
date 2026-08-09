@@ -9,6 +9,7 @@ import {
   instanceMatchesViewUpdate,
   resolveViewSyncKey,
 } from "@Core/instances/viewSyncKey.js";
+import { claimCollaborationViewId } from "@Collaboration/yjs/yjsSetup.js";
 import {
   getDatasetManager,
   getViewConfigurationManager,
@@ -319,8 +320,18 @@ class WorkspaceManager {
    * Called when another user in the same room picks a different dataset.
    * @private
    */
-  async _handleYjsActiveDatasetUpdate({ datasetId, name, path, type, source }) {
+  async _handleYjsActiveDatasetUpdate({ datasetId, name, path, type, source, updatedBy, overroteLocalSelection }) {
     console.log('[CIA Collab] Remote dataset load started:', datasetId, name);
+
+    // H7: this client's own recent dataset selection was raced out by the
+    // remote write we just received — last-writer-wins on the value itself
+    // is correct (only one dataset can be "active"), but the losing client
+    // used to get zero signal that their action didn't stick.
+    if (overroteLocalSelection) {
+      window.dispatchEvent(new CustomEvent('cia:dataset-selection-overridden', {
+        detail: { datasetId, overriddenBy: updatedBy },
+      }));
+    }
 
     // Find the currently active instance
     const activeInst = this.getActiveInstance();
@@ -473,6 +484,13 @@ class WorkspaceManager {
         createdAt: Date.now(),
         lastActive: Date.now(),
       };
+
+      // Claim/adopt this dataset's collaborationViewId (H5) — additive, does
+      // not change resolveViewSyncKey's default 'dataset' mode used by
+      // camera/visualization routing below. No-op (null) when there's no
+      // datasetId or viewConfigId yet to key the claim on.
+      const syncKey = resolveViewSyncKey(instance);
+      instance.collaborationViewId = syncKey ? claimCollaborationViewId(syncKey, getUserId()) : null;
 
       // If type is provided, initialize handler immediately
       if (type) {

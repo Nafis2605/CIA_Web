@@ -23,8 +23,27 @@ class WebSocketManager {
    * @param {http.Server} server - HTTP server instance
    */
   initialize(server, pool = null) {
-    this.wss = new WebSocket.Server({ server, path: "/ws" });
+    this.wss = new WebSocket.Server({ noServer: true });
     this.pool = pool;
+
+    // /ws is canonical; /app-ws is the same server under the alias the
+    // frontend also requests. Webpack's dev proxy owns /ws for its own HMR
+    // socket, so app traffic is mounted at /app-ws there (see
+    // webpack.config.js and src/services/serverSync.js) — but in production
+    // this same process serves the built SPA directly, with no HMR socket in
+    // the way, so /app-ws just needs to resolve to this same WS server
+    // instead of requiring a separate proxy (see H16).
+    const ACCEPTED_WS_PATHS = new Set(["/ws", "/app-ws"]);
+    server.on("upgrade", (request, socket, head) => {
+      const { pathname } = new URL(request.url, `http://${request.headers.host}`);
+      if (!ACCEPTED_WS_PATHS.has(pathname)) {
+        socket.destroy();
+        return;
+      }
+      this.wss.handleUpgrade(request, socket, head, (wsClient) => {
+        this.wss.emit("connection", wsClient, request);
+      });
+    });
 
     this.wss.on("connection", (wsClient, req) => {
       ws.info("WebSocket client connected");
@@ -574,14 +593,21 @@ class WebSocketManager {
   }
 
   /**
-   * Broadcast annotation deleted event
+   * Broadcast annotation deleted event.
+   * @param {string}      projectId
+   * @param {string}      fileId
+   * @param {string}      annotationId
+   * @param {bigint|null} syncEventId    sync_events.id for watermark tracking.
+   * @param {string|null} actorUserId    User who deleted it.
    */
-  annotationDeleted(projectId, fileId, annotationId) {
+  annotationDeleted(projectId, fileId, annotationId, syncEventId = null, actorUserId = null) {
     this.broadcastToProject(projectId, {
       type: "annotation:deleted",
       projectId,
       fileId,
       annotationId,
+      syncEventId: syncEventId != null ? syncEventId.toString() : null,
+      actorUserId: actorUserId || null,
       timestamp: new Date().toISOString(),
     });
   }

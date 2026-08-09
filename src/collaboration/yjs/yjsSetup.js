@@ -182,7 +182,8 @@ export async function initializeYjsProvider() {
     if (synced) {
       log.info("Y.js synchronized with server");
 
-      // Initialize presence observers when sync is complete
+      // Fires on every reconnect, not just the first sync — initializeAllObservers()
+      // is idempotent (guard lives in yjsObservers.js) so re-registration here is safe.
       import("@Collaboration/yjs/yjsObservers.js").then(
         ({ initializeAllObservers }) => {
           initializeAllObservers();
@@ -290,8 +291,11 @@ export function syncViewPresenceToYjs(viewId, viewers) {
  * @param {string|null} [syncKey] - Cross-client sync key (see viewSyncKey.js).
  *   viewId is local to the publisher — every client mints its own — so peers
  *   match on this instead.
+ * @param {string|null} [collaborationViewId] - Additive per-view id (H5, see
+ *   viewSyncKey.js's `mode: 'view'`). Currently inert — no consumer matches
+ *   on it yet — carried along so it's available once one does.
  */
-export function syncCameraToYjs(viewId, userId, cameraState, syncKey = null) {
+export function syncCameraToYjs(viewId, userId, cameraState, syncKey = null, collaborationViewId = null) {
   // Personal-camera mode: the user opted out of sharing their viewpoint —
   // suppress the outgoing broadcast entirely (see cameraSharePolicy).
   if (!cameraSharePolicy.isCameraShared()) return;
@@ -300,6 +304,7 @@ export function syncCameraToYjs(viewId, userId, cameraState, syncKey = null) {
       camera: cameraState,
       userId,
       syncKey,
+      collaborationViewId,
       clientId: ydoc.clientID,
       lastUpdate: Date.now(),
     });
@@ -317,17 +322,37 @@ export function syncCameraToYjs(viewId, userId, cameraState, syncKey = null) {
  * @param {string|null} [syncKey] - Cross-client sync key (see viewSyncKey.js).
  *   viewId is local to the publisher — every client mints its own — so peers
  *   match on this instead.
+ * @param {string|null} [collaborationViewId] - Additive per-view id (H5, see
+ *   viewSyncKey.js's `mode: 'view'`). Currently inert — no consumer matches
+ *   on it yet — carried along so it's available once one does.
  */
-export function syncVisualizationToYjs(viewId, userId, vizState, syncKey = null) {
+export function syncVisualizationToYjs(viewId, userId, vizState, syncKey = null, collaborationViewId = null) {
   try {
-    // Merge with existing state so partial updates don't overwrite other fields
-    const existing = yVisualizationState.get(viewId)?.visualization || {};
-    yVisualizationState.set(viewId, {
-      visualization: { ...existing, ...vizState },
-      userId,
-      syncKey,
-      clientId: ydoc.clientID,
-      lastUpdate: Date.now(),
+    // Each field is its own nested Y.Map entry (not a plain-object merge), so
+    // two clients patching DIFFERENT fields concurrently (e.g. Alice changes
+    // opacity, Bob changes representation) both survive — Y.js merges at the
+    // per-key level instead of picking one whole-value winner. A plain-object
+    // read-merge-write here used to let the second write silently clobber the
+    // first client's field, even though the two patches touched disjoint keys.
+    ydoc.transact(() => {
+      let entry = yVisualizationState.get(viewId);
+      if (!(entry instanceof Y.Map)) {
+        entry = new Y.Map();
+        yVisualizationState.set(viewId, entry);
+      }
+      let vizMap = entry.get("visualization");
+      if (!(vizMap instanceof Y.Map)) {
+        vizMap = new Y.Map();
+        entry.set("visualization", vizMap);
+      }
+      for (const [key, value] of Object.entries(vizState || {})) {
+        vizMap.set(key, value);
+      }
+      entry.set("userId", userId);
+      entry.set("syncKey", syncKey);
+      entry.set("collaborationViewId", collaborationViewId);
+      entry.set("clientId", ydoc.clientID);
+      entry.set("lastUpdate", Date.now());
     });
   } catch (error) {
     log.error("Failed to sync visualization to Y.js:", error);
@@ -370,16 +395,22 @@ export function syncManipulatorToYjs(userId, displayName, target, action) {
  */
 export function syncActiveDatasetToYjs(roomId, userId, datasetInfo) {
   try {
-    const prev = yActiveDataset.get(roomId);
-    const version = (prev?.version || 0) + 1;
-    yActiveDataset.set(roomId, {
-      ...datasetInfo,
-      version,
-      updatedBy: userId,
-      updatedAt: Date.now(),
-      clientId: ydoc.clientID,
+    // "Active dataset" is semantically exclusive — only one can be active per
+    // room — so last-writer-wins on the VALUE is correct. What used to be
+    // broken was `version`: reading the previous value and incrementing it
+    // locally races when two clients select concurrently (both can read the
+    // same prev.version and compute the same next value). Date.now() needs no
+    // read of a shared value to compute, so it can't collide the same way.
+    ydoc.transact(() => {
+      yActiveDataset.set(roomId, {
+        ...datasetInfo,
+        version: Date.now(),
+        updatedBy: userId,
+        updatedAt: Date.now(),
+        clientId: ydoc.clientID,
+      });
     });
-    console.log('[CIA Collab] → activeDataset broadcast', datasetInfo.datasetId, 'v' + version);
+    console.log('[CIA Collab] → activeDataset broadcast', datasetInfo.datasetId);
   } catch (error) {
     log.error("Failed to sync active dataset to Y.js:", error);
   }
@@ -490,6 +521,67 @@ export function releaseVRSession(viewConfigurationId, userId) {
   } catch (error) {
     log.error("Failed to release VR session:", error);
   }
+}
+
+// ============================================================================
+// COLLABORATION VIEW REGISTRY (H5 — collaborationViewId)
+// ============================================================================
+//
+// A collaborationViewId identifies ONE logical collaborative view — distinct
+// from viewConfigId (minted per-client via POST /views, never shared) and
+// from datasetId (shared by CONTENT, not by view — see viewSyncKey.js's
+// dataset-based syncKey, which stays the default for existing sync channels).
+// Keyed by that same dataset-based syncKey so every client viewing the same
+// dataset in the same room agrees on one id: the first client to resolve a
+// given syncKey with no existing record mints and claims it; every later
+// client for that syncKey adopts the existing id instead of minting its own.
+// Modeled directly on claimVRSession above — same claim-if-absent-else-adopt
+// shape, same last-writer-wins convergence guarantee.
+//
+// Currently unused by any existing sync call site (see viewSyncKey.js's
+// `mode: 'view'` — nothing defaults to it yet); this registry exists so that
+// plumbing has somewhere real to claim an id from.
+
+export const yCollaborationViews = ydoc.getMap("collaboration-views");
+
+/**
+ * Look up the collaborationViewId already claimed for a dataset-based sync
+ * key, if any.
+ * @param {string} syncKey - see resolveViewSyncKey() in viewSyncKey.js
+ * @returns {string|null}
+ */
+export function getCollaborationViewId(syncKey) {
+  if (!syncKey) return null;
+  return yCollaborationViews.get(syncKey)?.collaborationViewId || null;
+}
+
+/**
+ * Claim (or adopt) the collaborationViewId for a dataset-based sync key.
+ * @param {string} syncKey - see resolveViewSyncKey() in viewSyncKey.js
+ * @param {string} [mintedBy] - caller's user id, for diagnostics only
+ * @returns {string|null} the id that won the claim — ours, or the pre-existing one
+ */
+export function claimCollaborationViewId(syncKey, mintedBy) {
+  if (!syncKey) return null;
+  let winner = null;
+  try {
+    ydoc.transact(() => {
+      const existing = yCollaborationViews.get(syncKey);
+      if (existing) {
+        winner = existing;
+        return;
+      }
+      winner = {
+        collaborationViewId: `cview_${ydoc.clientID}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        mintedBy: mintedBy || null,
+        createdAt: Date.now(),
+      };
+      yCollaborationViews.set(syncKey, winner);
+    });
+  } catch (error) {
+    log.error("Failed to claim collaboration view id:", error);
+  }
+  return winner?.collaborationViewId || null;
 }
 
 /**

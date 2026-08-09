@@ -38,12 +38,25 @@
  * (VTKInstanceHandler.loadData, workspaceManager.loadDataIntoInstance), so the
  * ordering below is consistent whichever one is passed in.
  *
- * @param {{instanceData?: {dataset?: {id?: string}, datasetId?: string},
+ * `mode: 'view'` resolves a genuinely distinct per-view identity
+ * (`collaborationViewId`) instead, for callers that need isolation between
+ * two views of the same dataset rather than the default "same dataset, same
+ * room converges" behavior. It deliberately does NOT fall back to dataset id
+ * — an instance with no collaborationViewId yet resolves to null in this
+ * mode, rather than silently rejoining the dataset-scoped convergence it was
+ * asking to opt out of. No existing call site uses this mode; default
+ * ('dataset') behavior is unchanged.
+ *
+ * @param {{instanceData?: {dataset?: {id?: string}, datasetId?: string, collaborationViewId?: string},
  *   dataset?: {id?: string}, datasetId?: string,
- *   viewConfigId?: string}|null|undefined} instance
+ *   viewConfigId?: string, collaborationViewId?: string}|null|undefined} instance
+ * @param {{mode?: 'dataset'|'view'}} [options]
  * @returns {string|null} the sync key, or null when nothing identifies it
  */
-export function resolveViewSyncKey(instance) {
+export function resolveViewSyncKey(instance, { mode = 'dataset' } = {}) {
+  if (mode === 'view') {
+    return instance?.collaborationViewId || instance?.instanceData?.collaborationViewId || null;
+  }
   return (
     instance?.instanceData?.dataset?.id ||
     instance?.instanceData?.datasetId ||
@@ -71,11 +84,12 @@ export function resolveViewSyncKey(instance) {
  * @param {{viewConfigId?: string}|null|undefined} instance
  * @param {string} viewId - the publisher's view configuration id
  * @param {string|null|undefined} [syncKey] - the publisher's resolved sync key
+ * @param {{mode?: 'dataset'|'view'}} [options]
  * @returns {boolean}
  */
-export function instanceMatchesViewUpdate(instance, viewId, syncKey) {
+export function instanceMatchesViewUpdate(instance, viewId, syncKey, options) {
   if (!instance) return false;
   if (viewId && instance.viewConfigId === viewId) return true;
   if (!syncKey) return false;
-  return resolveViewSyncKey(instance) === syncKey;
+  return resolveViewSyncKey(instance, options) === syncKey;
 }

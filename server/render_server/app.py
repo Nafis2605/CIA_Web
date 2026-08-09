@@ -26,9 +26,18 @@ import logging
 import asyncio
 import uuid
 import time
+from collections import defaultdict, deque
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import (
+    FastAPI,
+    WebSocket,
+    WebSocketDisconnect,
+    HTTPException,
+    Depends,
+    Header,
+    Request,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -48,10 +57,28 @@ RENDER_WIDTH = int(os.environ.get("RENDER_WIDTH", "1024"))
 RENDER_HEIGHT = int(os.environ.get("RENDER_HEIGHT", "768"))
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "10"))
 
+# H14: access gate, resource bounds. RENDER_SERVER_TOKEN empty/unset means the
+# gate is disabled — matches the existing INTERNAL_API_TOKEN convention in the
+# main API (server/src/middleware/auth.js) of "only enforced when configured",
+# so local dev with no token set keeps working unchanged.
+RENDER_SERVER_TOKEN = os.environ.get("RENDER_SERVER_TOKEN", "")
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.environ.get(
+        "RENDER_ALLOWED_ORIGINS", "https://localhost:8081,http://localhost:8081"
+    ).split(",")
+    if o.strip()
+]
+MAX_DATASET_SIZE_MB = int(os.environ.get("MAX_DATASET_SIZE_MB", "500"))
+RATE_LIMIT_MAX_LOADS_PER_MIN = int(os.environ.get("RATE_LIMIT_MAX_LOADS_PER_MIN", "20"))
+
 log.info("[app] Starting CIA_Web VTK Render Server")
 log.info(f"[app] Dataset dir: {DATASET_DIR}")
 log.info(f"[app] Render size: {RENDER_WIDTH}x{RENDER_HEIGHT}")
 log.info(f"[app] Max sessions: {MAX_SESSIONS}")
+log.info(f"[app] Allowed origins: {ALLOWED_ORIGINS}")
+if not RENDER_SERVER_TOKEN:
+    log.warning("[app] RENDER_SERVER_TOKEN not set — access gate DISABLED")
 
 # ── VTK availability check ────────────────────────────────────────────────────
 try:
@@ -88,9 +115,9 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -99,6 +126,8 @@ app.add_middleware(
 
 class LoadRequest(BaseModel):
     datasetId: str
+    # Never trusted for path resolution (see resolve_registered_path / H14) —
+    # kept only so older callers don't break; ignored on the server.
     path: Optional[str] = None
     sessionId: Optional[str] = None
 
@@ -109,6 +138,50 @@ class CameraRequest(BaseModel):
     focalPoint: Optional[list] = None
     viewUp: Optional[list] = None
     zoom: Optional[float] = 1.0
+
+
+# ── H14: access gate, path trust, and resource bounds ────────────────────────
+
+def _token_valid(provided: Optional[str]) -> bool:
+    return not RENDER_SERVER_TOKEN or provided == RENDER_SERVER_TOKEN
+
+
+async def require_render_token(x_render_token: Optional[str] = Header(None)):
+    """FastAPI dependency: gate an HTTP endpoint behind RENDER_SERVER_TOKEN."""
+    if not _token_valid(x_render_token):
+        raise HTTPException(401, "Invalid or missing render server token")
+
+
+def resolve_registered_path(dataset_id: str) -> Optional[str]:
+    """
+    Dataset paths only ever come from this server's own DATASET_DIR/
+    EXTRA_DATASET_DIR scan — a client-supplied path is never trusted, since
+    it can arrive via a shared collaborative ViewConfiguration placement
+    authored by another, possibly malicious, user (see H14).
+    """
+    info = DATASETS.get(dataset_id)
+    return info["path"] if info else None
+
+
+def check_dataset_size(path: str):
+    size_mb = os.path.getsize(path) / (1024 * 1024)
+    if size_mb > MAX_DATASET_SIZE_MB:
+        raise ValueError(
+            f"Dataset exceeds size limit ({size_mb:.0f}MB > {MAX_DATASET_SIZE_MB}MB)"
+        )
+
+
+_load_times_by_ip: dict = defaultdict(deque)
+
+
+def check_rate_limit(client_ip: str):
+    now = time.time()
+    q = _load_times_by_ip[client_ip]
+    while q and now - q[0] > 60:
+        q.popleft()
+    if len(q) >= RATE_LIMIT_MAX_LOADS_PER_MIN:
+        raise ValueError("Rate limit exceeded — too many dataset loads")
+    q.append(now)
 
 
 # ── HTTP endpoints ─────────────────────────────────────────────────────────────
@@ -126,14 +199,14 @@ async def health():
     }
 
 
-@app.get("/datasets")
+@app.get("/datasets", dependencies=[Depends(require_render_token)])
 async def list_datasets():
     """Return list of available datasets discovered from DATASET_DIR."""
     return list(DATASETS.values())
 
 
-@app.post("/load")
-async def load_dataset(req: LoadRequest):
+@app.post("/load", dependencies=[Depends(require_render_token)])
+async def load_dataset(req: LoadRequest, request: Request):
     """
     Load a dataset and return metadata + first rendered frame.
     Creates a render session if sessionId is not provided.
@@ -141,8 +214,7 @@ async def load_dataset(req: LoadRequest):
     if not VTK_AVAILABLE or session_manager is None:
         raise HTTPException(503, "VTK rendering not available — check server logs")
 
-    dataset_info = DATASETS.get(req.datasetId)
-    path = req.path or (dataset_info["path"] if dataset_info else None)
+    path = resolve_registered_path(req.datasetId)
 
     if not path:
         raise HTTPException(
@@ -153,6 +225,13 @@ async def load_dataset(req: LoadRequest):
     file_type = path.rsplit(".", 1)[-1].lower() if "." in path else ""
     if file_type not in ("vtp", "vtu", "vti"):
         raise HTTPException(400, f"Unsupported file type: .{file_type}")
+
+    client_ip = request.client.host if request.client else "unknown"
+    try:
+        check_rate_limit(client_ip)
+        check_dataset_size(path)
+    except ValueError as e:
+        raise HTTPException(429 if "Rate limit" in str(e) else 413, str(e))
 
     session_id = req.sessionId or str(uuid.uuid4())
     session = session_manager.get_or_create(session_id)
@@ -199,7 +278,7 @@ async def load_dataset(req: LoadRequest):
         raise HTTPException(500, f"Render failed: {e}")
 
 
-@app.post("/camera")
+@app.post("/camera", dependencies=[Depends(require_render_token)])
 async def update_camera(req: CameraRequest):
     """Update camera position and return a new rendered frame."""
     if not VTK_AVAILABLE or session_manager is None:
@@ -239,7 +318,7 @@ async def update_camera(req: CameraRequest):
         raise HTTPException(500, f"Camera update failed: {e}")
 
 
-@app.get("/frame")
+@app.get("/frame", dependencies=[Depends(require_render_token)])
 async def get_frame(sessionId: Optional[str] = None):
     """Return latest rendered PNG as image/png (HTTP polling fallback)."""
     if not VTK_AVAILABLE or session_manager is None:
@@ -278,9 +357,17 @@ async def websocket_endpoint(websocket: WebSocket):
       { "type": "error", "message": "...", "stage": "load|parse|render|camera" }
       { "type": "pong" }
     """
+    # Browsers can't set custom headers on a WS handshake, so the token
+    # rides along as a query param instead. Reject before accept() so an
+    # unauthorized caller never gets an open socket.
+    if not _token_valid(websocket.query_params.get("token")):
+        await websocket.close(code=4401)
+        return
+
     await websocket.accept()
 
     session_id = str(uuid.uuid4())
+    client_ip = websocket.client.host if websocket.client else "unknown"
     log.info(f"[app] WS connected: {session_id}")
 
     session = None
@@ -317,10 +404,7 @@ async def websocket_endpoint(websocket: WebSocket):
             # ── loadDataset ─────────────────────────────────────────────────
             elif msg_type == "loadDataset":
                 dataset_id = msg.get("datasetId", "")
-                path = msg.get("path", "")
-
-                if not path and dataset_id in DATASETS:
-                    path = DATASETS[dataset_id]["path"]
+                path = resolve_registered_path(dataset_id)
 
                 if not path:
                     await websocket.send_json({
@@ -329,6 +413,13 @@ async def websocket_endpoint(websocket: WebSocket):
                                    f"Available: {list(DATASETS.keys())}",
                         "stage": "load",
                     })
+                    continue
+
+                try:
+                    check_rate_limit(client_ip)
+                    check_dataset_size(path)
+                except ValueError as e:
+                    await websocket.send_json({"type": "error", "message": str(e), "stage": "load"})
                     continue
 
                 file_type = path.rsplit(".", 1)[-1].lower() if "." in path else ""

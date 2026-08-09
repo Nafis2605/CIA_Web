@@ -12,9 +12,9 @@
 import { describe, test, expect, vi, beforeEach } from 'vitest';
 
 vi.mock('y-websocket', () => ({
-  WebsocketProvider: vi.fn().mockImplementation(() => ({
-    on: vi.fn(),
-  })),
+  WebsocketProvider: vi.fn().mockImplementation(function () {
+    return { on: vi.fn() };
+  }),
 }));
 
 vi.mock('@Core/config/clientConfig.js', () => ({
@@ -25,6 +25,7 @@ vi.mock('@Core/session/sessionManager', () => ({
   sessionManager: {
     getRoomId: vi.fn(() => 'test-room'),
     getUserId: vi.fn(() => 'test-user'),
+    getProjectId: vi.fn(() => 'test-project'),
   },
 }));
 
@@ -37,23 +38,30 @@ vi.mock('@Services/authService.js', () => ({
 
 vi.mock('@Collaboration/presence/userManagement.js', () => ({
   getUserId: vi.fn(() => 'test-user'),
+  getParticipantId: vi.fn(() => 'test-user#device-1'),
 }));
 
 vi.mock('@Utils/logger.js', () => ({
   sync: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
 
+import { WebsocketProvider } from 'y-websocket';
+import * as Y from 'yjs';
 import {
   ydoc,
   yCursors,
   yCameras,
   yAvatars,
   yVisualizationState,
+  yActiveDataset,
   syncCursorToYjs,
   syncCameraToYjs,
   syncAvatarToYjs,
   syncVisualizationToYjs,
+  syncActiveDatasetToYjs,
+  initializeYjsProvider,
 } from './yjsSetup.js';
+import { teardownAllObservers } from './yjsObservers.js';
 
 describe('cursor presence (yCursors) — keyed by userId', () => {
   beforeEach(() => {
@@ -134,18 +142,20 @@ describe('camera presence (yCameras) — keyed by viewId, echo-guarded by client
   });
 });
 
-describe('visualization state (yVisualizationState) — carries the cross-client syncKey', () => {
+describe('visualization state (yVisualizationState) — nested Y.Map per field (H7)', () => {
   beforeEach(() => {
     yVisualizationState.clear();
   });
 
-  test('stores the syncKey alongside the sender-local viewId', () => {
+  test('stores the syncKey alongside the sender-local viewId, in a nested Y.Map', () => {
     syncVisualizationToYjs('view-1', 'user-alice', { opacity: 0.5 }, 'dataset-1');
 
     const entry = yVisualizationState.get('view-1');
-    expect(entry.visualization).toEqual({ opacity: 0.5 });
-    expect(entry.syncKey).toBe('dataset-1');
-    expect(entry.clientId).toBe(ydoc.clientID);
+    expect(entry).toBeInstanceOf(Y.Map);
+    expect(entry.get('visualization')).toBeInstanceOf(Y.Map);
+    expect(entry.get('visualization').toJSON()).toEqual({ opacity: 0.5 });
+    expect(entry.get('syncKey')).toBe('dataset-1');
+    expect(entry.get('clientId')).toBe(ydoc.clientID);
   });
 
   test('partial patches merge, and the syncKey survives the merge', () => {
@@ -153,12 +163,85 @@ describe('visualization state (yVisualizationState) — carries the cross-client
     syncVisualizationToYjs('view-1', 'user-alice', { representation: 'points' }, 'dataset-1');
 
     const entry = yVisualizationState.get('view-1');
-    expect(entry.visualization).toEqual({ opacity: 0.5, representation: 'points' });
-    expect(entry.syncKey).toBe('dataset-1');
+    expect(entry.get('visualization').toJSON()).toEqual({ opacity: 0.5, representation: 'points' });
+    expect(entry.get('syncKey')).toBe('dataset-1');
   });
 
   test('omitting the syncKey is allowed and records null', () => {
     syncVisualizationToYjs('view-1', 'user-alice', { opacity: 0.5 });
-    expect(yVisualizationState.get('view-1').syncKey).toBeNull();
+    expect(yVisualizationState.get('view-1').get('syncKey')).toBeNull();
+  });
+
+  // H7: the bug this whole nested-map structure exists to fix — two clients
+  // patching DIFFERENT fields must not clobber each other, even though both
+  // read/wrote against the same viewId "concurrently" (here: back-to-back,
+  // simulating the write ordering without needing two real Y.Docs — the
+  // per-field CRDT merge is what's under test, not network interleaving).
+  test('two disjoint-field patches on the same viewId both survive', () => {
+    syncVisualizationToYjs('view-1', 'user-alice', { opacity: 0.9 }, 'dataset-1');
+    syncVisualizationToYjs('view-1', 'user-bob', { representation: 'wireframe' }, 'dataset-1');
+
+    const visualization = yVisualizationState.get('view-1').get('visualization').toJSON();
+    expect(visualization).toEqual({ opacity: 0.9, representation: 'wireframe' });
+  });
+});
+
+describe('active dataset (yActiveDataset) — collision-resistant version (H7)', () => {
+  beforeEach(() => {
+    yActiveDataset.clear();
+  });
+
+  // Not "always distinct" — Date.now() has millisecond granularity, so two
+  // synchronous back-to-back calls in the same test CAN land on the same ms.
+  // What matters (and what the racy incrementing counter got wrong) is that
+  // version is derived WITHOUT reading the previous value, so two concurrent
+  // writers can never compute the same "next" version from a shared stale
+  // read — and the later write always wins outright, with no lost update
+  // masked behind a matching version number.
+  test('version does not depend on reading the previous value, and the later write wins', () => {
+    syncActiveDatasetToYjs('room-1', 'user-alice', { datasetId: 'ds-1' });
+    const v1 = yActiveDataset.get('room-1').version;
+    expect(typeof v1).toBe('number');
+
+    syncActiveDatasetToYjs('room-1', 'user-bob', { datasetId: 'ds-2' });
+    const v2 = yActiveDataset.get('room-1').version;
+
+    expect(v2).toBeGreaterThanOrEqual(v1);
+    expect(yActiveDataset.get('room-1').datasetId).toBe('ds-2');
+  });
+
+  test('stores updatedBy and clientId for the writer', () => {
+    syncActiveDatasetToYjs('room-1', 'user-alice', { datasetId: 'ds-1' });
+    const record = yActiveDataset.get('room-1');
+    expect(record.updatedBy).toBe('user-alice');
+    expect(record.clientId).toBe(ydoc.clientID);
+  });
+});
+
+describe('provider "sync" event reconnect handling — initializeAllObservers must stay idempotent', () => {
+  // initializeYjsProvider() is guarded against re-creating the provider
+  // (`if (_provider) return _provider;`), so it only actually runs once for
+  // this whole file — this describe block owns that one call.
+  test('the "sync" event firing twice (reconnect) does not duplicate observer registration', async () => {
+    await initializeYjsProvider();
+
+    const providerInstance = WebsocketProvider.mock.results[0].value;
+    const [, syncHandler] = providerInstance.on.mock.calls.find(
+      ([event]) => event === 'sync'
+    );
+
+    teardownAllObservers();
+    const observeSpy = vi.spyOn(yCursors, 'observe');
+
+    // y-websocket fires "sync" on every successful (re)sync, not just the
+    // first connection — this simulates a reconnect refiring it.
+    syncHandler(true);
+    syncHandler(true);
+
+    await vi.waitFor(() => {
+      expect(observeSpy).toHaveBeenCalledTimes(1);
+    });
+
+    observeSpy.mockRestore();
   });
 });

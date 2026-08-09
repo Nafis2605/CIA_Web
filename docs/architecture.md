@@ -163,6 +163,22 @@ Y.js shared maps:
 | Redis 7 | BullMQ job queues, rate limiting |
 | IndexedDB (browser) | Offline dataset cache, query results |
 
+### Production Endpoint Routing
+
+Webpack's dev server (`webpack.config.js`) proxies five relative paths to their real backends so the frontend can always use same-origin URLs in dev: `/api`, `/app-ws`, `/render-ws`, `/render-api`, `/yjs-ws`, and `/livekit-token`. The production Express server (`server/src/index.js`) doesn't run behind that dev proxy, so each of these needs to resolve correctly on its own:
+
+- **`/api` and `/app-ws`** — no action needed. Both are served by this same Express/WebSocket process (`wsManager.initialize()` accepts upgrades at both `/ws` and its `/app-ws` alias on the same `http.Server`), so a relative-URL production deployment (frontend built and served from `dist/` by this same process) works without any proxy.
+- **`/render-ws` + `/render-api`, `/yjs-ws`, `/livekit-token`** — these are genuinely separate services/containers (the Python render server, the Y.js server, the LiveKit token server). If they aren't reachable at those same relative paths in production (e.g. no reverse proxy forwards them), point the frontend build directly at each service's real, publicly-reachable URL instead, via these env vars (read at webpack build time, see `webpack.config.js`'s `DefinePlugin` block and `src/core/config/clientConfig.js`):
+
+  | Env var | Overrides | Default |
+  |---|---|---|
+  | `RENDER_SERVER_URL` | Render server HTTP base (`/datasets`, `/load`, `/camera`, `/frame`) | `http://localhost:7001` |
+  | `RENDER_WS_URL` | Render server WebSocket (`/ws` on that service) | `/render-ws` |
+  | `YJS_WEBSOCKET_URL` | Y.js WebSocket server | `/yjs-ws` |
+  | `LIVEKIT_TOKEN_URL` | LiveKit token endpoint | `/livekit-token` |
+
+  Whatever fronts a `*_WS_URL` service (load balancer, ingress, CDN) must forward WebSocket upgrade requests, not just plain HTTP — a proxy that only handles `GET`/`POST` will silently fail the WS handshake.
+
 ---
 
 ## Data Flow

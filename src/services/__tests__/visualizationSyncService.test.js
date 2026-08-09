@@ -39,6 +39,7 @@ import {
   canModifyActiveView,
   resolveShareMode,
   getPermissionDeniedReason,
+  flushSharedCameraUpdate,
 } from '../visualizationSyncService.js';
 
 function mockActiveWorkspace(id) {
@@ -219,6 +220,104 @@ describe('visualizationSyncService', () => {
       expect(syncVisualizationToYjs).not.toHaveBeenCalled();
       expect(mockManager.updateVisualization).not.toHaveBeenCalled();
       expect(result.persisted).toBe(false);
+    });
+  });
+
+  describe('flushSharedCameraUpdate (H10)', () => {
+    beforeEach(() => {
+      mockActiveWorkspace('ws-1');
+      permissionService.getCachedRole.mockReturnValue('editor');
+      permissionService.hasPermission.mockReturnValue(true);
+    });
+
+    test('delivers a pending patch immediately instead of waiting for the trailing timer', () => {
+      // Leading-edge send — goes out immediately, nothing left pending yet.
+      pushSharedCameraUpdate('view-flush-1', { position: [0, 0, 1] });
+      syncCameraToYjs.mockClear();
+
+      // Within the throttle window — queued, not sent yet.
+      pushSharedCameraUpdate('view-flush-1', { position: [0, 0, 2] });
+      expect(syncCameraToYjs).not.toHaveBeenCalled();
+
+      flushSharedCameraUpdate('view-flush-1');
+
+      expect(syncCameraToYjs).toHaveBeenCalledWith(
+        'view-flush-1', 'user-1', { position: [0, 0, 2] }, null
+      );
+    });
+
+    test('is a no-op when nothing is pending for the view', () => {
+      expect(() => flushSharedCameraUpdate('view-flush-never-used')).not.toThrow();
+      expect(syncCameraToYjs).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('role-fetch warm-up window (H12)', () => {
+    test('queues the patch while the role fetch is in flight, then replays it once resolved', async () => {
+      mockActiveWorkspace('ws-warmup');
+      permissionService.getCachedRole.mockReturnValue(null);
+      // Matches the real permissionService: an uncached role reads as no
+      // permission (hasPermission returns false when nothing is cached yet).
+      permissionService.hasPermission.mockReturnValue(false);
+
+      let resolveFetch;
+      permissionService.fetchWorkspaceRole.mockImplementation(
+        () => new Promise((resolve) => { resolveFetch = resolve; })
+      );
+
+      const result = pushSharedCameraUpdate('view-warmup', { position: [1, 1, 1] });
+
+      expect(result).toEqual({ persisted: false, queued: true, reason: 'role-pending' });
+      expect(syncCameraToYjs).not.toHaveBeenCalled();
+      expect(mockManager.updateCamera).not.toHaveBeenCalled();
+
+      // Role resolves as editor — flip the cache the same way a real
+      // fetchWorkspaceRole resolution would, then let the replay settle.
+      permissionService.getCachedRole.mockReturnValue('editor');
+      permissionService.hasPermission.mockReturnValue(true);
+      resolveFetch('editor');
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(syncCameraToYjs).toHaveBeenCalledWith(
+        'view-warmup', 'user-1', { position: [1, 1, 1] }, null
+      );
+      expect(mockManager.updateCamera).toHaveBeenCalledWith('view-warmup', { position: [1, 1, 1] });
+    });
+
+    test('discards the queued patch if the active workspace changed before the fetch resolved', async () => {
+      mockActiveWorkspace('ws-a');
+      permissionService.getCachedRole.mockReturnValue(null);
+      permissionService.hasPermission.mockReturnValue(false);
+
+      let resolveFetch;
+      permissionService.fetchWorkspaceRole.mockImplementation(
+        () => new Promise((resolve) => { resolveFetch = resolve; })
+      );
+
+      pushSharedCameraUpdate('view-switch', { position: [2, 2, 2] });
+      expect(syncCameraToYjs).not.toHaveBeenCalled();
+
+      // User navigated to a different workspace before ws-a's fetch returned.
+      mockActiveWorkspace('ws-b');
+      permissionService.getCachedRole.mockReturnValue('editor');
+      permissionService.hasPermission.mockReturnValue(true);
+      resolveFetch('editor');
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(syncCameraToYjs).not.toHaveBeenCalled();
+    });
+
+    test('a cached-but-denied role still returns plain permission-denied, not the pending sentinel', () => {
+      mockActiveWorkspace('ws-1');
+      permissionService.getCachedRole.mockReturnValue('viewer');
+      permissionService.hasPermission.mockReturnValue(false);
+
+      const result = pushSharedCameraUpdate('view-denied', { position: [0, 0, 0] });
+
+      expect(result).toEqual({ persisted: false, reason: 'permission-denied' });
+      expect(syncCameraToYjs).not.toHaveBeenCalled();
     });
   });
 

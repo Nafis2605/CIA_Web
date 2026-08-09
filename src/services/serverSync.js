@@ -20,8 +20,10 @@ class ServerSyncService {
     this.ws = null;
     this.isConnected = false;
     this.reconnectAttempts = 0;
-    this.maxReconnectAttempts = 5;
     this.reconnectDelay = 1000;
+    this.maxReconnectDelay = 30000;
+    this._reconnectTimer = null;
+    this._resumeListenersAttached = false;
     this.handlers = new Map();
     this.datasetManager = null;
     this.viewConfigurationManager = null;
@@ -50,7 +52,38 @@ class ServerSyncService {
     this.datasetManager = datasetManager;
     this.viewConfigurationManager = viewConfigurationManager;
     this._setupDefaultHandlers();
+    this._setupNetworkResumeListeners();
     this.connect();
+  }
+
+  /**
+   * A Quest that sleeps or a laptop that loses Wi-Fi can outlast the capped
+   * backoff's growing delay while sitting in a `setTimeout` wait. Resume
+   * signals (network back online, tab regaining focus/visibility) short-
+   * circuit that wait and retry immediately instead of leaving the client
+   * stuck until the next scheduled attempt or a page reload.
+   */
+  _setupNetworkResumeListeners() {
+    if (this._resumeListenersAttached || typeof window === "undefined") return;
+    this._resumeListenersAttached = true;
+
+    const tryResumeNow = () => {
+      if (this.isConnected) return;
+      if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
+      log.info("Network/visibility resume signal — attempting immediate reconnect");
+      if (this._reconnectTimer) {
+        clearTimeout(this._reconnectTimer);
+        this._reconnectTimer = null;
+      }
+      this.reconnectAttempts = 0;
+      this.connect();
+    };
+
+    window.addEventListener("online", tryResumeNow);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") tryResumeNow();
+    });
+    window.addEventListener("focus", tryResumeNow);
   }
 
   /**
@@ -173,16 +206,25 @@ class ServerSyncService {
     // events for the useServerSyncEvents('annotation', ...) hook path
     this.on("annotation:created", (msg) => {
       log.info(`Annotation created on ${msg.fileId}`);
-      this._advanceWatermark(msg.syncEventId);
       this._recordSyncLatency("annotation-created", msg);
+      const { shouldSkip, shouldDefer } = this._checkSequenceGap(msg.syncEventId);
+      if (shouldSkip || shouldDefer) return;
+
       // Skip echo of our own creation - the creator already added it locally
       const myUserId = sessionManager.getUserId?.() || this._userId;
       if (msg.actorUserId && myUserId && msg.actorUserId === myUserId) {
         log.debug(`Skipping own annotation:created echo`);
+        this._advanceWatermark(msg.syncEventId); // already applied locally
         return;
       }
-      if (this.annotationManager) {
-        this.annotationManager.handleServerBroadcast("annotation:created", msg);
+      try {
+        if (this.annotationManager) {
+          this.annotationManager.handleServerBroadcast("annotation:created", msg);
+        }
+        this._advanceWatermark(msg.syncEventId);
+      } catch (err) {
+        log.warn(`Failed to apply annotation:created for ${msg.annotation?.id}: ${err.message}`);
+        return; // do NOT advance — the gap on the next event triggers back-fill
       }
       window.dispatchEvent(
         new CustomEvent("ws:annotation:created", { detail: msg })
@@ -190,10 +232,24 @@ class ServerSyncService {
     });
     this.on("annotation:updated", (msg) => {
       log.info(`Annotation updated: ${msg.annotation?.id}`);
-      this._advanceWatermark(msg.syncEventId);
       this._recordSyncLatency("annotation-updated", msg);
-      if (this.annotationManager) {
-        this.annotationManager.handleServerBroadcast("annotation:updated", msg);
+      const { shouldSkip, shouldDefer } = this._checkSequenceGap(msg.syncEventId);
+      if (shouldSkip || shouldDefer) return;
+
+      const myUserId = sessionManager.getUserId?.() || this._userId;
+      if (msg.actorUserId && myUserId && msg.actorUserId === myUserId) {
+        log.debug(`Skipping own annotation:updated echo`);
+        this._advanceWatermark(msg.syncEventId); // already applied locally
+        return;
+      }
+      try {
+        if (this.annotationManager) {
+          this.annotationManager.handleServerBroadcast("annotation:updated", msg);
+        }
+        this._advanceWatermark(msg.syncEventId);
+      } catch (err) {
+        log.warn(`Failed to apply annotation:updated for ${msg.annotation?.id}: ${err.message}`);
+        return; // do NOT advance — the gap on the next event triggers back-fill
       }
       window.dispatchEvent(
         new CustomEvent("ws:annotation:updated", { detail: msg })
@@ -201,10 +257,24 @@ class ServerSyncService {
     });
     this.on("annotation:deleted", (msg) => {
       log.info(`Annotation deleted: ${msg.annotationId}`);
-      this._advanceWatermark(msg.syncEventId);
       this._recordSyncLatency("annotation-deleted", msg);
-      if (this.annotationManager) {
-        this.annotationManager.handleServerBroadcast("annotation:deleted", msg);
+      const { shouldSkip, shouldDefer } = this._checkSequenceGap(msg.syncEventId);
+      if (shouldSkip || shouldDefer) return;
+
+      const myUserId = sessionManager.getUserId?.() || this._userId;
+      if (msg.actorUserId && myUserId && msg.actorUserId === myUserId) {
+        log.debug(`Skipping own annotation:deleted echo`);
+        this._advanceWatermark(msg.syncEventId); // already applied locally
+        return;
+      }
+      try {
+        if (this.annotationManager) {
+          this.annotationManager.handleServerBroadcast("annotation:deleted", msg);
+        }
+        this._advanceWatermark(msg.syncEventId);
+      } catch (err) {
+        log.warn(`Failed to apply annotation:deleted for ${msg.annotationId}: ${err.message}`);
+        return; // do NOT advance — the gap on the next event triggers back-fill
       }
       window.dispatchEvent(
         new CustomEvent("ws:annotation:deleted", { detail: msg })
@@ -237,9 +307,15 @@ class ServerSyncService {
     // View events - forward to ViewConfigurationManager
     this.on("view:created", (msg) => {
       log.info(`View created: ${msg.view?.name || msg.view?.id}`);
-      this._advanceWatermark(msg.syncEventId);
-      if (this.viewConfigurationManager) {
-        this.viewConfigurationManager.handleServerBroadcast("view:created", msg);
+      const { shouldSkip, shouldDefer } = this._checkSequenceGap(msg.syncEventId);
+      if (shouldSkip || shouldDefer) return;
+      try {
+        if (this.viewConfigurationManager) {
+          this.viewConfigurationManager.handleServerBroadcast("view:created", msg);
+        }
+        this._advanceWatermark(msg.syncEventId);
+      } catch (err) {
+        log.warn(`Failed to apply view:created for ${msg.view?.id}: ${err.message}`);
       }
     });
 
@@ -255,23 +331,9 @@ class ServerSyncService {
         return;
       }
 
-      if (msg.syncEventId) {
-        const incoming = parseInt(msg.syncEventId, 10);
-
-        // Case 1: duplicate or already-applied — skip silently
-        if (this._lastWatermark > 0 && incoming <= this._lastWatermark) {
-          log.debug(`Skipping already-applied view:updated event ${incoming} (watermark=${this._lastWatermark})`);
-          return;
-        }
-
-        // Case 2: gap of any size > 1 — schedule back-fill, defer this event
-        if (this._lastWatermark > 0 && incoming > this._lastWatermark + 1) {
-          log.warn(`Event gap detected (${this._lastWatermark} → ${incoming}); scheduling delta back-fill`);
-          this._scheduleDeltaFetch();
-          return; // event will be re-applied via back-fill
-        }
-
-        // Case 3: expected next event (incoming === lastWatermark + 1 or first event)
+      {
+        const { shouldSkip, shouldDefer } = this._checkSequenceGap(msg.syncEventId);
+        if (shouldSkip || shouldDefer) return; // deferred event is re-applied via back-fill
       }
 
       try {
@@ -287,9 +349,15 @@ class ServerSyncService {
 
     this.on("view:deleted", (msg) => {
       log.info(`View deleted: ${msg.viewId}`);
-      this._advanceWatermark(msg.syncEventId);
-      if (this.viewConfigurationManager) {
-        this.viewConfigurationManager.handleServerBroadcast("view:deleted", msg);
+      const { shouldSkip, shouldDefer } = this._checkSequenceGap(msg.syncEventId);
+      if (shouldSkip || shouldDefer) return;
+      try {
+        if (this.viewConfigurationManager) {
+          this.viewConfigurationManager.handleServerBroadcast("view:deleted", msg);
+        }
+        this._advanceWatermark(msg.syncEventId);
+      } catch (err) {
+        log.warn(`Failed to apply view:deleted for ${msg.viewId}: ${err.message}`);
       }
     });
 
@@ -603,15 +671,22 @@ class ServerSyncService {
     }
   }
 
+  /**
+   * Indefinite capped exponential backoff with jitter — never gives up.
+   * A permanent give-up (the old 5-attempt cap) meant a Quest that slept or
+   * lost Wi-Fi for longer than ~31s never resumed broadcasts without a page
+   * reload; the online/visibility/focus listeners above are the fast path,
+   * this is the fallback that keeps retrying even if none of those fire.
+   */
   _scheduleReconnect() {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      log.error("Max reconnect attempts reached");
-      return;
-    }
-    const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts);
+    const exp = Math.min(this.maxReconnectDelay, this.reconnectDelay * Math.pow(2, this.reconnectAttempts));
+    // 50%-100% of the computed delay, so many clients reconnecting after a
+    // shared outage don't all retry in lockstep (thundering herd).
+    const delay = exp * (0.5 + Math.random() * 0.5);
     this.reconnectAttempts++;
-    log.info(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
-    setTimeout(() => this.connect(), delay);
+    log.info(`Reconnecting in ${Math.round(delay)}ms (attempt ${this.reconnectAttempts})`);
+    if (this._reconnectTimer) clearTimeout(this._reconnectTimer);
+    this._reconnectTimer = setTimeout(() => this.connect(), delay);
   }
 
   // ============================================================================
@@ -662,6 +737,32 @@ class ServerSyncService {
   }
 
   /**
+   * Sequence-gap check shared by every event type that carries a
+   * `syncEventId` — was only inlined in the `view:updated` handler before,
+   * so every other event type (annotations, view:created/deleted) had no
+   * gap detection at all and would silently miss events on message loss.
+   * @param {string|number|null|undefined} syncEventId
+   * @returns {{shouldSkip: boolean, shouldDefer: boolean}} shouldSkip: duplicate/
+   *   already-applied, caller should return without applying. shouldDefer: a
+   *   gap was detected and a back-fill was scheduled — caller should return
+   *   without applying; the back-fill re-applies this event's data itself.
+   */
+  _checkSequenceGap(syncEventId) {
+    if (!syncEventId) return { shouldSkip: false, shouldDefer: false };
+    const incoming = parseInt(syncEventId, 10);
+    if (this._lastWatermark > 0 && incoming <= this._lastWatermark) {
+      log.debug(`Skipping already-applied event ${incoming} (watermark=${this._lastWatermark})`);
+      return { shouldSkip: true, shouldDefer: false };
+    }
+    if (this._lastWatermark > 0 && incoming > this._lastWatermark + 1) {
+      log.warn(`Event gap detected (${this._lastWatermark} → ${incoming}); scheduling delta back-fill`);
+      this._scheduleDeltaFetch();
+      return { shouldSkip: false, shouldDefer: true };
+    }
+    return { shouldSkip: false, shouldDefer: false };
+  }
+
+  /**
    * Debounced entry point for triggering a delta back-fill.
    * Multiple calls within DELTA_BACKFILL_DEBOUNCE_MS collapse into one fetch.
    */
@@ -696,7 +797,7 @@ class ServerSyncService {
         }
         const { lastAppliedEventId } = await applyDeltaEvents(
           delta.events || [],
-          { viewConfigurationManager: this.viewConfigurationManager },
+          { viewConfigurationManager: this.viewConfigurationManager, annotationManager: this.annotationManager },
           this._userId
         );
         if (lastAppliedEventId != null && lastAppliedEventId > this._lastWatermark) {

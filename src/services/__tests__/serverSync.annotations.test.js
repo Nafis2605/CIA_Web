@@ -30,8 +30,13 @@ vi.mock("@UI/react/store/toastStore.js", () => ({
   toast: { info: vi.fn(), error: vi.fn(), success: vi.fn() },
 }));
 
+const mockApplyDeltaEvents = vi.fn().mockResolvedValue({ lastAppliedEventId: null });
+const mockFetchDeltaSince = vi.fn().mockResolvedValue({ events: [] });
+const mockSaveSyncWatermark = vi.fn();
 vi.mock("@Services/syncService.js", () => ({
-  saveSyncWatermark: vi.fn(),
+  saveSyncWatermark: (...a) => mockSaveSyncWatermark(...a),
+  fetchDeltaSince: (...a) => mockFetchDeltaSince(...a),
+  applyDeltaEvents: (...a) => mockApplyDeltaEvents(...a),
 }));
 
 import { serverSync } from "../serverSync.js";
@@ -47,6 +52,16 @@ describe("serverSync annotation/filter broadcast wiring", () => {
     annotationManager = { handleServerBroadcast: vi.fn() };
     serverSync.setAnnotationManager(annotationManager);
     serverSync._setupDefaultHandlers();
+    serverSync.setWorkspaceId("workspace-1");
+    serverSync._lastWatermark = 0;
+    serverSync._deltaFetchPending = false;
+    if (serverSync._deltaFetchTimer) {
+      clearTimeout(serverSync._deltaFetchTimer);
+      serverSync._deltaFetchTimer = null;
+    }
+    mockSaveSyncWatermark.mockClear();
+    mockApplyDeltaEvents.mockClear();
+    mockFetchDeltaSince.mockClear();
   });
 
   test("annotation:created forwards to AnnotationManager and dispatches ws event", () => {
@@ -130,5 +145,80 @@ describe("serverSync annotation/filter broadcast wiring", () => {
         annotation: { id: "ann-4" },
       })
     ).not.toThrow();
+  });
+
+  // H9: watermark ordering — must advance only after a successful apply, so a
+  // failed/skipped apply doesn't mask a real gap on the next event.
+  describe("watermark ordering on apply failure", () => {
+    test.each([
+      ["annotation:created", { fileId: "file-1", annotation: { id: "ann-fail" }, actorUserId: "user-other" }],
+      ["annotation:updated", { fileId: "file-1", annotation: { id: "ann-fail" } }],
+      ["annotation:deleted", { fileId: "file-1", annotationId: "ann-fail" }],
+    ])("%s: does not advance the watermark when handleServerBroadcast throws", (type, base) => {
+      annotationManager.handleServerBroadcast.mockImplementation(() => {
+        throw new Error("apply failed");
+      });
+
+      deliver({ type, syncEventId: "1", ...base });
+
+      expect(mockSaveSyncWatermark).not.toHaveBeenCalled();
+    });
+  });
+
+  test("own-echo annotation:updated skips apply but still advances the watermark", () => {
+    deliver({
+      type: "annotation:updated",
+      fileId: "file-1",
+      annotation: { id: "ann-5" },
+      actorUserId: "user-me",
+      syncEventId: "2",
+    });
+
+    expect(annotationManager.handleServerBroadcast).not.toHaveBeenCalled();
+    expect(mockSaveSyncWatermark).toHaveBeenCalledWith("workspace-1", 2, null);
+  });
+
+  test("own-echo annotation:deleted skips apply but still advances the watermark", () => {
+    deliver({
+      type: "annotation:deleted",
+      fileId: "file-1",
+      annotationId: "ann-6",
+      actorUserId: "user-me",
+      syncEventId: "3",
+    });
+
+    expect(annotationManager.handleServerBroadcast).not.toHaveBeenCalled();
+    expect(mockSaveSyncWatermark).toHaveBeenCalledWith("workspace-1", 3, null);
+  });
+
+  test("a syncEventId gap defers apply and schedules a delta back-fill", async () => {
+    vi.useFakeTimers();
+    try {
+      // Prime the watermark at 1.
+      deliver({ type: "annotation:created", fileId: "file-1", annotation: { id: "ann-7" }, actorUserId: "user-other", syncEventId: "1" });
+      annotationManager.handleServerBroadcast.mockClear();
+
+      // Jump straight to 5 — a gap.
+      deliver({ type: "annotation:created", fileId: "file-1", annotation: { id: "ann-8" }, actorUserId: "user-other", syncEventId: "5" });
+
+      expect(annotationManager.handleServerBroadcast).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(600); // past DELTA_BACKFILL_DEBOUNCE_MS, flushing the dynamic import
+      expect(mockFetchDeltaSince).toHaveBeenCalledWith("workspace-1", 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("_triggerDeltaFetch passes annotationManager into applyDeltaEvents", async () => {
+    serverSync._lastWatermark = 1;
+    serverSync._triggerDeltaFetch();
+    await vi.waitFor(() => expect(mockApplyDeltaEvents).toHaveBeenCalled());
+
+    expect(mockApplyDeltaEvents).toHaveBeenCalledWith(
+      [],
+      expect.objectContaining({ annotationManager }),
+      null
+    );
   });
 });

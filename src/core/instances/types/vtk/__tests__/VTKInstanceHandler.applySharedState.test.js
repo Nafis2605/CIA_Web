@@ -106,16 +106,44 @@ describe("VTKInstanceHandler.applySharedState — new visualization branches", (
     expect(setWindowLevel).toHaveBeenCalledWith("inst-1", 400, 40);
   });
 
-  it("sets _isApplyingRemoteState during application and clears it after", async () => {
+  it("sets the per-instance remote-state flag during application and clears it after", async () => {
     let sawFlagSet = false;
     vi.spyOn(instanceTools, "setPointSize").mockImplementation(() => {
-      sawFlagSet = handler._isApplyingRemoteState === true;
+      sawFlagSet = handler._isApplyingRemoteStateFor("inst-1") === true;
     });
 
     await handler.applySharedState(instanceData, { visualization: { pointSize: 4 } }, "remote-user");
 
     expect(sawFlagSet).toBe(true);
-    expect(handler._isApplyingRemoteState).toBe(false);
+    expect(handler._isApplyingRemoteStateFor("inst-1")).toBe(false);
+  });
+
+  it("applying remote state to one instance does not suppress a concurrent local sync on another instance (H11)", async () => {
+    const instanceB = makeInstanceData("inst-2");
+    let sawInstanceBFlagDuringA = null;
+    vi.spyOn(instanceTools, "setPointSize").mockImplementation(() => {
+      sawInstanceBFlagDuringA = handler._isApplyingRemoteStateFor("inst-2");
+    });
+
+    await handler.applySharedState(instanceData, { visualization: { pointSize: 4 } }, "remote-user");
+
+    expect(sawInstanceBFlagDuringA).toBe(false);
+    expect(handler._isApplyingRemoteStateFor("inst-2")).toBe(false);
+    // instanceB itself was never touched — just asserting the shared-counter
+    // guard didn't leak across instances.
+    expect(instanceB.instanceId).toBe("inst-2");
+  });
+
+  it("nested begin/end calls for the same instance require a matching end before the guard clears (H11 overlapping applies)", () => {
+    handler._beginApplyingRemoteState("inst-1");
+    handler._beginApplyingRemoteState("inst-1");
+    expect(handler._isApplyingRemoteStateFor("inst-1")).toBe(true);
+
+    handler._endApplyingRemoteState("inst-1");
+    expect(handler._isApplyingRemoteStateFor("inst-1")).toBe(true);
+
+    handler._endApplyingRemoteState("inst-1");
+    expect(handler._isApplyingRemoteStateFor("inst-1")).toBe(false);
   });
 
   describe("widget toggle diffing", () => {

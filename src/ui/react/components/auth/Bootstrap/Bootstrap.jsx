@@ -6,6 +6,7 @@ import { Icon } from "@UI/react/components/atoms/Icon";
 import { auth as log } from "@Utils/logger.js";
 import { hasUserName, getUserName, setUserName, getUserId } from "@Collaboration/presence/userManagement.js";
 import { initializePhase2, PHASE2_STEPS } from "@Init/appInitializer.js";
+import { teardownAllObservers } from "@Collaboration/yjs/yjsObservers.js";
 import { sessionManager } from "@Core/session/sessionManager.js";
 import { authService } from "@Services/authService.js";
 import { apiClient } from "@Services/apiClient.js";
@@ -76,6 +77,14 @@ export function Bootstrap() {
         if (window.hideLoadingScreen) {
             window.hideLoadingScreen();
         }
+
+        // Defensive: Bootstrap doesn't currently unmount/re-run during normal
+        // operation, but tear down Y.js observers on unmount anyway so a
+        // future remount (or a test mounting/unmounting Bootstrap) can't
+        // leave a stale set of .observe() registrations behind.
+        return () => {
+            teardownAllObservers();
+        };
     }, []);
 
     async function checkPrerequisites() {

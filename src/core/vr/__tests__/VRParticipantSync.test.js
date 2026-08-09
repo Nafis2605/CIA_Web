@@ -8,7 +8,7 @@ vi.mock("@Utils/logger.js", () => {
   return { vr: mkLog(), app: mkLog(), sync: mkLog(), view: mkLog(), createLogger: () => mkLog() };
 });
 
-const { mockYMaps } = vi.hoisted(() => ({ mockYMaps: new Map() }));
+const { mockYMaps, mockYArrays } = vi.hoisted(() => ({ mockYMaps: new Map(), mockYArrays: new Map() }));
 vi.mock("@Collaboration/yjs/yjsSetup.js", () => ({
   ydoc: {
     getMap: (name) => {
@@ -25,6 +25,19 @@ vi.mock("@Collaboration/yjs/yjsSetup.js", () => ({
         });
       }
       return mockYMaps.get(name);
+    },
+    getArray: (name) => {
+      if (!mockYArrays.has(name)) {
+        const items = [];
+        mockYArrays.set(name, {
+          _items: items,
+          toArray: () => items.slice(),
+          push: (values) => items.push(...values),
+          observe: vi.fn(),
+          unobserve: vi.fn(),
+        });
+      }
+      return mockYArrays.get(name);
     },
   },
 }));
@@ -105,6 +118,7 @@ describe("VRParticipantSync", () => {
 
   beforeEach(() => {
     mockYMaps.clear();
+    mockYArrays.clear();
     session = makeSession();
     sync = new VRParticipantSync(session);
     sync.start();

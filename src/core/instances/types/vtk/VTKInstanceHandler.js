@@ -40,11 +40,12 @@ import { vtkCleanPolyDataFeature } from "@VTK/features/VTKCleanPolyDataFeature";
 import { vtkOrientationWidget, ORIENTATION_STYLES } from "@VTK/widgets/orientation/VTKOrientationWidget";
 import { vtkInstanceCursors } from "@VTK/collaboration/VTKInstanceCursors.js";
 import { getViewConfigurationManager } from "@Init/appInitializer.js";
+import { syncManipulatorToYjs } from "@Collaboration/yjs/yjsSetup.js";
 import {
-  syncCameraToYjs,
-  syncManipulatorToYjs,
-} from "@Collaboration/yjs/yjsSetup.js";
-import { pushSharedVisualizationUpdate } from "@Services/visualizationSyncService.js";
+  pushSharedVisualizationUpdate,
+  pushSharedCameraUpdate,
+  flushSharedCameraUpdate,
+} from "@Services/visualizationSyncService.js";
 import { getUserId, getUserName } from "@Collaboration/presence/userManagement.js";
 import { resolveViewSyncKey } from "@Core/instances/viewSyncKey.js";
 import { metricsService } from "@Services/metrics/metricsService.js";
@@ -131,7 +132,12 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
     super();
     this.instances = new Map(); // instanceId -> instance data
     this.reductionFeature = new VTKReductionFeature();
-    this._isApplyingRemoteState = false;
+    // Per-instanceId in-flight-apply counter, not a single shared boolean —
+    // this handler manages every open VTK view, so a shared flag would let
+    // applying remote state to view A suppress legitimate local events on
+    // view B, and a boolean can't represent two overlapping applies to the
+    // SAME view without the first one's cleanup clearing the guard early.
+    this._applyingRemoteStateCounts = new Map(); // instanceId -> in-flight apply count
 
     // ===========================================================================
     // RENDER INSTRUMENTATION (dev only)
@@ -144,6 +150,33 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
     // Start render reporting interval in dev mode
     if (process.env.NODE_ENV === "development") {
       setInterval(() => this._reportRenderStats(), 1000);
+    }
+  }
+
+  /**
+   * Whether a remote-state apply is currently in flight for this instance.
+   * Guards local-change sync handlers (camera.onModified, tools-menu
+   * setters) so they don't echo a remote update back out as if it were a
+   * local edit.
+   */
+  _isApplyingRemoteStateFor(instanceId) {
+    return (this._applyingRemoteStateCounts.get(instanceId) || 0) > 0;
+  }
+
+  /** Pair with `_endApplyingRemoteState` in a try/finally. Nestable. */
+  _beginApplyingRemoteState(instanceId) {
+    this._applyingRemoteStateCounts.set(
+      instanceId,
+      (this._applyingRemoteStateCounts.get(instanceId) || 0) + 1
+    );
+  }
+
+  _endApplyingRemoteState(instanceId) {
+    const next = (this._applyingRemoteStateCounts.get(instanceId) || 0) - 1;
+    if (next <= 0) {
+      this._applyingRemoteStateCounts.delete(instanceId);
+    } else {
+      this._applyingRemoteStateCounts.set(instanceId, next);
     }
   }
 
@@ -941,7 +974,7 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
 
     // CRITICAL: Prevent Y.js sync during initial camera setup
     // Without this, resetCamera() broadcasts default position to all users
-    this._isApplyingRemoteState = true;
+    this._beginApplyingRemoteState(instanceId);
 
     try {
       // Reset camera to frame the data (default position)
@@ -988,7 +1021,7 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
       this._storeInitialCameraState(instanceData);
     } finally {
       // Re-enable Y.js sync after initial setup is complete
-      this._isApplyingRemoteState = false;
+      this._endApplyingRemoteState(instanceId);
     }
 
     // DR2.5: Restore durable time-series position from ViewConfiguration.
@@ -2832,7 +2865,7 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
       // colormap/activeArray/opacity already do.
       const syncGlyph = () => {
         this._emitToolsUpdate(instanceId);
-        if (!this._isApplyingRemoteState) {
+        if (!this._isApplyingRemoteStateFor(instanceId)) {
           this._syncVizPatch(instanceId, {
             glyph: vtkGlyphFeature.getConfigForSync(instanceId),
           });
@@ -3002,7 +3035,7 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
       // and persists into the view configuration the same way glyph/threshold do.
       const syncSlicePlane = () => {
         this._emitToolsUpdate(instanceId);
-        if (!this._isApplyingRemoteState) {
+        if (!this._isApplyingRemoteStateFor(instanceId)) {
           this._syncVizPatch(instanceId, {
             slicePlane: vtkSliceFeature.getConfigForSync(instanceId),
           });
@@ -3099,7 +3132,7 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
       // persists into the view configuration the same way glyph/threshold do.
       const syncClipBox = () => {
         this._emitToolsUpdate(instanceId);
-        if (!this._isApplyingRemoteState) {
+        if (!this._isApplyingRemoteStateFor(instanceId)) {
           this._syncVizPatch(instanceId, {
             clipBox: vtkClippingFeature.getConfigForSync(instanceId),
           });
@@ -3150,7 +3183,7 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
       // same way glyph/colormap/opacity do (declarative params only).
       const syncThreshold = () => {
         this._emitToolsUpdate(instanceId);
-        if (!this._isApplyingRemoteState) {
+        if (!this._isApplyingRemoteStateFor(instanceId)) {
           this._syncVizPatch(instanceId, {
             threshold: vtkThresholdFeature.getConfigForSync(instanceId),
           });
@@ -3400,7 +3433,7 @@ console.log('Tools:', tools);
    */
   _syncVizPatch(instanceId, patch) {
     // Applying a patch we just received must not echo it back out.
-    if (this._isApplyingRemoteState) return;
+    if (this._isApplyingRemoteStateFor(instanceId)) return;
 
     const instance = this.instances.get(instanceId);
     const vId = instance?.viewConfigId;
@@ -4258,7 +4291,7 @@ console.log('Tools:', tools);
     }
 
     // Set flag to prevent sync loops
-    this._isApplyingRemoteState = true;
+    this._beginApplyingRemoteState(instanceData.instanceId);
 
     // Sync-latency instrumentation (send → apply). `state.visualization._syncOriginTs`
     // is stamped by _syncVizPatch at send time on the originating client (VR
@@ -4505,7 +4538,7 @@ console.log('Tools:', tools);
       log.error("Failed to apply remote state:", error);
     } finally {
       // Always clear the flag, even if there was an error
-      this._isApplyingRemoteState = false;
+      this._endApplyingRemoteState(instanceData.instanceId);
     }
   }
 
@@ -4527,7 +4560,7 @@ console.log('Tools:', tools);
       return;
     }
 
-    this._isApplyingRemoteState = true;
+    this._beginApplyingRemoteState(instanceId);
 
     try {
       const camera = instanceData.sceneObjects.camera;
@@ -4546,7 +4579,7 @@ console.log('Tools:', tools);
 
       log.debug(`Applied camera state to instance ${instanceId}`);
     } finally {
-      this._isApplyingRemoteState = false;
+      this._endApplyingRemoteState(instanceId);
     }
   }
 
@@ -5579,7 +5612,7 @@ console.log('Tools:', tools);
           vrExplorationManager.isExploring() &&
           vrExplorationManager.getActiveContext()?.instance?.instanceId === instanceData.instanceId;
 
-        if (!isVRDrivingThisCamera && !this._isApplyingRemoteState && instanceData.viewConfigId) {
+        if (!isVRDrivingThisCamera && !this._isApplyingRemoteStateFor(instanceData.instanceId) && instanceData.viewConfigId) {
           const cameraState = {
             position: camera.getPosition(),
             focalPoint: camera.getFocalPoint(),
@@ -5589,17 +5622,19 @@ console.log('Tools:', tools);
             viewAngle: camera.getViewAngle(),
           };
 
-          // REAL-TIME: Sync to Y.js for immediate updates to other users
+          // Y.js (real-time) + throttled durable persist, permission-gated —
+          // same path the tools menu and VR camera pushes already use. Was
+          // previously a raw syncCameraToYjs() call on every tick, which
+          // bypassed both the throttle and the view:modify_configuration gate.
+          pushSharedCameraUpdate(
+            instanceData.viewConfigId,
+            cameraState,
+            resolveViewSyncKey(instanceData)
+          );
+
+          // Broadcast active manipulator; auto-clear after 1.5 s of inactivity
           const userId = getUserId();
           if (userId) {
-            syncCameraToYjs(
-              instanceData.viewConfigId,
-              userId,
-              cameraState,
-              resolveViewSyncKey(instanceData)
-            );
-
-            // Broadcast active manipulator; auto-clear after 1.5 s of inactivity
             syncManipulatorToYjs(userId, getUserName(), 'camera', 'manipulating');
             if (this._manipulatorClearTimer) clearTimeout(this._manipulatorClearTimer);
             this._manipulatorClearTimer = setTimeout(() => {
@@ -5607,16 +5642,10 @@ console.log('Tools:', tools);
               this._manipulatorClearTimer = null;
             }, 1500);
           }
-
-          // PERSISTENCE: Sync to server via ViewConfigurationManager (throttled)
-          getViewConfigurationManager()?.updateCamera(
-            instanceData.viewConfigId,
-            cameraState
-          );
         }
 
         // Only publish if we're not applying remote state
-        if (!this._isApplyingRemoteState && instanceData.stateAdapter) {
+        if (!this._isApplyingRemoteStateFor(instanceData.instanceId) && instanceData.stateAdapter) {
           const cameraState = {
             position: camera.getPosition(),
             focalPoint: camera.getFocalPoint(),
@@ -5662,8 +5691,14 @@ console.log('Tools:', tools);
     // When user stops interacting, publish the final state
     const publishStateAfterInteraction = () => {
       try {
+        // Deliver the gesture's final camera position immediately instead of
+        // leaving it on the throttle's trailing timer.
+        if (instanceData.viewConfigId) {
+          flushSharedCameraUpdate(instanceData.viewConfigId);
+        }
+
         // CRITICAL: Add the same defensive checks here
-        if (!this._isApplyingRemoteState && instanceData.stateAdapter) {
+        if (!this._isApplyingRemoteStateFor(instanceData.instanceId) && instanceData.stateAdapter) {
           // Get complete state and publish it
           const state = this._getCurrentVTKState(instanceData);
           instanceData.stateAdapter.updateState(state, "local");

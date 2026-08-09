@@ -34,8 +34,52 @@ const TRANSMITTED_ONLY = {
   transmitted: true,
   reason: "no-active-workspace",
 };
+// The workspace's role hasn't been fetched yet (as opposed to a role that HAS
+// been fetched and denies editing, which is plain NO_PERMISSION). The patch
+// was queued and will be replayed automatically once the role resolves.
+const PENDING_ROLE = { persisted: false, queued: true, reason: "role-pending" };
 
 const _roleFetchInFlight = new Set();
+
+// The first camera/visualization edit right after a workspace becomes active
+// can land while its role is still being fetched — resolveShareMode() must
+// answer synchronously, so it reports SHARE_BLOCKED for that window even
+// though the role may turn out to permit editing. Rather than drop that
+// edit, stash the latest patch per (workspaceId, kind) here and replay it
+// once the in-flight fetch resolves. Toggle edits (pushSharedWidgetToggle)
+// are deliberately not queued — replaying a stale toggle after the user may
+// have already re-toggled it locally would flip it the wrong way.
+const _pendingReplay = new Map(); // workspaceId -> { camera, visualization }
+
+function _queuePendingReplay(workspaceId, kind, viewId, patch, syncKey) {
+  let entry = _pendingReplay.get(workspaceId);
+  if (!entry) {
+    entry = { camera: null, visualization: null };
+    _pendingReplay.set(workspaceId, entry);
+  }
+  entry[kind] = { viewId, patch, syncKey };
+}
+
+function _replayPendingPatches(workspaceId) {
+  const entry = _pendingReplay.get(workspaceId);
+  if (!entry) return;
+  _pendingReplay.delete(workspaceId);
+
+  // Discard rather than resurrect an edit if the user has since switched
+  // away from the workspace it was queued for.
+  if (resolveActiveWorkspaceId() !== workspaceId) return;
+
+  if (entry.camera) {
+    pushSharedCameraUpdate(entry.camera.viewId, entry.camera.patch, entry.camera.syncKey);
+  }
+  if (entry.visualization) {
+    pushSharedVisualizationUpdate(
+      entry.visualization.viewId,
+      entry.visualization.patch,
+      entry.visualization.syncKey
+    );
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Ephemeral Y.js send throttling
@@ -66,7 +110,7 @@ function createViewPatchThrottle(sendFn, throttleMs = YJS_SEND_THROTTLE_MS) {
     if (e.userId) sendFn(viewId, e.userId, patch, e.syncKey);
   };
 
-  return (viewId, userId, patch, syncKey = null) => {
+  const send = (viewId, userId, patch, syncKey = null) => {
     let e = state.get(viewId);
     if (!e) {
       e = { lastSent: 0, timer: null, pending: null, userId, syncKey };
@@ -86,6 +130,13 @@ function createViewPatchThrottle(sendFn, throttleMs = YJS_SEND_THROTTLE_MS) {
       e.timer = setTimeout(() => flush(viewId), throttleMs - elapsed);
     }
   };
+
+  // Exposed so a caller that knows a gesture just ended (e.g. mouse-up after
+  // a camera drag) can deliver the last patch immediately instead of it
+  // sitting on the trailing timer for up to `throttleMs`.
+  send.flush = flush;
+
+  return send;
 }
 
 const _throttledCameraSend = createViewPatchThrottle(syncCameraToYjs);
@@ -143,6 +194,7 @@ export function resolveShareMode() {
     _roleFetchInFlight.add(workspaceId);
     permissionService
       .fetchWorkspaceRole(workspaceId)
+      .then(() => _replayPendingPatches(workspaceId))
       .finally(() => _roleFetchInFlight.delete(workspaceId));
   }
 
@@ -176,8 +228,17 @@ export function getPermissionDeniedReason() {
 export function pushSharedCameraUpdate(viewId, cameraPatch, syncKey = null) {
   if (!viewId) return NO_VIEW;
 
+  const workspaceId = resolveActiveWorkspaceId();
   const mode = resolveShareMode();
-  if (mode === SHARE_BLOCKED) return NO_PERMISSION;
+  if (mode === SHARE_BLOCKED) {
+    // Role not cached yet ⇒ still in flight, not a resolved denial — queue
+    // for replay instead of dropping this edit on the floor.
+    if (workspaceId && permissionService.getCachedRole(workspaceId) == null) {
+      _queuePendingReplay(workspaceId, "camera", viewId, cameraPatch, syncKey);
+      return PENDING_ROLE;
+    }
+    return NO_PERMISSION;
+  }
 
   const userId = getUserId();
   if (userId) _throttledCameraSend(viewId, userId, cameraPatch, syncKey);
@@ -186,6 +247,17 @@ export function pushSharedCameraUpdate(viewId, cameraPatch, syncKey = null) {
   getViewConfigurationManager()?.updateCamera(viewId, cameraPatch);
 
   return { persisted: true };
+}
+
+/**
+ * Force-deliver a view's pending throttled camera patch immediately, instead
+ * of waiting for the trailing timer. Call this when a drag/orbit gesture
+ * ends so the peer sees the final camera position without a throttle-window
+ * delay. No-op if nothing is pending for the view.
+ * @param {string} viewId
+ */
+export function flushSharedCameraUpdate(viewId) {
+  _throttledCameraSend.flush(viewId);
 }
 
 /**
@@ -201,8 +273,15 @@ export function pushSharedCameraUpdate(viewId, cameraPatch, syncKey = null) {
 export function pushSharedVisualizationUpdate(viewId, patch, syncKey = null) {
   if (!viewId) return NO_VIEW;
 
+  const workspaceId = resolveActiveWorkspaceId();
   const mode = resolveShareMode();
-  if (mode === SHARE_BLOCKED) return NO_PERMISSION;
+  if (mode === SHARE_BLOCKED) {
+    if (workspaceId && permissionService.getCachedRole(workspaceId) == null) {
+      _queuePendingReplay(workspaceId, "visualization", viewId, patch, syncKey);
+      return PENDING_ROLE;
+    }
+    return NO_PERMISSION;
+  }
 
   const userId = getUserId();
   if (userId) _throttledVizSend(viewId, userId, patch, syncKey);

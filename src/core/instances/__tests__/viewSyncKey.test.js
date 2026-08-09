@@ -40,6 +40,45 @@ describe("resolveViewSyncKey", () => {
     expect(resolveViewSyncKey(null)).toBeNull();
     expect(resolveViewSyncKey(undefined)).toBeNull();
   });
+
+  // REGRESSION: no options argument at all — the exact shape every existing
+  // call site (e.g. VRExplorationManager._resolveSessionKey) still uses —
+  // must be byte-identical to today's behavior.
+  test("default (no options) behavior is unchanged", () => {
+    const instance = {
+      viewConfigId: "view-a",
+      datasetId: "dataset-1",
+      instanceData: { dataset: { id: "dataset-1" } },
+    };
+    expect(resolveViewSyncKey(instance)).toBe("dataset-1");
+    expect(resolveViewSyncKey({ viewConfigId: "view-a" })).toBe("view-a");
+    expect(resolveViewSyncKey({})).toBeNull();
+  });
+});
+
+describe("resolveViewSyncKey with mode: 'view'", () => {
+  // H5: an additive per-view identity, distinct from both dataset id and
+  // viewConfigId, for callers that need isolation between two views of the
+  // SAME dataset instead of the default "same dataset, same room converges"
+  // behavior. No existing call site uses this yet.
+  test("returns collaborationViewId when present, ignoring dataset/viewConfigId", () => {
+    const instance = {
+      viewConfigId: "view-a",
+      datasetId: "dataset-1",
+      collaborationViewId: "cview-1",
+    };
+    expect(resolveViewSyncKey(instance, { mode: "view" })).toBe("cview-1");
+  });
+
+  test("reads collaborationViewId from instanceData too", () => {
+    const instance = { instanceData: { collaborationViewId: "cview-2" } };
+    expect(resolveViewSyncKey(instance, { mode: "view" })).toBe("cview-2");
+  });
+
+  test("does NOT fall back to dataset id or viewConfigId when absent", () => {
+    const instance = { viewConfigId: "view-a", datasetId: "dataset-1" };
+    expect(resolveViewSyncKey(instance, { mode: "view" })).toBeNull();
+  });
 });
 
 describe("instanceMatchesViewUpdate", () => {
@@ -82,5 +121,21 @@ describe("instanceMatchesViewUpdate", () => {
 
   test("never matches a missing instance", () => {
     expect(instanceMatchesViewUpdate(null, "view-1", "dataset-1")).toBe(false);
+  });
+});
+
+describe("instanceMatchesViewUpdate with mode: 'view'", () => {
+  test("matches on collaborationViewId, not the dataset-based syncKey", () => {
+    const localInstance = { viewConfigId: "view-local", collaborationViewId: "cview-1" };
+    expect(
+      instanceMatchesViewUpdate(localInstance, "view-remote", "cview-1", { mode: "view" })
+    ).toBe(true);
+  });
+
+  test("does not match on shared dataset id alone in view mode", () => {
+    const localInstance = { viewConfigId: "view-local", datasetId: "dataset-1" };
+    expect(
+      instanceMatchesViewUpdate(localInstance, "view-remote", "dataset-1", { mode: "view" })
+    ).toBe(false);
   });
 });

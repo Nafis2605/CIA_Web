@@ -3,7 +3,11 @@
  * @description WebSocket client for the CIA_Web Python VTK render server.
  *
  * Manages connection, session lifecycle, dataset loading, camera updates,
- * and frame streaming. Designed as a singleton — one shared connection per tab.
+ * and frame streaming. One instance = one WebSocket = one server-side render
+ * session (its own dataset + camera). The server already creates an
+ * independent RenderSession per connection, so each ServerRenderedViewport
+ * must own its own client instance — sharing one instance across viewports
+ * made them overwrite each other's in-flight requests and share one dataset.
  *
  * Protocol:
  *   Client → Server: loadDataset | cameraUpdate | setRepresentation | resetCamera | ping
@@ -14,6 +18,7 @@ import { config } from '@Core/config/clientConfig.js';
 
 const DEFAULT_WS_URL = '/render-ws';
 const PING_INTERVAL_MS = 30_000;
+const REQUEST_TIMEOUT_MS = 20_000;
 
 class RemoteRenderClient {
     constructor() {
@@ -64,8 +69,13 @@ class RemoteRenderClient {
         }
 
         this._connecting = true;
-        const wsUrl = config.renderWsUrl || DEFAULT_WS_URL;
-        console.log('[RenderServer] connecting to', wsUrl);
+        const baseWsUrl = config.renderWsUrl || DEFAULT_WS_URL;
+        // Browsers can't set custom headers on a WS handshake, so the access
+        // token (see H14) rides along as a query param instead.
+        const wsUrl = config.renderServerToken
+            ? `${baseWsUrl}?token=${encodeURIComponent(config.renderServerToken)}`
+            : baseWsUrl;
+        console.log('[RenderServer] connecting to', baseWsUrl);
 
         return new Promise((resolve, reject) => {
             try {
@@ -128,10 +138,7 @@ class RemoteRenderClient {
         console.log('[RenderServer] loading dataset:', { id: datasetId, path });
         console.log('[RenderServer] session:', this._sessionId);
 
-        return new Promise((resolve, reject) => {
-            this._pending.set('datasetLoaded', { resolve, reject });
-            this._send({ type: 'loadDataset', datasetId, path });
-        });
+        return this._sendAndAwait('datasetLoaded', { type: 'loadDataset', datasetId, path });
     }
 
     /**
@@ -141,10 +148,7 @@ class RemoteRenderClient {
      */
     async updateCamera(camera) {
         await this._ensureConnected();
-        return new Promise((resolve, reject) => {
-            this._pending.set('cameraFrame', { resolve, reject });
-            this._send({ type: 'cameraUpdate', camera });
-        });
+        return this._sendAndAwait('cameraFrame', { type: 'cameraUpdate', camera });
     }
 
     /**
@@ -153,10 +157,7 @@ class RemoteRenderClient {
      */
     async resetCamera() {
         await this._ensureConnected();
-        return new Promise((resolve, reject) => {
-            this._pending.set('resetFrame', { resolve, reject });
-            this._send({ type: 'resetCamera' });
-        });
+        return this._sendAndAwait('resetFrame', { type: 'resetCamera' });
     }
 
     /**
@@ -205,6 +206,30 @@ class RemoteRenderClient {
         }
         this._ws.send(JSON.stringify(msg));
         console.log('[RenderServer] sent:', msg.type);
+    }
+
+    /**
+     * Send a message and await its response, keyed by response type in
+     * `_pending`. Rejects if no response arrives within `timeoutMs`, or
+     * immediately if the connection drops first (see `_onDisconnect`).
+     * @param {string} pendingKey - response `type` this call is waiting for
+     * @param {object} message    - sent as-is via `_send`
+     */
+    _sendAndAwait(pendingKey, message, timeoutMs = REQUEST_TIMEOUT_MS) {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                if (this._pending.get(pendingKey)) {
+                    this._pending.delete(pendingKey);
+                    reject(new Error(`Render server request timed out: ${pendingKey}`));
+                }
+            }, timeoutMs);
+
+            this._pending.set(pendingKey, {
+                resolve: (value) => { clearTimeout(timer); resolve(value); },
+                reject: (err) => { clearTimeout(timer); reject(err); },
+            });
+            this._send(message);
+        });
     }
 
     _handleMessage(raw) {
@@ -305,6 +330,16 @@ class RemoteRenderClient {
         this._connecting = false;
         this._sessionId = null;
         this._stopPing();
+
+        // Nothing left waiting on this connection will ever hear back —
+        // reject rather than leave callers hanging forever.
+        const err = new Error('Render server connection closed');
+        for (const [, r] of this._pending) r.reject(err);
+        this._pending.clear();
+        this._pendingMeta = null;
+
+        this._connectWaiters.forEach(w => w.reject(err));
+        this._connectWaiters = [];
     }
 
     _startPing() {
@@ -322,6 +357,6 @@ class RemoteRenderClient {
     }
 }
 
-/** Singleton — one shared connection per browser tab. */
-export const remoteRenderClient = new RemoteRenderClient();
-export default remoteRenderClient;
+/** One instance per viewport — see the file header for why. */
+export { RemoteRenderClient };
+export default RemoteRenderClient;

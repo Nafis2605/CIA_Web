@@ -268,6 +268,9 @@ module.exports = {
       __RENDER_WS_URL__: JSON.stringify(
         process.env.RENDER_WS_URL || "/render-ws"
       ),
+      __RENDER_SERVER_TOKEN__: JSON.stringify(
+        process.env.RENDER_SERVER_TOKEN || ""
+      ),
     }),
   ],
   // Ignore controller.html

@@ -131,11 +131,14 @@ router.get("/:id", async (req, res, next) => {
 // desktop useAnnotations hook both do) — without resolving broadcast targets
 // from file_project_access the way DELETE already does, those annotations are
 // created but never broadcast, and only show up for other users on refetch.
-async function resolveBroadcastProjects(pool, fileId, bodyProjectId) {
+//
+// Deliberately does NOT seed the result with a caller-supplied projectId
+// (H15): that value is never validated, so trusting it here would let an
+// otherwise-legitimate creator smuggle in an unrelated project and leak the
+// new annotation to that project's members. Broadcast targets come from
+// file_project_access alone, same as DELETE already does.
+async function resolveBroadcastProjects(pool, fileId) {
   const projectIds = new Set();
-  if (bodyProjectId) {
-    projectIds.add(bodyProjectId);
-  }
   try {
     const result = await pool.query(
       "SELECT project_id FROM file_project_access WHERE file_id = $1",
@@ -147,11 +150,50 @@ async function resolveBroadcastProjects(pool, fileId, bodyProjectId) {
       }
     }
   } catch (err) {
-    // Non-fatal: the annotation is already committed. Worst case we fall back
-    // to broadcasting only to the caller-supplied projectId (today's behavior).
+    // Non-fatal: the annotation is already committed. Worst case it just
+    // doesn't broadcast until the next refetch.
     log.warn("resolveBroadcastProjects: file_project_access lookup failed", err);
   }
   return projectIds;
+}
+
+/**
+ * Whether `userId` may create annotations on `fileId`. Never trusts a
+ * client-supplied projectId (which can be omitted or spoofed — see H15).
+ * Authorization is derived from the file's OWN project associations
+ * (file_project_access, the same source resolveBroadcastProjects reads) —
+ * membership (or public-project access, via checkProjectAccess) in ANY of
+ * them grants access. A file with no project association at all falls back
+ * to ownership/public-dataset access, matching the same rule files.js's own
+ * listing query already uses (uploaded_by = user OR public_path).
+ * Returns null if the file doesn't exist/isn't active, so callers can tell
+ * "not found" apart from "not authorized".
+ */
+async function authorizeAnnotationCreate(pool, fileId, userId) {
+  const fileResult = await pool.query(
+    "SELECT id, organization_id, uploaded_by, public_path FROM datasets WHERE id = $1 AND status = 'active'",
+    [fileId]
+  );
+  const file = fileResult.rows[0];
+  if (!file) return null;
+
+  const projectRows = await pool.query(
+    "SELECT project_id FROM file_project_access WHERE file_id = $1",
+    [fileId]
+  );
+
+  let authorized = false;
+  if (projectRows.rows.length === 0) {
+    authorized = file.public_path != null || file.uploaded_by === userId;
+  } else {
+    for (const { project_id } of projectRows.rows) {
+      if (await checkProjectAccess(pool, project_id, userId)) {
+        authorized = true;
+        break;
+      }
+    }
+  }
+  return { file, authorized };
 }
 
 /**
@@ -184,25 +226,18 @@ router.post("/", async (req, res, next) => {
       });
     }
 
-    // If scoped to a project, verify caller is a member
-    if (projectId) {
-      const memberRole = await checkProjectAccess(pool, projectId, user?.id);
-      if (!memberRole) {
-        return res.status(403).json({ error: "Not a member of this project" });
-      }
-    }
-
-    // Verify file exists
-    const fileCheck = await pool.query(
-      "SELECT id, organization_id FROM datasets WHERE id = $1 AND status = 'active'",
-      [fileId]
-    );
-
-    if (fileCheck.rows.length === 0) {
+    // Verify the file exists AND that the caller may annotate it — derived
+    // server-side from the file's real project ownership, never from the
+    // (omittable, spoofable) request body projectId (see H15).
+    const auth = await authorizeAnnotationCreate(pool, fileId, user?.id);
+    if (!auth) {
       return res.status(404).json({ error: "File not found" });
     }
+    if (!auth.authorized) {
+      return res.status(403).json({ error: "Not authorized to annotate this file" });
+    }
 
-    const orgId = fileCheck.rows[0].organization_id;
+    const orgId = auth.file.organization_id;
 
     // Get current file version if not specified
     let fileVersionId = req.body.fileVersionId;
@@ -290,8 +325,11 @@ router.post("/", async (req, res, next) => {
     // omitted (VR path, desktop useAnnotations hook), so we can't rely on it
     // alone to know who to tell. Must run on pool (not client) after release,
     // so a lookup failure can never roll back the already-committed insert.
-    const broadcastProjectIds = await resolveBroadcastProjects(pool, fileId, projectId);
-    const auditProjectId = projectId || [...broadcastProjectIds][0] || null;
+    const broadcastProjectIds = await resolveBroadcastProjects(pool, fileId);
+    // Server-derived project first — the request body's projectId is never
+    // trusted for this (see H15); only used as a last-resort audit label
+    // when the file has no project association at all to derive from.
+    const auditProjectId = [...broadcastProjectIds][0] || projectId || null;
 
     // Audit log
     if (req.audit) {
@@ -573,6 +611,7 @@ router.delete("/:id", async (req, res, next) => {
     }
 
     // Soft delete + sync event in one transaction so delta hydration sees deletes
+    let syncEvent = null;
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -592,7 +631,7 @@ router.delete("/:id", async (req, res, next) => {
         workspaceId = ws.rows[0]?.id || null;
       } catch (_) { /* non-fatal */ }
 
-      await writeSyncEvent(client, {
+      syncEvent = await writeSyncEvent(client, {
         workspaceId,
         entityType: "annotation",
         entityId: id,
@@ -632,7 +671,7 @@ router.delete("/:id", async (req, res, next) => {
       );
 
       for (const row of projects.rows) {
-        wsManager.annotationDeleted(row.project_id, annotation.dataset_id, id);
+        wsManager.annotationDeleted(row.project_id, annotation.dataset_id, id, syncEvent?.id, user?.id);
       }
     }
 
@@ -664,18 +703,13 @@ router.post("/batch", async (req, res, next) => {
         .json({ error: "Maximum 100 annotations per batch" });
     }
 
-    // If scoped to a project, verify caller is a member
-    if (projectId) {
-      const memberRole = await checkProjectAccess(pool, projectId, user?.id);
-      if (!memberRole) {
-        client.release();
-        return res.status(403).json({ error: "Not a member of this project" });
-      }
-    }
-
     await client.query("BEGIN");
 
     const created = [];
+    // Per-file authorization cache — a batch can span multiple files, and
+    // each one is checked independently server-side, never relying on the
+    // shared top-level projectId (which the caller can omit — see H15).
+    const fileAuthCache = new Map(); // fileId -> boolean
 
     for (const ann of annotations) {
       const {
@@ -693,6 +727,14 @@ router.post("/batch", async (req, res, next) => {
 
       if (!fileId || !type || !coordinates) {
         continue; // Skip invalid annotations
+      }
+
+      if (!fileAuthCache.has(fileId)) {
+        const auth = await authorizeAnnotationCreate(pool, fileId, user?.id);
+        fileAuthCache.set(fileId, !!auth?.authorized);
+      }
+      if (!fileAuthCache.get(fileId)) {
+        continue; // Skip: not authorized to annotate this file
       }
 
       const result = await client.query(
@@ -744,7 +786,7 @@ router.post("/batch", async (req, res, next) => {
       for (const annotation of created) {
         const fid = annotation.dataset_id;
         if (!projectIdsByFile.has(fid)) {
-          projectIdsByFile.set(fid, await resolveBroadcastProjects(pool, fid, projectId));
+          projectIdsByFile.set(fid, await resolveBroadcastProjects(pool, fid));
         }
         for (const pid of projectIdsByFile.get(fid)) {
           wsManager.annotationCreated(pid, fid, annotation);
