@@ -16,6 +16,7 @@
 
 import remoteRenderClient from '@Services/RemoteRenderClient.js';
 import { config } from '@Core/config/clientConfig.js';
+import { fetchRenderTokenHeader } from '@Services/renderTokenClient.js';
 
 /** How long to wait for a server health check before falling back (ms). */
 const SERVER_PROBE_TIMEOUT_MS = 3000;
@@ -57,7 +58,7 @@ export async function fetchServerDatasets() {
 
     try {
         const resp = await fetch(`${serverUrl}/datasets`, {
-            headers: config.renderServerToken ? { 'X-Render-Token': config.renderServerToken } : undefined,
+            headers: await fetchRenderTokenHeader(),
         });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const datasets = await resp.json();

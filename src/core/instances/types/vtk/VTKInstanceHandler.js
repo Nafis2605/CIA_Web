@@ -96,6 +96,9 @@ import vtkConeSource from "@kitware/vtk.js/Filters/Sources/ConeSource";
 import vtkCubeSource from "@kitware/vtk.js/Filters/Sources/CubeSource";
 import vtkCylinderSource from "@kitware/vtk.js/Filters/Sources/CylinderSource";
 import vtkCellPicker from "@kitware/vtk.js/Rendering/Core/CellPicker";
+import vtkPointPicker from "@kitware/vtk.js/Rendering/Core/PointPicker";
+import vtkPointLocator from "@kitware/vtk.js/Common/DataModel/PointLocator";
+import vtkMatrixBuilder from "@kitware/vtk.js/Common/Core/MatrixBuilder";
 import "@kitware/vtk.js/Rendering/Profiles/Geometry";
 
 // Ensure zip access is registered even when tree-shaken builds drop side effects.
@@ -2858,7 +2861,8 @@ export class VTKInstanceHandler extends InstanceTypeHandler {
       tools.push({ type: "separator" });
 
       const { vectorArrays = [], scalarArrays = [], enabled: glyphEnabled } = glyphState;
-      const featureAvailable = isGlyphFeatureAvailable(vectorArrays, scalarArrays);
+      const hasPoints = (instanceData.polydata?.getNumberOfPoints?.() ?? 0) > 0;
+      const featureAvailable = isGlyphFeatureAvailable(vectorArrays, scalarArrays, hasPoints);
       const disabledGlyphTypes = getDisabledGlyphTypes(vectorArrays);
 
       // Shared helper so every glyph mutation syncs to collaborators the same way
@@ -4993,6 +4997,26 @@ console.log('Tools:', tools);
       dataActor.setUserMatrix(vrContext.originalActorUserMatrix);
     }
 
+    // Derived (glyph/threshold/isosurface) actors have no "original" matrix
+    // snapshot to restore — they're recreated fresh (no UserMatrix) whenever
+    // a feature is (re)enabled — so any yaw applied to them during VR
+    // (_applyVRDataRotation) is reset to identity rather than restored.
+    const IDENTITY_MATRIX_4X4 = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+    for (const derivedActor of this._getInstanceActors(vrContext)) {
+      if (derivedActor !== dataActor && typeof derivedActor?.setUserMatrix === "function") {
+        derivedActor.setUserMatrix(IDENTITY_MATRIX_4X4);
+      }
+    }
+
+    // Dispose any cached VR point locators (see probeDataVR) so they don't
+    // outlive the session or hold a stale polydata reference.
+    if (vrContext._vrPointLocators) {
+      for (const entry of vrContext._vrPointLocators.values()) {
+        entry?.locator?.delete?.();
+      }
+      vrContext._vrPointLocators = null;
+    }
+
     // Clean up controller visuals
     this._cleanupVRExplorationControllers(vrContext);
 
@@ -5002,6 +5026,10 @@ console.log('Tools:', tools);
     // release, not a required one (the picker itself holds no GL resources).
     vrContext._vrPicker?.delete?.();
     vrContext._vrPicker = null;
+
+    // Same for the exactPoint-mode picker (see _getVRPointPicker).
+    vrContext._vrPointPicker?.delete?.();
+    vrContext._vrPointPicker = null;
 
     // Restore the desktop viewport and GL drawing-buffer size, both of which
     // were mutated per-eye during VR rendering. Without this the desktop
@@ -5030,8 +5058,26 @@ console.log('Tools:', tools);
 
   /**
    * Perform raycast in VR
+   * @param {object} vrContext
+   * @param {object} ray
+   * @param {{excludeDerivedActors?: boolean, selectionMode?: 'nearestVertex'|'surface'|'exactPoint'}} [options]
+   *   - excludeDerivedActors restricts picking to the source actor when
+   *   possible (falls back to the full target list if that would leave
+   *   nothing pickable) — used by annotation/measurement placement so a
+   *   resolved pointId is relative to the source dataset whenever it's
+   *   actually pickable.
+   *   - selectionMode (default 'nearestVertex'): 'nearestVertex' picks the
+   *   hit cell's vertex closest to the surface intersection (today's
+   *   behavior); 'surface' returns the raw interpolated intersection with no
+   *   vertex commitment (pointId always -1); 'exactPoint' bypasses cell
+   *   picking entirely and finds the nearest ACTUAL DATA POINT along the ray
+   *   via vtkPointPicker, which works on point-cloud datasets with zero
+   *   cells (vtkCellPicker can never hit those). Regardless of the requested
+   *   mode, a cell-picker miss automatically retries via the exactPoint path
+   *   when a pick target has no cells at all — unless the mode is
+   *   explicitly 'surface', which has no meaningful point-cloud fallback.
    */
-  raycastVR(vrContext, ray) {
+  raycastVR(vrContext, ray, options = {}) {
     if (!ray || !vrContext?.sceneObjects) return null;
 
     const { renderer } = vrContext.sceneObjects;
@@ -5048,14 +5094,196 @@ console.log('Tools:', tools);
     }
     if (!origin || !dir) return null;
 
+    const selectionMode = options.selectionMode || "nearestVertex";
+    const pickTargets = this._getVRPickTargets(vrContext, {
+      excludeDerived: !!options.excludeDerivedActors,
+    });
+
+    // exactPoint bypasses cell-based picking entirely — it wants the nearest
+    // ACTUAL DATA POINT along the ray, independent of cell/surface topology,
+    // so it works identically whether or not the target has cells at all.
+    if (selectionMode === "exactPoint") {
+      return this._raycastExactPoint(vrContext, pickTargets, origin, dir, renderer);
+    }
+
     // Cached, pick-list-scoped, world-space cell picker. See the three
     // helpers below for why each of these matters.
     const picker = this._getVRPicker(vrContext);
-    const pickTargets = this._getVRPickTargets(vrContext);
     picker.setTolerance(VR_PICK_TOLERANCE);
     picker.setPickFromList(true);
     picker.setPickList(pickTargets);
 
+    const { p1, p2, rayLength } = this._computeVRPickRayPoints(vrContext, origin, dir);
+
+    // pick3DPoint is the WORLD-space counterpart of pick() (which takes a
+    // 3-component DISPLAY/pixel coordinate — passing a world point there, as
+    // the old code did, corrupts renderer.getActiveCamera() downstream).
+    // Neither pick() nor pick3DPoint() returns a value; the hit test is done
+    // by reading back picker.getCellId() afterward, mirroring the proven
+    // desktop convention in vtkRaycaster.js (picker.pick + getCellId() < 0).
+    //
+    // No manual un-yaw needed here (unlike probeDataVR below): pick3DInternal
+    // intersects against prop.getMatrix(), which already includes the
+    // UserMatrix written by _applyVRDataRotation (:5222-ish), so the picker
+    // sees the actor exactly as rendered, twist and all.
+    // Reset pick state EXPLICITLY. pick3DPoint calls the module-local
+    // initialize() (Picker.js:272), not publicAPI.initialize — and
+    // vtkCellPicker only overrides the latter (CellPicker.js:113-116 ->
+    // resetPickInfo -> model.cellId = -1). publicAPI.pick calls it for us
+    // (CellPicker.js:137); pick3DPoint does not. Without this, a miss reports
+    // the PREVIOUS pick's cellId/position and markers stick to a stale point.
+    picker.initialize();
+    picker.pick3DPoint(p1, p2, renderer);
+
+    const cellId = picker.getCellId();
+
+    // Diagnostic for on-headset debugging (remote console via chrome://inspect).
+    // Logged only when the hit/miss state FLIPS, never per frame — raycastVR
+    // runs at headset frame rate. Distinguishes the three ways VR picking can
+    // fail: no pick targets at all, a ray placed wrong, or a genuine miss.
+    const nowHit = cellId >= 0;
+    if (vrContext._lastPickWasHit !== nowHit) {
+      vrContext._lastPickWasHit = nowHit;
+      log.debug(
+        `VR pick ${nowHit ? "HIT" : "MISS"} — cellId=${cellId}, ` +
+          `targets=${pickTargets.length}, ` +
+          `rayOrigin(data)=[${p1[0].toFixed(3)}, ${p1[1].toFixed(3)}, ${p1[2].toFixed(3)}], ` +
+          `vrScale=${vrContext.vrScale}, rayLength=${rayLength.toFixed(3)}`
+      );
+    }
+
+    if (cellId < 0) {
+      // Automatic fallback for point-cloud datasets: vtkCellPicker can never
+      // hit an actor with zero cells (no surface to intersect), so a miss
+      // here doesn't necessarily mean "nothing there" — it may mean "there's
+      // nothing WITH CELLS there". 'surface' mode has no meaningful
+      // fallback (there's no cell to interpolate a surface position from
+      // either way), so it's excluded.
+      if (selectionMode !== "surface") {
+        const targetHasNoCells = pickTargets.some((a) => {
+          const pd =
+            typeof a?.getMapper === "function" ? a.getMapper()?.getInputData?.() : null;
+          return (
+            pd &&
+            typeof pd.getNumberOfCells === "function" &&
+            pd.getNumberOfCells() === 0
+          );
+        });
+        if (targetHasNoCells) {
+          return this._raycastExactPoint(vrContext, pickTargets, origin, dir, renderer);
+        }
+      }
+      return null;
+    }
+
+    const position = picker.getPickPosition();
+    const normal = picker.getPickNormal() || [0, 1, 0];
+    // vtkCellPicker exposes the hit actor only via the plural getActors()
+    // list (no singular getActor()) — mirror vtkRaycaster.js's fallback.
+    let actor = null;
+    if (typeof picker.getActor === "function") {
+      actor = picker.getActor();
+    } else if (typeof picker.getActors === "function") {
+      const actors = picker.getActors();
+      actor = Array.isArray(actors) ? actors[0] : null;
+    }
+
+    // Resolve the actual source POINT id, not just the triangle/cell that was
+    // hit. vtkCellPicker computes this internally (the closest point within
+    // the hit cell) but never exposes it publicly — recompute it from the
+    // cell's own point ids (getCellPoints, typically 3-4, at most a handful)
+    // plus the already-known pick position. -1 when it can't be resolved
+    // (e.g. the actor's polydata isn't reachable), which callers must treat
+    // as "no source point id available" rather than a real index.
+    // 'surface' mode skips this deliberately — it wants the raw interpolated
+    // intersection with no vertex commitment.
+    let pointId = -1;
+    if (selectionMode !== "surface") {
+      try {
+        const polyData =
+          typeof actor?.getMapper === "function"
+            ? actor.getMapper()?.getInputData?.()
+            : null;
+        const cellInfo =
+          typeof polyData?.getCellPoints === "function"
+            ? polyData.getCellPoints(cellId)
+            : null;
+        const candidateIds = cellInfo?.cellPointIds;
+        if (candidateIds && candidateIds.length) {
+          const coords = polyData.getPoints().getData();
+          let bestId = -1;
+          let bestDistSq = Infinity;
+          for (let i = 0; i < candidateIds.length; i++) {
+            const pid = candidateIds[i];
+            const dx = coords[pid * 3] - position[0];
+            const dy = coords[pid * 3 + 1] - position[1];
+            const dz = coords[pid * 3 + 2] - position[2];
+            const distSq = dx * dx + dy * dy + dz * dz;
+            if (distSq < bestDistSq) {
+              bestDistSq = distSq;
+              bestId = pid;
+            }
+          }
+          pointId = bestId;
+        }
+      } catch (err) {
+        log.debug(`raycastVR: point-id resolution failed (${err?.message}) — leaving pointId=-1`);
+      }
+    }
+
+    return {
+      hit: true,
+      position: { x: position[0], y: position[1], z: position[2] },
+      normal: { x: normal[0], y: normal[1], z: normal[2] },
+      distance: Math.sqrt(
+        Math.pow(position[0] - p1[0], 2) +
+          Math.pow(position[1] - p1[1], 2) +
+          Math.pow(position[2] - p1[2], 2)
+      ),
+      cellId,
+      pointId,
+      actorRole: this._classifyVRActor(vrContext, actor),
+      actor,
+      datasetId: this._getVRInstanceDatasetId(vrContext),
+    };
+  }
+
+  /**
+   * Cached vtkCellPicker for VR raycasts. Creating a picker is real garbage
+   * (internal locator/tree state) and raycastVR runs once or more per XR
+   * frame (~90 Hz) — recreating it every call would be a steady allocation
+   * churn. Cached on vrContext (one per VR session) and disposed in
+   * exitVRExploration.
+   * @private
+   */
+  _getVRPicker(vrContext) {
+    if (!vrContext._vrPicker) {
+      vrContext._vrPicker = vtkCellPicker.newInstance();
+    }
+    return vrContext._vrPicker;
+  }
+
+  /**
+   * Cached vtkPointPicker for the 'exactPoint' selection mode and the
+   * zero-cell (point-cloud) automatic fallback. Same caching rationale as
+   * _getVRPicker; disposed alongside it in exitVRExploration.
+   * @private
+   */
+  _getVRPointPicker(vrContext) {
+    if (!vrContext._vrPointPicker) {
+      vrContext._vrPointPicker = vtkPointPicker.newInstance();
+    }
+    return vrContext._vrPointPicker;
+  }
+
+  /**
+   * Map a VR controller ray (XR/physical-metre origin + direction) into the
+   * two data-space endpoints vtk.js pickers need, plus the ray length used to
+   * build the far endpoint. Shared by the cell-picker path and
+   * _raycastExactPoint so both pick against the identical ray.
+   * @private
+   */
+  _computeVRPickRayPoints(vrContext, origin, dir) {
     // XR -> DATA SPACE. `origin` arrives in physical headset metres (it comes
     // from controller.targetRay), but VR here remaps the CAMERA and leaves
     // the actors in data space — so the picker, which intersects those actors,
@@ -5108,84 +5336,121 @@ console.log('Tools:', tools);
       1.0, // homogeneous w — see the note on p1 above
     ];
 
-    // pick3DPoint is the WORLD-space counterpart of pick() (which takes a
-    // 3-component DISPLAY/pixel coordinate — passing a world point there, as
-    // the old code did, corrupts renderer.getActiveCamera() downstream).
-    // Neither pick() nor pick3DPoint() returns a value; the hit test is done
-    // by reading back picker.getCellId() afterward, mirroring the proven
-    // desktop convention in vtkRaycaster.js (picker.pick + getCellId() < 0).
-    //
-    // No manual un-yaw needed here (unlike probeDataVR below): pick3DInternal
-    // intersects against prop.getMatrix(), which already includes the
-    // UserMatrix written by _applyVRDataRotation (:5222-ish), so the picker
-    // sees the actor exactly as rendered, twist and all.
-    // Reset pick state EXPLICITLY. pick3DPoint calls the module-local
-    // initialize() (Picker.js:272), not publicAPI.initialize — and
-    // vtkCellPicker only overrides the latter (CellPicker.js:113-116 ->
-    // resetPickInfo -> model.cellId = -1). publicAPI.pick calls it for us
-    // (CellPicker.js:137); pick3DPoint does not. Without this, a miss reports
-    // the PREVIOUS pick's cellId/position and markers stick to a stale point.
+    return { p1, p2, rayLength };
+  }
+
+  /**
+   * 'exactPoint' selection mode: find the nearest ACTUAL DATA POINT along the
+   * ray via vtkPointPicker, bypassing cell/surface intersection entirely.
+   * Works on point-cloud datasets with zero cells, where vtkCellPicker can
+   * never find anything to intersect — used both when a caller explicitly
+   * requests this mode and as raycastVR's automatic fallback when the
+   * primary cell picker misses against a cell-less target.
+   * @private
+   */
+  _raycastExactPoint(vrContext, pickTargets, origin, dir, renderer) {
+    const picker = this._getVRPointPicker(vrContext);
+    picker.setTolerance(VR_PICK_TOLERANCE);
+    picker.setPickFromList(true);
+    picker.setPickList(pickTargets);
+
+    const { p1, p2 } = this._computeVRPickRayPoints(vrContext, origin, dir);
+
+    // Reset pick state EXPLICITLY, same reasoning as the cell-picker path —
+    // but note vtkPointPicker's own quirk: unlike vtkCellPicker, its
+    // `pointId` is only ever OVERWRITTEN on a hit (PointPicker.js's
+    // intersectActorWithLine sets model.pointId only inside
+    // `if (minPtId > -1 ...)`), and initialize() does NOT reset it. A miss
+    // here would otherwise silently report the PREVIOUS successful pick's
+    // pointId. The reliable hit/miss signal is picker.getActors().length —
+    // that array genuinely resets to [] in base Picker.js's initialize() and
+    // is only repopulated when pick3DInternal actually finds an in-tolerance
+    // point (confirmed by reading Picker.js's pick3DInternal).
     picker.initialize();
     picker.pick3DPoint(p1, p2, renderer);
 
-    const cellId = picker.getCellId();
+    const actors = typeof picker.getActors === "function" ? picker.getActors() : [];
+    if (!actors || actors.length === 0) return null;
 
-    // Diagnostic for on-headset debugging (remote console via chrome://inspect).
-    // Logged only when the hit/miss state FLIPS, never per frame — raycastVR
-    // runs at headset frame rate. Distinguishes the three ways VR picking can
-    // fail: no pick targets at all, a ray placed wrong, or a genuine miss.
-    const nowHit = cellId >= 0;
-    if (vrContext._lastPickWasHit !== nowHit) {
-      vrContext._lastPickWasHit = nowHit;
-      log.debug(
-        `VR pick ${nowHit ? "HIT" : "MISS"} — cellId=${cellId}, ` +
-          `targets=${pickTargets.length}, ` +
-          `rayOrigin(data)=[${p1[0].toFixed(3)}, ${p1[1].toFixed(3)}, ${p1[2].toFixed(3)}], ` +
-          `vrScale=${vrContext.vrScale}, rayLength=${rayLength.toFixed(3)}`
-      );
-    }
-
-    if (cellId < 0) return null;
-
+    const pointId = picker.getPointId();
     const position = picker.getPickPosition();
-    const normal = picker.getPickNormal() || [0, 1, 0];
-    // vtkCellPicker exposes the hit actor only via the plural getActors()
-    // list (no singular getActor()) — mirror vtkRaycaster.js's fallback.
-    let actor = null;
-    if (typeof picker.getActor === "function") {
-      actor = picker.getActor();
-    } else if (typeof picker.getActors === "function") {
-      const actors = picker.getActors();
-      actor = Array.isArray(actors) ? actors[0] : null;
-    }
+    const actor = actors[0];
 
     return {
       hit: true,
       position: { x: position[0], y: position[1], z: position[2] },
-      normal: { x: normal[0], y: normal[1], z: normal[2] },
+      // vtkPointPicker has no surface/normal concept — it finds points, not
+      // intersected faces.
+      normal: { x: 0, y: 1, z: 0 },
       distance: Math.sqrt(
         Math.pow(position[0] - p1[0], 2) +
           Math.pow(position[1] - p1[1], 2) +
           Math.pow(position[2] - p1[2], 2)
       ),
-      cellId,
+      cellId: -1,
+      pointId,
+      actorRole: this._classifyVRActor(vrContext, actor),
       actor,
+      datasetId: this._getVRInstanceDatasetId(vrContext),
     };
   }
 
   /**
-   * Cached vtkCellPicker for VR raycasts. Creating a picker is real garbage
-   * (internal locator/tree state) and raycastVR runs once or more per XR
-   * frame (~90 Hz) — recreating it every call would be a steady allocation
-   * churn. Cached on vrContext (one per VR session) and disposed in
-   * exitVRExploration.
+   * Classify an actor as the instance's source actor, or one of the derived
+   * (glyph/threshold/isosurface) actors, or "unknown". vtk.js actor objects
+   * are frozen (Object.freeze in vtk.js's macro factory), so they can't be
+   * tagged with a plain property — instead this looks the actor up in each
+   * feature singleton's own per-instance state, which VTKInstanceHandler
+   * already imports and drives (vtkGlyphFeature/vtkThresholdFeature/
+   * vtkIsosurfaceFeature). NOTE: their public getState() returns a curated
+   * field whitelist that does NOT include the actor reference, so this reads
+   * the internal instanceStates map directly.
    * @private
    */
-  _getVRPicker(vrContext) {
-    if (!vrContext._vrPicker) {
-      vrContext._vrPicker = vtkCellPicker.newInstance();
+  /**
+   * The dataset id backing this VR instance, or null. Same field
+   * VRExplorationManager._getPersistenceScope reads (instanceData.datasetId,
+   * set at dataset-load time) — returned as-is, whether a real UUID or a
+   * `builtin-*` key; built-in-key resolution to a UUID stays at persistence
+   * time (resolveBuiltInDatasetId), not here.
+   * @private
+   */
+  _getVRInstanceDatasetId(vrContext) {
+    const instanceId = vrContext?.instanceId;
+    if (!instanceId) return null;
+    return this.instances.get(instanceId)?.datasetId || null;
+  }
+
+  _classifyVRActor(vrContext, actor) {
+    if (!actor) return null;
+    if (actor === vrContext?.sceneObjects?.actor) return "source";
+    const instanceId = vrContext?.instanceId;
+    if (!instanceId) return "unknown";
+    if (actor === vtkGlyphFeature.instanceStates.get(instanceId)?.glyphActor) return "glyph";
+    if (actor === vtkThresholdFeature.instanceStates.get(instanceId)?.thresholdActor) return "threshold";
+    if (actor === vtkIsosurfaceFeature.instanceStates.get(instanceId)?.isoActor) return "isosurface";
+    return "unknown";
+  }
+
+  /**
+   * All actors — source plus any currently active derived actor — belonging
+   * to this VR instance. Used both to filter "exact" picking (below) and to
+   * apply the same VR-yaw transform to every one of them (_applyVRDataRotation).
+   * @private
+   */
+  _getInstanceActors(vrContext) {
+    const out = [];
+    if (vrContext?.sceneObjects?.actor) out.push(vrContext.sceneObjects.actor);
+    const instanceId = vrContext?.instanceId;
+    if (instanceId) {
+      const glyphActor = vtkGlyphFeature.instanceStates.get(instanceId)?.glyphActor;
+      const thresholdActor = vtkThresholdFeature.instanceStates.get(instanceId)?.thresholdActor;
+      const isoActor = vtkIsosurfaceFeature.instanceStates.get(instanceId)?.isoActor;
+      if (glyphActor) out.push(glyphActor);
+      if (thresholdActor) out.push(thresholdActor);
+      if (isoActor) out.push(isoActor);
     }
-    return vrContext._vrPicker;
+    return out;
   }
 
   /**
@@ -5200,9 +5465,18 @@ console.log('Tools:', tools);
    * blind the moment Threshold or Isosurface is toggled on. Falls back to
    * sceneObjects.actor only if the filter comes up empty (e.g. before any
    * actor has been marked pickable).
+   *
+   * @param {object} vrContext
+   * @param {{excludeDerived?: boolean}} [options] - when true, glyph/
+   *   threshold/isosurface actors are excluded so a resolved pointId is
+   *   relative to the actual source dataset rather than derived (and, for
+   *   glyphs, regenerated-on-density-change) geometry. Falls back to the
+   *   unrestricted list if excluding derived actors would leave nothing
+   *   pickable (e.g. threshold/isosurface currently hides the source actor)
+   *   — picking must never go blind.
    * @private
    */
-  _getVRPickTargets(vrContext) {
+  _getVRPickTargets(vrContext, options = {}) {
     const { renderer, actor } = vrContext?.sceneObjects || {};
     const all =
       typeof renderer?.getActors === "function" ? renderer.getActors() : [];
@@ -5215,8 +5489,15 @@ console.log('Tools:', tools);
         typeof a.getMapper === "function" &&
         !!a.getMapper()
     );
-    if (targets.length > 0) return targets;
-    return actor ? [actor] : [];
+    const fallback = targets.length > 0 ? targets : actor ? [actor] : [];
+
+    if (!options.excludeDerived) return fallback;
+
+    const derivedRoles = new Set(["glyph", "threshold", "isosurface"]);
+    const exact = fallback.filter(
+      (a) => !derivedRoles.has(this._classifyVRActor(vrContext, a))
+    );
+    return exact.length > 0 ? exact : fallback;
   }
 
   /**
@@ -5242,24 +5523,65 @@ console.log('Tools:', tools);
   }
 
   /**
+   * Cached vtkPointLocator (real spatial index) per actor, for probeDataVR.
+   * Rebuilds whenever the actor's polydata reference changes — a feature
+   * regenerating its derived polydata on a parameter change (e.g. glyph
+   * density) is a NEW object, so this is a correct dirty-check with no
+   * manual invalidation hook needed. Disposed in exitVRExploration.
+   * @private
+   */
+  _getVRPointLocator(vrContext, actor, polyData) {
+    vrContext._vrPointLocators = vrContext._vrPointLocators || new Map();
+    const cached = vrContext._vrPointLocators.get(actor);
+    if (cached && cached.polyData === polyData) return cached.locator;
+
+    cached?.locator?.delete?.();
+    vrContext._vrPointLocators.delete(actor);
+
+    try {
+      const locator = vtkPointLocator.newInstance();
+      locator.setDataSet(polyData);
+      locator.buildLocator();
+      vrContext._vrPointLocators.set(actor, { polyData, locator });
+      return locator;
+    } catch (err) {
+      log.debug(`probeDataVR: failed to build point locator (${err?.message})`);
+      return null;
+    }
+  }
+
+  /**
    * Get data value(s) at a data-space position by nearest-point lookup.
    *
-   * Called by VRProbeTool._probeAtPosition with the same coordinate space that
-   * raycastVR returns (scene/data space). Finds the nearest polydata point via
-   * a linear scan (fine for interactive single-probe use) and returns its
-   * point-data array values.
+   * Called by VRProbeTool._probeAtPosition with the same coordinate space
+   * that raycastVR returns (world/data space). Uses a real vtk.js spatial
+   * index (vtkPointLocator) rather than a linear scan — on an
+   * 800K+-point dataset an O(n) scan every probe call was enough to stall
+   * the headset. The query point is mapped into the target actor's LOCAL
+   * frame by inverting its FULL composed matrix (Position/Origin/
+   * Orientation/Scale plus any UserMatrix, e.g. the VR-yaw twist from
+   * _applyVRDataRotation) — not just the tracked yaw scalar as before — so
+   * probing stays correct under any transform the actor carries.
    *
-   * @param {Object} vrContext - VR context; polydata is read from
-   *   vrContext.sceneObjects.mapper.getInputData()
-   * @param {{x:number,y:number,z:number}|number[]} position - data-space probe point
+   * @param {Object} vrContext - VR context
+   * @param {{x:number,y:number,z:number}|number[]} position - world/data-space probe point
+   * @param {object} [actor] - which actor's polydata to probe; defaults to
+   *   the primary source actor (vrContext.sceneObjects.actor) so existing
+   *   callers are unaffected. Pass the actor a raycastVR hit landed on
+   *   (hit.actor) to probe a glyph/threshold/isosurface surface correctly
+   *   instead of always reading the (possibly hidden) source dataset.
    * @returns {{pointId:number, distance:number, position:number[],
    *   values:Object<string, number|number[]>}|null} null when there is no
    *   polydata/points to probe.
    */
-  probeDataVR(vrContext, position) {
+  probeDataVR(vrContext, position, actor) {
     if (!vrContext?.sceneObjects || !position) return null;
 
-    const mapper = vrContext.sceneObjects.mapper;
+    const targetActor = actor || vrContext.sceneObjects.actor;
+    const mapper =
+      typeof targetActor?.getMapper === "function"
+        ? targetActor.getMapper()
+        : vrContext.sceneObjects.mapper;
     const polyData =
       typeof mapper?.getInputData === "function" ? mapper.getInputData() : null;
     if (!polyData) return null;
@@ -5275,39 +5597,55 @@ console.log('Tools:', tools);
     const coords = pointsObj.getData();
     if (!coords || coords.length < nPoints * 3) return null;
 
-    let px = Array.isArray(position) ? position[0] : position.x;
-    let py = Array.isArray(position) ? position[1] : position.y;
-    let pz = Array.isArray(position) ? position[2] : position.z;
+    const px = Array.isArray(position) ? position[0] : position.x;
+    const py = Array.isArray(position) ? position[1] : position.y;
+    const pz = Array.isArray(position) ? position[2] : position.z;
+    const localPoint = [px, py, pz];
 
-    // The polydata coords are the actor's LOCAL (un-rotated) points, but the
-    // probe position comes from raycastVR in WORLD space on the possibly-yawed
-    // actor. Undo the two-hand twist about the dataset center so the nearest-
-    // point scan compares like with like.
-    const yaw = vrContext.vrRotation || 0;
-    if (yaw) {
-      const center = vrContext.dataCenter || [0, 0, 0];
-      const c = Math.cos(-yaw);
-      const s = Math.sin(-yaw);
-      const rx = px - center[0];
-      const rz = pz - center[2];
-      px = center[0] + (rx * c + rz * s);
-      pz = center[2] + (-rx * s + rz * c);
+    // Map WORLD -> the actor's LOCAL frame by inverting its full composed
+    // matrix. vtkMatrixBuilder (like gl-matrix's mat4) is column-major, but
+    // Prop3D.computeMatrix() explicitly TRANSPOSES its result before
+    // returning it (Prop3D.js: `mat4.transpose(model.matrix, model.matrix)`)
+    // — so actor.getMatrix() is NOT in the layout vtkMatrixBuilder expects.
+    // Transpose it back first, or invert()/apply() silently operate on the
+    // wrong matrix (verified: for a pure translation this produced a
+    // completely wrong result; for a pure rotation it can look right by
+    // coincidence, since a rotation matrix's transpose is its own inverse).
+    if (typeof targetActor?.getMatrix === "function") {
+      const m = targetActor.getMatrix();
+      const columnMajor = [
+        m[0], m[4], m[8], m[12],
+        m[1], m[5], m[9], m[13],
+        m[2], m[6], m[10], m[14],
+        m[3], m[7], m[11], m[15],
+      ];
+      vtkMatrixBuilder
+        .buildFromRadian()
+        .setMatrix(columnMajor)
+        .invert()
+        .apply(localPoint);
     }
 
-    // Linear nearest-point scan (squared distance — no sqrt in the loop).
-    let bestId = -1;
-    let bestDistSq = Infinity;
-    for (let i = 0; i < nPoints; i++) {
-      const dx = coords[i * 3] - px;
-      const dy = coords[i * 3 + 1] - py;
-      const dz = coords[i * 3 + 2] - pz;
-      const d2 = dx * dx + dy * dy + dz * dz;
-      if (d2 < bestDistSq) {
-        bestDistSq = d2;
-        bestId = i;
-      }
+    const locator = this._getVRPointLocator(vrContext, targetActor, polyData);
+    if (!locator) return null;
+
+    let bestId;
+    try {
+      bestId = locator.findClosestPoint(localPoint);
+    } catch (err) {
+      log.debug(`probeDataVR: findClosestPoint failed (${err?.message})`);
+      return null;
     }
-    if (bestId < 0) return null;
+    if (bestId == null || bestId < 0) return null;
+
+    const bestPoint = [
+      coords[bestId * 3],
+      coords[bestId * 3 + 1],
+      coords[bestId * 3 + 2],
+    ];
+    const dx = bestPoint[0] - localPoint[0];
+    const dy = bestPoint[1] - localPoint[1];
+    const dz = bestPoint[2] - localPoint[2];
 
     // Collect every point-data array's value(s) at the nearest point.
     const values = {};
@@ -5337,12 +5675,8 @@ console.log('Tools:', tools);
 
     return {
       pointId: bestId,
-      distance: Math.sqrt(bestDistSq),
-      position: [
-        coords[bestId * 3],
-        coords[bestId * 3 + 1],
-        coords[bestId * 3 + 2],
-      ],
+      distance: Math.sqrt(dx * dx + dy * dy + dz * dz),
+      position: bestPoint,
       values,
     };
   }
@@ -5472,11 +5806,20 @@ console.log('Tools:', tools);
    * world-space point into a local-space property then introduced a spurious
    * jump on VR entry (object invisible / sunk below the floor) even at yaw=0.
    * Restored exactly on exit by exitVRExploration.
+   *
+   * Applied to EVERY actor belonging to this instance (source plus any
+   * active glyph/threshold/isosurface actor — see _getInstanceActors), not
+   * just the source. Glyph/threshold/isosurface actors used to never
+   * receive this transform at all, so a yawed dataset would render (and get
+   * picked) with its derived geometry frozen at the un-rotated orientation —
+   * visibly misaligned from the source surface, and a second, independent
+   * source of position mismatch for anything picking against a derived
+   * actor.
    * @private
    */
   _applyVRDataRotation(vrContext) {
-    const actor = vrContext?.sceneObjects?.actor;
-    if (!actor || typeof actor.setUserMatrix !== "function") return;
+    const actors = this._getInstanceActors(vrContext);
+    if (!actors.length) return;
 
     const yaw = vrContext.vrRotation || 0;
     // Dirty-check — actor transform is unchanged most frames.
@@ -5484,7 +5827,12 @@ console.log('Tools:', tools);
     vrContext._appliedVRRotation = yaw;
 
     const center = vrContext.dataCenter || [0, 0, 0];
-    actor.setUserMatrix(buildYawPivotMatrix(yaw, center));
+    const matrix = buildYawPivotMatrix(yaw, center);
+    for (const actor of actors) {
+      if (typeof actor?.setUserMatrix === "function") {
+        actor.setUserMatrix(matrix);
+      }
+    }
   }
 
   // ===========================================================================

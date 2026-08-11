@@ -91,6 +91,9 @@ services:
       # Render server (container-network address, not localhost)
       RENDER_SERVER_URL: http://render-server:7000
       ENABLE_GPU_RENDERING: ${ENABLE_GPU_RENDERING:-false}
+      # Shared with render-server below — signs the short-lived, scoped
+      # render tokens POST /api/render/token mints (server/src/routes/renderToken.js).
+      RENDER_TOKEN_SECRET: ${RENDER_TOKEN_SECRET:-dev-render-token-secret}
       # Matrix Federation
       MATRIX_FEDERATION_ENABLED: ${MATRIX_FEDERATION_ENABLED:-true}
       MATRIX_BASE_URL: ${MATRIX_BASE_URL:-http://synapse:8008}
@@ -214,8 +217,12 @@ services:
       RENDER_WIDTH: ${RENDER_WIDTH:-1024}
       RENDER_HEIGHT: ${RENDER_HEIGHT:-768}
       MAX_SESSIONS: ${MAX_SESSIONS:-10}
-      # H14: access gate + resource bounds — override RENDER_SERVER_TOKEN in
-      # production; the frontend build must be given the same value.
+      # Shared with api above — verifies the short-lived, scoped render
+      # tokens the main API mints. Override in production; must match api's
+      # RENDER_TOKEN_SECRET exactly.
+      RENDER_TOKEN_SECRET: ${RENDER_TOKEN_SECRET:-dev-render-token-secret}
+      # H14 legacy static token — no longer read by app.py (see
+      # RENDER_TOKEN_SECRET above). Left defined, harmless, during rollout.
       RENDER_SERVER_TOKEN: ${RENDER_SERVER_TOKEN:-dev-render-token}
       RENDER_ALLOWED_ORIGINS: ${RENDER_ALLOWED_ORIGINS:-https://localhost:8081,http://localhost:8081}
       MAX_DATASET_SIZE_MB: ${MAX_DATASET_SIZE_MB:-500}

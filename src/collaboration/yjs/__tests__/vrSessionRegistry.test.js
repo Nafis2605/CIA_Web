@@ -65,7 +65,7 @@ describe('VR session registry (yVRSessions) — keyed by viewConfigurationId', (
     expect(yVRSessions.get('view-1').sessionId).toBe('vrsession_alice');
   });
 
-  test('claimVRSession returns an existing LIVE record unchanged, not ours', () => {
+  test('claimVRSession returns an existing LIVE record unchanged when a DIFFERENT host claims it, not ours', () => {
     claimVRSession('view-1', {
       sessionId: 'vrsession_alice',
       hostUserId: 'alice',
@@ -83,6 +83,33 @@ describe('VR session registry (yVRSessions) — keyed by viewConfigurationId', (
     expect(second.hostUserId).toBe('alice');
     // The map itself was never touched by Bob's losing claim.
     expect(yVRSessions.get('view-1').sessionId).toBe('vrsession_alice');
+  });
+
+  test('claimVRSession lets the SAME host update its own live record with a new sessionId', () => {
+    // Regression test: a host re-keying from a temporary id (e.g. issued
+    // before a slow server registration completes) to a durable server id
+    // must be able to overwrite its own still-live record — this is not a
+    // competing claim from another client, and used to be silently dropped,
+    // leaving the temp id permanently published for other clients to adopt.
+    const original = claimVRSession('view-1', {
+      sessionId: 'vrsession_temp',
+      hostUserId: 'alice',
+      hostUserName: 'Alice',
+      participantCount: 3,
+    });
+
+    const rekeyed = claimVRSession('view-1', {
+      sessionId: 'server-uuid-123',
+      hostUserId: 'alice',
+      hostUserName: 'Alice',
+    });
+
+    expect(rekeyed.sessionId).toBe('server-uuid-123');
+    expect(yVRSessions.get('view-1').sessionId).toBe('server-uuid-123');
+    // createdAt/participantCount carry over from the original record — this
+    // is a rekey of the same session, not a brand-new one.
+    expect(rekeyed.createdAt).toBe(original.createdAt);
+    expect(rekeyed.participantCount).toBe(3);
   });
 
   test('a record older than VR_SESSION_STALE_MS is overwritten by a new claim', () => {
@@ -158,6 +185,29 @@ describe('VR session registry (yVRSessions) — keyed by viewConfigurationId', (
     expect(record.lastHeartbeat).toBeGreaterThan(before);
     expect(record.hostUserId).toBe('alice');
     expect(record.createdAt).toBe(before);
+  });
+
+  test('heartbeatVRSession is a no-op when called by a non-host', () => {
+    // Regression test: a guest's heartbeat must never keep the HOST's record
+    // alive. Previously any participant could refresh any record, which meant
+    // a surviving guest kept a crashed host's record "live" forever — the
+    // stale-record election in VRExplorationManager's _tickVRSessionRegistry
+    // never runs because getVRSessionForView never returns null.
+    const before = Date.now() - 5000;
+    yVRSessions.set('view-1', {
+      sessionId: 'vrsession_alice',
+      viewConfigurationId: 'view-1',
+      hostUserId: 'alice',
+      hostUserName: 'Alice',
+      createdAt: before,
+      lastHeartbeat: before,
+      participantCount: 2,
+    });
+
+    heartbeatVRSession('view-1', 'bob');
+
+    const record = yVRSessions.get('view-1');
+    expect(record.lastHeartbeat).toBe(before);
   });
 
   test('heartbeatVRSession is a no-op when there is no record for the view', () => {

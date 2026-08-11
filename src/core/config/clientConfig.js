@@ -194,16 +194,6 @@ export const config = Object.freeze({
     "/render-ws"
   ),
 
-  /**
-   * Shared access token for the render server (see H14). Empty string when
-   * unconfigured — the render server treats an empty/unset RENDER_SERVER_TOKEN
-   * as "gate disabled", matching local dev with no token configured either side.
-   */
-  renderServerToken: resolveValue(
-    "renderServerToken",
-    typeof __RENDER_SERVER_TOKEN__ !== "undefined" ? __RENDER_SERVER_TOKEN__ : undefined,
-    ""
-  ),
 });
 
 // =============================================================================

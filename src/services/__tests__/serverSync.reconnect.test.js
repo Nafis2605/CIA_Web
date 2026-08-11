@@ -157,3 +157,93 @@ describe("serverSync reconnect backoff and network-resume listeners", () => {
     expect(MockWebSocket.instances.length).toBe(1); // no extra connect attempt
   });
 });
+
+// ---------------------------------------------------------------------------
+// Intentional disconnect (e.g. sign-out) vs. a network drop. Before this fix,
+// disconnect() closed the socket but never removed the online/visibility/
+// focus listeners (a leak), and neither onclose nor those listeners checked
+// for a deliberate close before reconnecting — so disconnect() didn't
+// actually keep the connection closed.
+// ---------------------------------------------------------------------------
+describe("serverSync intentional disconnect", () => {
+  let originalWebSocket;
+
+  beforeEach(() => {
+    originalWebSocket = global.WebSocket;
+    global.WebSocket = MockWebSocket;
+    MockWebSocket.instances = [];
+    serverSync.isConnected = false;
+    serverSync.reconnectAttempts = 0;
+    serverSync.ws = null;
+    serverSync._reconnectTimer = null;
+    serverSync._resumeListenersAttached = false;
+    serverSync._intentionalDisconnect = false;
+    serverSync._onNetworkResume = null;
+    serverSync._onVisibilityChange = null;
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    global.WebSocket = originalWebSocket;
+  });
+
+  test("disconnect() removes the online/visibilitychange/focus listeners", () => {
+    serverSync._setupNetworkResumeListeners();
+    const removeWindowSpy = vi.spyOn(window, "removeEventListener");
+    const removeDocSpy = vi.spyOn(document, "removeEventListener");
+
+    serverSync.disconnect();
+
+    expect(removeWindowSpy).toHaveBeenCalledWith("online", expect.any(Function));
+    expect(removeWindowSpy).toHaveBeenCalledWith("focus", expect.any(Function));
+    expect(removeDocSpy).toHaveBeenCalledWith("visibilitychange", expect.any(Function));
+    removeWindowSpy.mockRestore();
+    removeDocSpy.mockRestore();
+  });
+
+  test("a stray online/focus event after disconnect() does not reconnect", () => {
+    serverSync._setupNetworkResumeListeners();
+    serverSync.connect();
+    serverSync.disconnect();
+
+    const countAfterDisconnect = MockWebSocket.instances.length;
+    window.dispatchEvent(new Event("online"));
+    window.dispatchEvent(new Event("focus"));
+
+    // Listeners were removed, so these events shouldn't even reach
+    // tryResumeNow — but assert the outcome either way: no new socket.
+    expect(MockWebSocket.instances.length).toBe(countAfterDisconnect);
+  });
+
+  test("onclose does not schedule a reconnect for a self-initiated disconnect()", () => {
+    serverSync.connect(); // ws.close() inside disconnect() below fires onclose synchronously in the mock
+    const countBeforeDisconnect = MockWebSocket.instances.length;
+
+    serverSync.disconnect();
+    vi.advanceTimersByTime(60000); // well past maxReconnectDelay if a reconnect HAD been scheduled
+
+    expect(serverSync.reconnectAttempts).toBe(0);
+    expect(MockWebSocket.instances.length).toBe(countBeforeDisconnect); // no new socket
+  });
+
+  test("connect() clears the intentional-disconnect flag, allowing a later legitimate reconnect", () => {
+    serverSync.connect();
+    serverSync.disconnect();
+    expect(serverSync._intentionalDisconnect).toBe(true);
+
+    serverSync.connect();
+
+    expect(serverSync._intentionalDisconnect).toBe(false);
+  });
+
+  test("resume listeners can be re-attached after disconnect() (not left permanently blocked)", () => {
+    serverSync._setupNetworkResumeListeners();
+    serverSync.disconnect();
+    expect(serverSync._resumeListenersAttached).toBe(false);
+
+    serverSync._setupNetworkResumeListeners();
+
+    expect(serverSync._resumeListenersAttached).toBe(true);
+  });
+});

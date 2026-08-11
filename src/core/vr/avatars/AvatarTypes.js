@@ -41,6 +41,15 @@
  */
 
 /**
+ * @typedef {Object} AvatarPointerHit
+ * @property {AvatarPosePoint} position - data/scene-space point, identical for every viewer
+ * @property {number} pointId - source-dataset point index, or -1 when unresolved
+ * @property {number} cellId - source-dataset cell index, or -1 when unresolved
+ * @property {string|null} datasetId - dataset the hit belongs to, or null
+ * @property {string|null} actorRole - 'source'|'glyph'|'threshold'|'isosurface'|'unknown'|null
+ */
+
+/**
  * All limb positions are in the SENDER's own WebXR local-floor reference
  * space (meters, Y-up) — each VR participant has a physically independent
  * session/reference space, so vrScale/vrOrigin travel alongside the pose.
@@ -52,10 +61,11 @@
  * @property {AvatarLimbPose} leftHand
  * @property {AvatarLimbPose} rightHand
  * @property {AvatarPointer} pointer
- * @property {AvatarPosePoint|null} [pointerHit] - Where the sender's ray met the
- *   shared geometry. THE ONE FIELD HERE THAT IS NOT IN THE SENDER'S XR SPACE:
- *   it is already in data/scene space and identical for every viewer, so it is
- *   passed through untransformed (see RemoteAvatarController._toScenePose).
+ * @property {AvatarPointerHit|null} [pointerHit] - Where the sender's ray met the
+ *   shared geometry, plus what it hit. THE ONE FIELD HERE THAT IS NOT IN THE
+ *   SENDER'S XR SPACE: `position` is already in data/scene space and identical
+ *   for every viewer, so it is passed through untransformed (see
+ *   RemoteAvatarController._toScenePose).
  * @property {number} timestamp - Date.now()
  * @property {number} vrScale - sender's vrScale at the time of this pose
  * @property {number[]} vrOrigin - sender's vrOrigin [x,y,z] at the time of this pose

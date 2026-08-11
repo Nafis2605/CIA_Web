@@ -333,18 +333,25 @@ describe("VR tool placement gate", () => {
     expect(mgr._toolContext.canManipulate("Annotation")).toBe(true);
   });
 
-  it("annotation placement is refused for a non-holder, with no raycast attempted", () => {
+  it("annotation placement proceeds for a non-holder (not gated by the manipulation token)", () => {
+    // Regression test: annotation/measurement placement is additive and
+    // per-user, unlike clip/threshold/glyph edits — it must never require
+    // the shared VRManipulationLock token, even when canManipulate() would
+    // refuse other operations.
     const tool = new VRAnnotationTool();
-    const handler = { raycastVR: vi.fn(() => ({ position: { x: 0, y: 0, z: 0 } })) };
+    const handler = {
+      raycastVR: vi.fn(() => ({ position: { x: 0, y: 0, z: 0 }, normal: null })),
+    };
     tool._context = {
       handler,
       vrContext: {},
       canManipulate: vi.fn(() => false),
     };
 
-    expect(tool.handleInput(pull, {})).toBeNull();
-    expect(handler.raycastVR).not.toHaveBeenCalled();
-    expect(tool.getDraft()).toBeNull();
+    const action = tool.handleInput(pull, {});
+    expect(action).toMatchObject({ type: "annotation-pending" });
+    expect(handler.raycastVR).toHaveBeenCalled();
+    expect(tool.getDraft()).not.toBeNull();
   });
 
   it("annotation placement proceeds for the holder", () => {

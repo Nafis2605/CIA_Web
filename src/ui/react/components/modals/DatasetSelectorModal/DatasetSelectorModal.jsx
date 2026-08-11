@@ -19,6 +19,7 @@ import { useDatasets } from '@UI/react/hooks/useDatasets.js';
 import { viewLifecycleService } from '@Services/ViewLifecycleService.js';
 import { getDatasetManager } from '@Init/appInitializer.js';
 import { config } from '@Core/config/clientConfig.js';
+import { fetchRenderTokenHeader } from '@Services/renderTokenClient.js';
 import { toast } from '@UI/react/store/toastStore';
 import { syncActiveDatasetToYjs } from '@Collaboration/yjs/yjsSetup.js';
 import { getUserId } from '@Collaboration/presence/userManagement.js';
@@ -77,9 +78,8 @@ export function DatasetSelectorModal({
         console.log('[DatasetSelector] render mode:', config.renderMode);
         console.log('[DatasetSelector] fetching server datasets from:', SERVER_DATASETS_URL);
 
-        fetch(SERVER_DATASETS_URL, {
-            headers: config.renderServerToken ? { 'X-Render-Token': config.renderServerToken } : undefined,
-        })
+        fetchRenderTokenHeader()
+            .then((headers) => fetch(SERVER_DATASETS_URL, { headers }))
             .then(r => {
                 if (!r.ok) throw new Error(`HTTP ${r.status}`);
                 return r.json();

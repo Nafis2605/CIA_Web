@@ -17,6 +17,7 @@ vi.mock("@Collaboration/presence/userManagement.js", () => ({
 }));
 
 import { VRAnnotationTool, ANNOTATION_LABEL_PRESETS } from "../VRAnnotationTool.js";
+import { vtkGlyphFeature } from "@VTK/features/VTKGlyphFeature";
 
 function makeInputState({ triggerPressed = false, thumbstickX = 0 } = {}) {
   return {
@@ -51,6 +52,40 @@ describe("VRAnnotationTool — preset label", () => {
       seen.push(tool.cycleLabel());
     }
     expect(seen).toEqual([...ANNOTATION_LABEL_PRESETS, ANNOTATION_LABEL_PRESETS[0]]);
+  });
+
+  it("requests excludeDerivedActors and carries pointId/cellId/actorRole from the hit onto the draft", () => {
+    const raycastVR = vi.fn(() => ({
+      position: { x: 1, y: 2, z: 3 },
+      normal: { x: 0, y: 1, z: 0 },
+      pointId: 42,
+      cellId: 7,
+      actorRole: "source",
+    }));
+    tool._context.handler.raycastVR = raycastVR;
+
+    const pending = tool.handleInput(makeInputState({ triggerPressed: true }), {});
+
+    expect(raycastVR).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      { excludeDerivedActors: true }
+    );
+    expect(pending.data.pointId).toBe(42);
+    expect(pending.data.cellId).toBe(7);
+    expect(pending.data.pickActorRole).toBe("source");
+  });
+
+  it("defaults pointId/cellId/pickActorRole to null when the hit carried none", () => {
+    tool._context.handler.raycastVR = vi.fn(() => ({
+      position: { x: 1, y: 2, z: 3 },
+      normal: null,
+    }));
+
+    const pending = tool.handleInput(makeInputState({ triggerPressed: true }), {});
+    expect(pending.data.pointId).toBeNull();
+    expect(pending.data.cellId).toBeNull();
+    expect(pending.data.pickActorRole).toBeNull();
   });
 
   it("placing an annotation carries the currently-selected label, not a hardcoded placeholder", () => {
@@ -121,6 +156,79 @@ describe("VRAnnotationTool — preset label", () => {
     // A fresh pinch must be recognized as a new rising edge.
     const secondPending = tool.handleInput(makeInputState({ triggerPressed: true }), {});
     expect(secondPending).toMatchObject({ type: "annotation-pending" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Glyph-density "keep this point visible" hint (source-surface picks only —
+// a glyph/threshold/isosurface pointId isn't a source-dataset index).
+// ---------------------------------------------------------------------------
+describe("VRAnnotationTool — glyph selection hint", () => {
+  let tool;
+  const instanceId = "instance-1";
+
+  beforeEach(async () => {
+    vi.restoreAllMocks();
+    vi.spyOn(vtkGlyphFeature, "setSelectedPoint").mockImplementation(() => {});
+    vi.spyOn(vtkGlyphFeature, "clearSelectedPoint").mockImplementation(() => {});
+    tool = new VRAnnotationTool();
+    await tool.activate({
+      handler: { raycastVR: vi.fn() },
+      vrContext: { instanceId },
+    });
+  });
+
+  it("pins the source point when a draft opens against a source-surface pick", () => {
+    tool._context.handler.raycastVR = vi.fn(() => ({
+      position: { x: 1, y: 2, z: 3 },
+      pointId: 42,
+      actorRole: "source",
+    }));
+
+    tool.handleInput(makeInputState({ triggerPressed: true }), {});
+
+    expect(vtkGlyphFeature.setSelectedPoint).toHaveBeenCalledWith(instanceId, 42);
+  });
+
+  it("does not pin a point for a derived-actor (glyph/threshold/isosurface) pick", () => {
+    tool._context.handler.raycastVR = vi.fn(() => ({
+      position: { x: 1, y: 2, z: 3 },
+      pointId: 42,
+      actorRole: "glyph",
+    }));
+
+    tool.handleInput(makeInputState({ triggerPressed: true }), {});
+
+    expect(vtkGlyphFeature.setSelectedPoint).not.toHaveBeenCalled();
+    expect(vtkGlyphFeature.clearSelectedPoint).toHaveBeenCalledWith(instanceId);
+  });
+
+  it("releases the pin when the draft is confirmed", () => {
+    tool._context.handler.raycastVR = vi.fn(() => ({
+      position: { x: 1, y: 2, z: 3 },
+      pointId: 42,
+      actorRole: "source",
+    }));
+    tool.handleInput(makeInputState({ triggerPressed: true }), {});
+    vtkGlyphFeature.clearSelectedPoint.mockClear();
+
+    tool.confirmDraft();
+
+    expect(vtkGlyphFeature.clearSelectedPoint).toHaveBeenCalledWith(instanceId);
+  });
+
+  it("releases the pin when the draft is cancelled", () => {
+    tool._context.handler.raycastVR = vi.fn(() => ({
+      position: { x: 1, y: 2, z: 3 },
+      pointId: 42,
+      actorRole: "source",
+    }));
+    tool.handleInput(makeInputState({ triggerPressed: true }), {});
+    vtkGlyphFeature.clearSelectedPoint.mockClear();
+
+    tool.cancelDraft();
+
+    expect(vtkGlyphFeature.clearSelectedPoint).toHaveBeenCalledWith(instanceId);
   });
 });
 

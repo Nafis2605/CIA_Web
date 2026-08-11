@@ -109,6 +109,29 @@ router.get("/supported-types", (req, res) => {
 });
 
 /**
+ * GET /api/files/builtin
+ * Resolve bundled dataset manifest ids (public/vtp_files/manifest.json, e.g.
+ * "builtin-lungs") to their real server-side UUID rows — see
+ * migrations/020_bundled_dataset_ids.sql. Registered before "/:id" below,
+ * matching the "/supported-types" ordering above, so Express's literal-path
+ * match isn't shadowed by the ":id" param route. No auth-sensitive fields;
+ * safe to cache client-side.
+ */
+router.get("/builtin", async (req, res, next) => {
+  try {
+    const { pool } = req.app.locals;
+    const result = await pool.query(
+      `SELECT id, builtin_key, filename, public_path
+       FROM datasets
+       WHERE builtin_key IS NOT NULL AND status = 'active'`
+    );
+    res.json({ datasets: result.rows });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
  * GET /api/files/:id
  * Get file metadata and version history
  */

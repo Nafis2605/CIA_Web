@@ -22,6 +22,8 @@ import os
 import sys
 import json
 import base64
+import hmac
+import hashlib
 import logging
 import asyncio
 import uuid
@@ -57,11 +59,12 @@ RENDER_WIDTH = int(os.environ.get("RENDER_WIDTH", "1024"))
 RENDER_HEIGHT = int(os.environ.get("RENDER_HEIGHT", "768"))
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "10"))
 
-# H14: access gate, resource bounds. RENDER_SERVER_TOKEN empty/unset means the
-# gate is disabled — matches the existing INTERNAL_API_TOKEN convention in the
-# main API (server/src/middleware/auth.js) of "only enforced when configured",
-# so local dev with no token set keeps working unchanged.
-RENDER_SERVER_TOKEN = os.environ.get("RENDER_SERVER_TOKEN", "")
+# Short-lived, scoped render credentials (see server/src/routes/renderToken.js,
+# which mints these). RENDER_TOKEN_SECRET empty/unset means the gate is
+# disabled — matches the existing INTERNAL_API_TOKEN convention in the main
+# API (server/src/middleware/auth.js) of "only enforced when configured", so
+# local dev with no secret set keeps working unchanged.
+RENDER_TOKEN_SECRET = os.environ.get("RENDER_TOKEN_SECRET", "")
 ALLOWED_ORIGINS = [
     o.strip()
     for o in os.environ.get(
@@ -77,8 +80,8 @@ log.info(f"[app] Dataset dir: {DATASET_DIR}")
 log.info(f"[app] Render size: {RENDER_WIDTH}x{RENDER_HEIGHT}")
 log.info(f"[app] Max sessions: {MAX_SESSIONS}")
 log.info(f"[app] Allowed origins: {ALLOWED_ORIGINS}")
-if not RENDER_SERVER_TOKEN:
-    log.warning("[app] RENDER_SERVER_TOKEN not set — access gate DISABLED")
+if not RENDER_TOKEN_SECRET:
+    log.warning("[app] RENDER_TOKEN_SECRET not set — access gate DISABLED")
 
 # ── VTK availability check ────────────────────────────────────────────────────
 try:
@@ -142,14 +145,56 @@ class CameraRequest(BaseModel):
 
 # ── H14: access gate, path trust, and resource bounds ────────────────────────
 
+def _b64url_decode(s: str) -> bytes:
+    """Reverse of the Node side's base64url() (server/src/routes/renderToken.js),
+    which strips '=' padding — re-add it before decoding."""
+    padding = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + padding)
+
+
+def _verify_scoped_token(token: Optional[str]) -> Optional[dict]:
+    """Verify a signed, short-lived render token minted by POST
+    /api/render/token (server/src/routes/renderToken.js). Token format:
+    `${payloadB64}.${signatureB64}`, signature = HMAC-SHA256(payloadB64,
+    RENDER_TOKEN_SECRET), payload = {sub, datasetId, exp}. Returns the
+    decoded payload if the signature is valid and it hasn't expired, else
+    None — replaces the old plain string-equality check against one shared
+    static secret with real signature + expiry verification.
+    """
+    if not token or "." not in token:
+        return None
+    payload_b64, _, signature_b64 = token.partition(".")
+    expected_sig = (
+        base64.urlsafe_b64encode(
+            hmac.new(
+                RENDER_TOKEN_SECRET.encode("utf-8"),
+                payload_b64.encode("utf-8"),
+                hashlib.sha256,
+            ).digest()
+        )
+        .decode("utf-8")
+        .rstrip("=")
+    )
+    if not hmac.compare_digest(expected_sig, signature_b64):
+        return None
+    try:
+        payload = json.loads(_b64url_decode(payload_b64))
+    except Exception:
+        return None
+    exp = payload.get("exp")
+    if not isinstance(exp, (int, float)) or exp < time.time() * 1000:
+        return None
+    return payload
+
+
 def _token_valid(provided: Optional[str]) -> bool:
-    return not RENDER_SERVER_TOKEN or provided == RENDER_SERVER_TOKEN
+    return not RENDER_TOKEN_SECRET or _verify_scoped_token(provided) is not None
 
 
 async def require_render_token(x_render_token: Optional[str] = Header(None)):
-    """FastAPI dependency: gate an HTTP endpoint behind RENDER_SERVER_TOKEN."""
+    """FastAPI dependency: gate an HTTP endpoint behind a valid render token."""
     if not _token_valid(x_render_token):
-        raise HTTPException(401, "Invalid or missing render server token")
+        raise HTTPException(401, "Invalid, missing, or expired render token")
 
 
 def resolve_registered_path(dataset_id: str) -> Optional[str]:
@@ -359,10 +404,16 @@ async def websocket_endpoint(websocket: WebSocket):
     """
     # Browsers can't set custom headers on a WS handshake, so the token
     # rides along as a query param instead. Reject before accept() so an
-    # unauthorized caller never gets an open socket.
-    if not _token_valid(websocket.query_params.get("token")):
-        await websocket.close(code=4401)
-        return
+    # unauthorized caller never gets an open socket. Decoded once here (not
+    # just bool-checked) so loadDataset below can enforce the token's
+    # dataset scope, not just its signature/expiry.
+    raw_token = websocket.query_params.get("token")
+    token_payload = None
+    if RENDER_TOKEN_SECRET:
+        token_payload = _verify_scoped_token(raw_token)
+        if token_payload is None:
+            await websocket.close(code=4401)
+            return
 
     await websocket.accept()
 
@@ -395,6 +446,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             msg_type = msg.get("type", "")
+            # Echoed back on every reply to this message so the client can
+            # match a response to the request that triggered it instead of
+            # assuming strict single-outstanding-request FIFO order (broke
+            # under concurrent requests, e.g. a drag and a wheel-zoom firing
+            # close together both sending cameraUpdate).
+            request_id = msg.get("id")
             log.debug(f"[app] WS {session_id} recv: {msg_type}")
 
             # ── ping ────────────────────────────────────────────────────────
@@ -404,6 +461,21 @@ async def websocket_endpoint(websocket: WebSocket):
             # ── loadDataset ─────────────────────────────────────────────────
             elif msg_type == "loadDataset":
                 dataset_id = msg.get("datasetId", "")
+
+                # Enforce the token's dataset scope, when it has one — an
+                # unscoped token (datasetId omitted when it was minted)
+                # skips this check, matching the "lightweight pass" the
+                # token endpoint documents.
+                token_scope = token_payload.get("datasetId") if token_payload else None
+                if token_scope and token_scope != dataset_id:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "Render token is not scoped to this dataset",
+                        "stage": "load",
+                        "id": request_id,
+                    })
+                    continue
+
                 path = resolve_registered_path(dataset_id)
 
                 if not path:
@@ -412,6 +484,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "message": f"Dataset '{dataset_id}' not found. "
                                    f"Available: {list(DATASETS.keys())}",
                         "stage": "load",
+                        "id": request_id,
                     })
                     continue
 
@@ -419,7 +492,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     check_rate_limit(client_ip)
                     check_dataset_size(path)
                 except ValueError as e:
-                    await websocket.send_json({"type": "error", "message": str(e), "stage": "load"})
+                    await websocket.send_json({"type": "error", "message": str(e), "stage": "load", "id": request_id})
                     continue
 
                 file_type = path.rsplit(".", 1)[-1].lower() if "." in path else ""
@@ -446,6 +519,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "datasetId": dataset_id,
                         "metadata": metadata,
                         "camera": camera_state,
+                        "id": request_id,
                     })
 
                     await websocket.send_json({
@@ -454,15 +528,16 @@ async def websocket_endpoint(websocket: WebSocket):
                         "width": RENDER_WIDTH,
                         "height": RENDER_HEIGHT,
                         "camera": camera_state,
+                        "id": request_id,
                     })
 
                 except FileNotFoundError as e:
-                    await websocket.send_json({"type": "error", "message": str(e), "stage": "load"})
+                    await websocket.send_json({"type": "error", "message": str(e), "stage": "load", "id": request_id})
                 except ValueError as e:
-                    await websocket.send_json({"type": "error", "message": str(e), "stage": "parse"})
+                    await websocket.send_json({"type": "error", "message": str(e), "stage": "parse", "id": request_id})
                 except Exception as e:
                     log.error(f"[app] WS load error: {e}", exc_info=True)
-                    await websocket.send_json({"type": "error", "message": str(e), "stage": "render"})
+                    await websocket.send_json({"type": "error", "message": str(e), "stage": "render", "id": request_id})
 
             # ── cameraUpdate ────────────────────────────────────────────────
             elif msg_type == "cameraUpdate":
@@ -471,6 +546,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "type": "error",
                         "message": "No dataset loaded. Send loadDataset first.",
                         "stage": "camera",
+                        "id": request_id,
                     })
                     continue
 
@@ -492,11 +568,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         "image": frame_b64,
                         "width": RENDER_WIDTH,
                         "height": RENDER_HEIGHT,
+                        "id": request_id,
                     })
 
                 except Exception as e:
                     log.error(f"[app] Camera error: {e}", exc_info=True)
-                    await websocket.send_json({"type": "error", "message": str(e), "stage": "camera"})
+                    await websocket.send_json({"type": "error", "message": str(e), "stage": "camera", "id": request_id})
 
             # ── resetCamera ─────────────────────────────────────────────────
             elif msg_type == "resetCamera":
@@ -515,6 +592,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "width": RENDER_WIDTH,
                     "height": RENDER_HEIGHT,
                     "camera": camera_state,
+                    "id": request_id,
                 })
 
             # ── setRepresentation ───────────────────────────────────────────
@@ -532,6 +610,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "image": frame_b64,
                     "width": RENDER_WIDTH,
                     "height": RENDER_HEIGHT,
+                    "id": request_id,
                 })
 
             else:

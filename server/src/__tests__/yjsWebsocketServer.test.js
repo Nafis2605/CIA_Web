@@ -357,22 +357,47 @@ describe('H8: transient-root classification and durable snapshot filtering', () 
 
   test('buildDurableSnapshotState excludes every transient root and keeps durable roots intact', () => {
     const doc = new Y.Doc();
-    doc.getMap('visualizationState').set('view-1', { opacity: 0.5 });
+
+    // Real production shape (syncVisualizationToYjs, yjsSetup.js): each
+    // visualizationState entry is an already-integrated Y.Map nesting a
+    // second Y.Map for the "visualization" field — NOT a plain object.
+    // Reinserting either by reference into a different Y.Doc throws; this is
+    // the direct regression case for that bug.
+    const entry = new Y.Map();
+    const vizMap = new Y.Map();
+    vizMap.set('opacity', 0.5);
+    vizMap.set('representation', 'surface');
+    entry.set('visualization', vizMap);
+    entry.set('userId', 'user-1');
+    doc.getMap('visualizationState').set('view-1', entry);
+
     doc.getMap('activeDataset').set('room-1', { datasetId: 'ds-1' });
     doc.getMap('vrControllers').set('user-1', { pose: [0, 0, 0] });
     doc.getMap('vr-sessions').set('view-1', { hostUserId: 'user-1' });
     doc.getMap('vr-manipulation-session1').set('lockedBy', 'user-1');
     doc.getMap('vr-control-session1').set('pending', true);
-    doc.getArray('vr-join-order-session1').push([{ participantId: 'user-1' }]);
+    // A transient root holding a nested Y type too — stripping must not
+    // choke on non-plain transient content either.
+    const joinOrderEntry = new Y.Map();
+    joinOrderEntry.set('participantId', 'user-1');
+    doc.getArray('vr-join-order-session1').push([joinOrderEntry]);
     doc.getMap('avatars').set('user-1', { displayName: 'Alice' });
 
-    const state = buildDurableSnapshotState(doc);
+    let state;
+    expect(() => {
+      state = buildDurableSnapshotState(doc);
+    }).not.toThrow();
 
     const restored = new Y.Doc();
     Y.applyUpdate(restored, state);
 
-    // Durable roots survive.
-    expect(restored.getMap('visualizationState').get('view-1')).toEqual({ opacity: 0.5 });
+    // Durable roots survive, nested Y.Map structure intact (not flattened).
+    const restoredEntry = restored.getMap('visualizationState').get('view-1');
+    expect(restoredEntry).toBeInstanceOf(Y.Map);
+    expect(restoredEntry.get('userId')).toBe('user-1');
+    const restoredVizMap = restoredEntry.get('visualization');
+    expect(restoredVizMap).toBeInstanceOf(Y.Map);
+    expect(restoredVizMap.toJSON()).toEqual({ opacity: 0.5, representation: 'surface' });
     expect(restored.getMap('activeDataset').get('room-1')).toEqual({ datasetId: 'ds-1' });
 
     // Transient roots are entirely absent from the snapshot.

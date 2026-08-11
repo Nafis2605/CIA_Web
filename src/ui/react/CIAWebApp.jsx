@@ -9,6 +9,7 @@ import { ui as log } from "@Utils/logger.js";
 import { sessionManager } from "@Core/session/sessionManager.js";
 import { authService } from "@Services/authService.js";
 import { followService } from "@Services/followService.js";
+import { serverSync } from "@Services/serverSync.js";
 import { presenceSystem } from "@Collaboration/presence/presenceSystem.js";
 
 // Layout
@@ -334,6 +335,9 @@ export function CIAWebApp({ username, userId, projectId }) {
   // ── Sign-out ──────────────────────────────────────────────────────────────
   const handleSignOut = useCallback(async () => {
     presenceSystem.destroy();
+    // Intentional — must not trigger serverSync's own reconnect logic (see
+    // serverSync.disconnect()'s _intentionalDisconnect flag).
+    serverSync.disconnect();
     sessionManager.clearSession();
     await authService.logout();
   }, []);

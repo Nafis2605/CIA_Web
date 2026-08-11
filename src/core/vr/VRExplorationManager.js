@@ -37,6 +37,7 @@ import {
 import { sessionManager } from '@Core/session/sessionManager.js';
 import { getDeviceId } from '@Core/identity/deviceIdentity.js';
 import { apiClient } from '@Services/apiClient.js';
+import { isBuiltInDatasetId, resolveBuiltInDatasetId } from '@Services/builtInDatasets.js';
 import { BaseManager } from '@Core/data/managers/BaseManager.js';
 import { vrAvatarSystem } from '@Core/instances/types/vtk/vr/VTKVRAvatars.js';
 import { vrSpatialUI } from '@Core/instances/types/vtk/vr/VTKVRSpatialUI.js';
@@ -1437,14 +1438,20 @@ class VRExplorationManager extends BaseManager {
   // ===========================================================================
   //
   // Exactly one participant at a time may push SHARED data changes — clip,
-  // representation, glyphs, threshold, isosurface, dataset transform, and the
-  // placement of annotations/measurements. The host holds the token by
-  // default, can hand it to anyone, and everyone else can ask.
+  // representation, glyphs, threshold, isosurface, and dataset transform.
+  // The host holds the token by default, can hand it to anyone, and everyone
+  // else can ask.
   //
   // WHAT IS DELIBERATELY NOT GATED: vrScale, vrOrigin, locomotion, follow,
-  // isolation and probe. Those are this user's own viewpoint. Gating them
-  // would mean four people in one headset session all being dragged around by
-  // whoever holds the token, which is the opposite of the requirement.
+  // isolation, probe, and annotation/measurement placement. vrScale/vrOrigin/
+  // locomotion/follow/isolation/probe are this user's own viewpoint — gating
+  // them would mean four people in one headset session all being dragged
+  // around by whoever holds the token. Annotation and measurement placement
+  // are additive, per-user, non-conflicting writes (unlike clip/threshold/
+  // glyph, which mutate ONE shared representation of the dataset) — any
+  // participant may place one at any time regardless of who holds the token;
+  // see VRAnnotationTool.js/VRMeasureTool.js, which no longer call
+  // canManipulate() before placement.
 
   /**
    * Silent permission read. FAILS OPEN on a missing/throwing lock — every
@@ -2574,51 +2581,58 @@ class VRExplorationManager extends BaseManager {
 
     // Cheap guards stay synchronous so the button can still report "can't do
     // that" immediately, without ever touching the deferred queue.
-    const { vectorArrays = [], scalarArrays = [] } = state;
-    if (!isGlyphFeatureAvailable(vectorArrays, scalarArrays)) {
-      log.warn('VR glyph toggle: no usable vector/scalar point-data arrays on this dataset');
-      return false;
-    }
-
     const polydata = this._activeContext?.instance?.instanceData?.polydata;
     if (!polydata) {
       log.warn('VR glyph toggle: dataset polydata unavailable');
       return false;
     }
 
+    const { vectorArrays = [], scalarArrays = [] } = state;
+    const hasPoints = (polydata.getNumberOfPoints?.() ?? 0) > 0;
+    if (!isGlyphFeatureAvailable(vectorArrays, scalarArrays, hasPoints)) {
+      log.warn('VR glyph toggle: no usable vector/scalar/point data on this dataset');
+      return false;
+    }
+
     // Pick settings the DATA can actually satisfy, rather than inheriting
     // VTKGlyphFeature's defaults.
     //
-    // Those defaults are glyphType 'arrow' (requiresOrientation) with
-    // scalingMode 'vector', and VR passed orientationArray = undefined when the
-    // dataset had no vector array. Worse, SCALING_MODES maps 'vector' to 2,
-    // which in vtk.js is SCALE_BY_COMPONENTS, not magnitude — so with a
-    // 1-component scalar array vtk.js logs an error and nulls the scale array.
-    // Net result: every glyph drew at scaleFactor 1.0 in ABSOLUTE DATA UNITS,
-    // unoriented — invisible specks on a large dataset, scene-swamping blobs on
-    // a small one. That is the "Glyphs doesn't work" report.
-    //
-    // The shared SCALING_MODES map is left alone deliberately: correcting it is
-    // desktop-visible and would change existing saved glyph configs. Tracked
-    // separately; here we just choose the one entry that maps correctly
-    // ('scalar' -> 1 -> SCALE_BY_MAGNITUDE) and an explicit type/array pair.
+    // Those defaults are glyphType 'arrow' (requiresOrientation), and VR
+    // passed orientationArray = undefined when the dataset had no vector
+    // array — invisible specks on a large dataset, scene-swamping blobs on a
+    // small one. That was the "Glyphs doesn't work" report. Now that
+    // SCALING_MODES has been corrected to match vtk.js's real enum
+    // (magnitude=1, components=2 — see VTKGlyphFeature.js), 'magnitude' is
+    // the correct, non-hacky way to express "scale by vector length/scalar
+    // magnitude" here.
     const vectorName = vectorArrays?.[0]?.name;
     const scalarName = scalarArrays?.[0]?.name;
     const options = vectorName
       ? {
           glyphType: 'arrow',
-          scalingMode: 'scalar',
+          scalingMode: 'magnitude',
           orientationArray: vectorName,
           scaleArray: vectorName,
         }
-      : {
+      : scalarName
+      ? {
           // 'sphere' is requiresOrientation:false, so it renders correctly with
           // no vector data — unlike 'arrow', which has nothing to point along.
           glyphType: 'sphere',
           scalingMode: 'off',
           orientationArray: null,
-          colorMode: scalarName ? 'scalar' : 'solid',
-          colorArray: scalarName || null,
+          colorMode: 'scalar',
+          colorArray: scalarName,
+        }
+      : {
+          // Point-only dataset (no vector/scalar arrays at all): constant-
+          // scale, solid-colored spheres are the only thing the data can
+          // actually satisfy.
+          glyphType: 'sphere',
+          scalingMode: 'off',
+          orientationArray: null,
+          colorMode: 'solid',
+          colorArray: null,
         };
     options.scaleFactor = this._autoGlyphScaleFactor(polydata);
 
@@ -2703,12 +2717,14 @@ class VRExplorationManager extends BaseManager {
     // Same guards toggleGlyphs uses, but reported (a disabled-type tap fails
     // loud via a notice, not silently — see the plan's notice-visibility fix).
     const { vectorArrays = [], scalarArrays = [] } = state;
+    const polydata = this._activeContext?.instance?.instanceData?.polydata;
     if (getDisabledGlyphTypes(vectorArrays).includes(typeId)) {
       this._flashVRNotice(`${typeId} needs a vector array — this dataset has none`);
       return false;
     }
-    if (!isGlyphFeatureAvailable(vectorArrays, scalarArrays)) {
-      this._flashVRNotice('No vector or scalar data on this dataset for glyphs');
+    const hasPoints = (polydata?.getNumberOfPoints?.() ?? 0) > 0;
+    if (!isGlyphFeatureAvailable(vectorArrays, scalarArrays, hasPoints)) {
+      this._flashVRNotice('No vector, scalar, or point data on this dataset for glyphs');
       return false;
     }
 
@@ -2724,10 +2740,8 @@ class VRExplorationManager extends BaseManager {
     }
 
     // Not yet enabled: bring it up WITH the requested type, using the same
-    // array-driven options toggleGlyphs derives (see its comment for why
-    // scalingMode:'scalar' rather than 'vector' matters) — just parameterized
-    // on the user's chosen type instead of always picking arrow-or-sphere.
-    const polydata = this._activeContext?.instance?.instanceData?.polydata;
+    // array-driven options toggleGlyphs derives — just parameterized on the
+    // user's chosen type instead of always picking arrow-or-sphere.
     if (!polydata) return false;
 
     const vectorName = vectorArrays?.[0]?.name;
@@ -2735,7 +2749,7 @@ class VRExplorationManager extends BaseManager {
     const options = vectorName
       ? {
           glyphType: typeId,
-          scalingMode: 'scalar',
+          scalingMode: 'magnitude',
           orientationArray: vectorName,
           scaleArray: vectorName,
         }
@@ -3828,7 +3842,8 @@ class VRExplorationManager extends BaseManager {
    *   dataOrigin:{x:number,y:number,z:number},
    *   direction:{x:number,y:number,z:number},
    *   hand:'left'|'right',
-   *   hit:{x:number,y:number,z:number}|null}|null}
+   *   hit:{position:{x:number,y:number,z:number},pointId:number,cellId:number,
+   *     datasetId:string|null,actorRole:string|null}|null}|null}
    * @private
    */
   _computePointerRay(inputState, vrContext, { skipPick = false } = {}) {
@@ -3868,10 +3883,18 @@ class VRExplorationManager extends BaseManager {
    * Throttled surface pick for the pointer's hit marker. Returns the cached
    * result between picks so the caller can treat it as a per-frame value.
    *
+   * Carries the same identity fields raycastVR resolves (pointId/cellId/
+   * datasetId/actorRole) — not just the bare position — because this same
+   * pick rides into VRParticipantSync.updateLocalState (see the call site
+   * in the frame loop) and out to every collaborator's remote-avatar hit
+   * marker, so the "what am I currently pointing at" signal is broadcast in
+   * real time, not just used cosmetically for the dot's position.
+   *
    * @param {object} controller - inputState.controllers[hand]
    * @param {object} vrContext
    * @param {boolean} skipPick
-   * @returns {{x:number,y:number,z:number}|null} data-space hit point
+   * @returns {{position:{x:number,y:number,z:number},pointId:number,
+   *   cellId:number,datasetId:string|null,actorRole:string|null}|null}
    * @private
    */
   _pickPointerHit(controller, vrContext, skipPick) {
@@ -3884,31 +3907,38 @@ class VRExplorationManager extends BaseManager {
 
     const now = Date.now();
     const cached = this._lastPointerHit;
-    if (cached && now - cached.atMs < POINTER_PICK_MS) return cached.pos;
+    if (cached && now - cached.atMs < POINTER_PICK_MS) return cached.pick;
 
     const handler = this._activeContext?.handler;
     if (typeof handler?.raycastVR !== 'function' || !controller?.targetRay) {
-      this._lastPointerHit = { pos: null, atMs: now };
+      this._lastPointerHit = { pick: null, atMs: now };
       return null;
     }
 
-    let pos = null;
+    let pick = null;
     try {
       // Same call convention as VRAnnotationTool._performRaycast — raycastVR
       // accepts the XRRigidTransform targetRay directly and returns
-      // { hit, position, normal, ... } in data space.
+      // { hit, position, pointId, cellId, datasetId, actorRole, ... } in
+      // data space.
       const result = handler.raycastVR(vrContext, controller.targetRay);
       if (result?.hit && result.position) {
-        pos = { x: result.position.x, y: result.position.y, z: result.position.z };
+        pick = {
+          position: { x: result.position.x, y: result.position.y, z: result.position.z },
+          pointId: result.pointId ?? -1,
+          cellId: result.cellId ?? -1,
+          datasetId: result.datasetId ?? null,
+          actorRole: result.actorRole ?? null,
+        };
       }
     } catch {
       // Swallow, but still stamp the cache below so a persistently throwing
       // picker is retried at 10 Hz rather than 90 Hz.
-      pos = null;
+      pick = null;
     }
 
-    this._lastPointerHit = { pos, atMs: now };
-    return pos;
+    this._lastPointerHit = { pick, atMs: now };
+    return pick;
   }
 
   /**
@@ -4240,11 +4270,22 @@ class VRExplorationManager extends BaseManager {
   // them to every participant (desktop and VR), closing the loop between
   // immersive actions and the shared annotation store.
 
-  _getPersistenceScope() {
+  /**
+   * @returns {Promise<{datasetId: string|null, projectId: string|null}>}
+   *   datasetId is always a real server UUID (or null) — a bundled dataset's
+   *   manifest key (e.g. "builtin-lungs") is resolved to its stable UUID row
+   *   first (see migrations/020_bundled_dataset_ids.sql / GET
+   *   /api/files/builtin), so annotation/measurement persistence never has
+   *   to special-case non-UUID ids.
+   */
+  async _getPersistenceScope() {
     const instance = this._activeContext?.instance;
-    const datasetId =
+    let datasetId =
       instance?.instanceData?.dataset?.id || instance?.datasetId || null;
     const projectId = instance?.instanceData?.projectId || null;
+    if (datasetId && isBuiltInDatasetId(datasetId)) {
+      datasetId = await resolveBuiltInDatasetId(datasetId);
+    }
     return { datasetId, projectId };
   }
 
@@ -4255,8 +4296,8 @@ class VRExplorationManager extends BaseManager {
     return annotationManager;
   }
 
-  _persistVRAnnotation(data) {
-    const { datasetId, projectId } = this._getPersistenceScope();
+  async _persistVRAnnotation(data) {
+    const { datasetId, projectId } = await this._getPersistenceScope();
     if (!datasetId || !data?.position) {
       // Marker still renders locally (the tool's own optimistic state) so
       // this looks like success in-headset unless we say otherwise — a
@@ -4289,6 +4330,13 @@ class VRExplorationManager extends BaseManager {
               vrMode: data.type,
               color: data.color,
               authorName: data.authorName || getUserName(),
+              // pointId is only meaningful relative to whichever polydata
+              // pickActorRole names — it does NOT index into the source
+              // dataset when pickActorRole is 'glyph'/'threshold'/
+              // 'isosurface'. null/-1 means no source point id was resolved.
+              pointId: data.pointId ?? null,
+              cellId: data.cellId ?? null,
+              pickActorRole: data.pickActorRole ?? null,
             },
           },
           { projectId }
@@ -4316,8 +4364,8 @@ class VRExplorationManager extends BaseManager {
       });
   }
 
-  _deletePersistedVRAnnotation(data) {
-    const { datasetId } = this._getPersistenceScope();
+  async _deletePersistedVRAnnotation(data) {
+    const { datasetId } = await this._getPersistenceScope();
     if (!datasetId || !data?.serverId) return;
 
     this._getAnnotationManager()
@@ -4327,8 +4375,8 @@ class VRExplorationManager extends BaseManager {
       .catch((err) => log.warn('Failed to delete VR annotation:', err.message));
   }
 
-  _persistVRMeasurement(data) {
-    const { datasetId, projectId } = this._getPersistenceScope();
+  async _persistVRMeasurement(data) {
+    const { datasetId, projectId } = await this._getPersistenceScope();
     if (!datasetId || !data?.startPoint || !data?.endPoint) {
       this._flashVRNotice('Measurement not saved — dataset has no server id');
       return;
@@ -4355,6 +4403,14 @@ class VRExplorationManager extends BaseManager {
               endPoint: [data.endPoint.x, data.endPoint.y, data.endPoint.z],
               distance: data.distance,
               unit: data.unit || 'units',
+              // See _persistVRAnnotation's comment: pointId is only
+              // meaningful relative to its own pickActorRole.
+              startPointId: data.startPoint.pointId ?? null,
+              startCellId: data.startPoint.cellId ?? null,
+              startActorRole: data.startPoint.pickActorRole ?? null,
+              endPointId: data.endPoint.pointId ?? null,
+              endCellId: data.endPoint.cellId ?? null,
+              endActorRole: data.endPoint.pickActorRole ?? null,
             },
           },
           { projectId }
@@ -4364,6 +4420,12 @@ class VRExplorationManager extends BaseManager {
         if (annotation) {
           data.serverId = annotation.id;
           log.debug(`VR measurement persisted as ${annotation.id}`);
+
+          // Same in-flight-undo hole as _persistVRAnnotation: Undo can
+          // tombstone this segment (see VRMeasureTool.undoLast) before this
+          // create POST resolves. Without this check the row would live on
+          // the server and stay broadcast to every participant forever.
+          if (data._deleted) this._deletePersistedVRAnnotation(data);
         }
       })
       .catch((err) => {

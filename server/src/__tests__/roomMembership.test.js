@@ -171,6 +171,64 @@ maybeDescribe('GET /api/projects/:projectId/rooms/:roomId (membership enforcemen
 
     expect(res.status).toBe(404);
   });
+
+  test('GET / (list rooms) returns 403 for a non-project-member', async () => {
+    const res = await request(app)
+      .get(`/api/projects/${privateProjectId}/rooms`)
+      .set('x-user-id', NON_MEMBER_UUID)
+      .set('x-user-name', 'Nobody');
+
+    expect(res.status).toBe(403);
+  });
+
+  test('GET / (list rooms) returns 200 with the room list for a project member', async () => {
+    const res = await request(app)
+      .get(`/api/projects/${privateProjectId}/rooms`)
+      .set('x-user-id', SEED.USER_ALICE)
+      .set('x-user-name', 'Alice');
+
+    expect(res.status).toBe(200);
+    expect(res.body.some((r) => r.id === privateRoomId)).toBe(true);
+  });
+
+  test('GET /my-permissions is reachable and returns permissions (route-order fix)', async () => {
+    const res = await request(app)
+      .get(`/api/projects/${privateProjectId}/rooms/my-permissions`)
+      .set('x-user-id', SEED.USER_ALICE)
+      .set('x-user-name', 'Alice');
+
+    expect(res.status).toBe(200);
+    expect(res.body.projectId).toBe(privateProjectId);
+    expect(Array.isArray(res.body.permissions)).toBe(true);
+  });
+
+  test('GET /:roomId/members returns 404 for a non-room-member on a private room', async () => {
+    const res = await request(app)
+      .get(`/api/projects/${privateProjectId}/rooms/${privateRoomId}/members`)
+      .set('x-user-id', SEED.USER_BOB)
+      .set('x-user-name', 'Bob');
+
+    expect(res.status).toBe(404);
+  });
+
+  test('GET /:roomId/members returns 200 with the member list for a room member', async () => {
+    const res = await request(app)
+      .get(`/api/projects/${privateProjectId}/rooms/${privateRoomId}/members`)
+      .set('x-user-id', SEED.USER_ALICE)
+      .set('x-user-name', 'Alice');
+
+    expect(res.status).toBe(200);
+    expect(res.body.members.some((m) => m.id === SEED.USER_ALICE)).toBe(true);
+  });
+
+  test('GET /:roomId/members returns 200 for a project member on a PUBLIC room they have not joined', async () => {
+    const res = await request(app)
+      .get(`/api/projects/${publicProjectId}/rooms/${publicRoomId}/members`)
+      .set('x-user-id', SEED.USER_BOB)
+      .set('x-user-name', 'Bob');
+
+    expect(res.status).toBe(200);
+  });
 });
 
 // Separate describe block: needs DEV_BYPASS_AUTH genuinely off to exercise

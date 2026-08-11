@@ -6,8 +6,8 @@
     "description": "Bone structure",
     "sizeHint": "26 MB",
     "format": "vtp",
-    "size": 27272740,
-    "contentHash": "c1d3e2a88c5bc9ea30616030db1c2d46db0b98f33b2da877256035a56473bca3"
+    "size": 27272777,
+    "contentHash": "f730e53ca63abfdc4bca456370cf7449c418b911b88833ea742b8803cce6c609"
   },
   {
     "id": "builtin-lung-vessels",
@@ -16,8 +16,8 @@
     "description": "Pulmonary vessel tree",
     "sizeHint": "27 MB",
     "format": "vtp",
-    "size": 28826464,
-    "contentHash": "a14ca75254c6729dc6c2240d1f1353ab5c922d1a528a7a5be0033fc5cb30c2e0"
+    "size": 28826501,
+    "contentHash": "f6cfc6ba9f90fda8ffa40655d99689c468e2e7c8e1c55da166e8c2df08453607"
   },
   {
     "id": "builtin-lungs",
@@ -26,8 +26,8 @@
     "description": "Lung surface mesh",
     "sizeHint": "10 MB",
     "format": "vtp",
-    "size": 10750132,
-    "contentHash": "82c785fdf2222329b761d33c3d6ac3355af152d5f12567de51365a05d3619fe7"
+    "size": 10750169,
+    "contentHash": "402d1689bd3107b143ac5cf0604a60f2118118225efb803a0a226f9a8512aac8"
   },
   {
     "id": "builtin-skull",
@@ -36,8 +36,8 @@
     "description": "Skull geometry",
     "sizeHint": "19 MB",
     "format": "vtp",
-    "size": 19988316,
-    "contentHash": "d6486a677aa1906156e3fc33b3a448b12724ca2fcc45d99445fb29bbf3847605"
+    "size": 19988353,
+    "contentHash": "019003760d32815510d271f096372d06f0ebfd122f9ff80f1206ce61b661f504"
   },
   {
     "id": "builtin-ventricles",
@@ -46,8 +46,8 @@
     "description": "Cardiac ventricles",
     "sizeHint": "16 MB",
     "format": "vtp",
-    "size": 16487240,
-    "contentHash": "569701fd7541aae0c0ea20d729fba8155aefb557d56eeb78c85aba3ea662309f"
+    "size": 16487277,
+    "contentHash": "5837a42de5e833b61db56875c324282116283f7def98fcdc06e3b621b46ff643"
   },
   {
     "id": "builtin-disk",
@@ -56,8 +56,8 @@
     "description": "Small test dataset",
     "sizeHint": "472 KB",
     "format": "vtp",
-    "size": 483237,
-    "contentHash": "cc169f7cfa11b4be05470595605d2f15632b8d8ffc693aa97f11100ad2482d85"
+    "size": 491216,
+    "contentHash": "81dd5365d095bfca38d5c7fecc794fc85762b459cdbb44528ce2fdc9076f7b0c"
   },
   {
     "id": "builtin-earth",
@@ -66,7 +66,7 @@
     "description": "Earth surface",
     "sizeHint": "1.2 MB",
     "format": "vtp",
-    "size": 1233227,
-    "contentHash": "003a55ec43fd199f3ebddd9d541f30569559b4eba6da6dd09091789031e0d2f4"
+    "size": 1233277,
+    "contentHash": "9931c02cc12376c4e0e912daa785881a225f9c33945c98e330dd3fc40ecf62af"
   }
 ]

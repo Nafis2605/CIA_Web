@@ -1,0 +1,31 @@
+# server/Dockerfile.token-server — containerizes the LiveKit token-minting
+# server (repo-root token-server.js) for production, so the gateway
+# (docker/nginx/nginx.conf's /livekit-token route) can reach it over the
+# internal Docker network like every other backend service, instead of
+# relying on it being run ad hoc on the host (`npm run token-server`, dev-only).
+#
+# token-server.js requires files under server/src/ (utils/logger,
+# middleware/auth) but every dependency those pull in (express, cors,
+# jsonwebtoken, jwks-rsa, livekit-server-sdk, pg, dotenv) is already listed
+# in the ROOT package.json — Node's module resolution walks up from
+# server/src/middleware/ and finds them there since this image has no
+# separate server/node_modules. Build context must be the repo root (see
+# docker-compose.prod.yml's `context: .`), matching how `npm run
+# token-server` already runs it in dev.
+
+FROM node:22-slim
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+COPY token-server.js ./
+COPY server/src ./server/src
+
+EXPOSE 3002
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=5 \
+  CMD node -e "fetch('http://localhost:3002/health').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"
+
+CMD ["node", "token-server.js"]

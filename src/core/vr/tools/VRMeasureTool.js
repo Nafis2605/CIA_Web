@@ -22,6 +22,7 @@ import vtkMapper from '@kitware/vtk.js/Rendering/Core/Mapper';
 import vtkSphereSource from '@kitware/vtk.js/Filters/Sources/SphereSource';
 import vtkLineSource from '@kitware/vtk.js/Filters/Sources/LineSource';
 import { VRTextBillboard } from '@Core/vr/ui/VRTextBillboard.js';
+import { vtkGlyphFeature } from '@VTK/features/VTKGlyphFeature';
 
 const ENDPOINT_APPARENT_RADIUS_M = 0.012;
 const LABEL_APPARENT_HEIGHT_M = 0.018;
@@ -76,6 +77,9 @@ export class VRMeasureTool extends VRToolInterface {
   }
 
   async deactivate() {
+    // Must run BEFORE super.deactivate() clears this._context — releases the
+    // glyph-selection hint via this._context.vrContext.instanceId.
+    this._clearSelectedGlyphPoint();
     await super.deactivate();
     this._previewPoint = null;
     this._clearVisuals();
@@ -105,10 +109,11 @@ export class VRMeasureTool extends VRToolInterface {
     if (!rightCtrl) return null;
 
     if (triggerRisingEdge) {
-      // Data-control gate — see the identical check in VRAnnotationTool:
-      // enforced at placement, not at tool selection, and fails open when no
-      // predicate was injected into the tool context.
-      if (this._context?.canManipulate?.('Measurement') === false) return null;
+      // Measurement placement is intentionally NOT gated by the shared
+      // VRManipulationLock data-control token — see VRAnnotationTool and
+      // VRExplorationManager.js's "DATA-MANIPULATION TOKEN" comment. It's an
+      // additive, per-user, non-conflicting write, so any participant may
+      // place one at any time regardless of who holds the token.
       return this._addPoint(rightCtrl, frame);
     }
 
@@ -139,9 +144,22 @@ export class VRMeasureTool extends VRToolInterface {
     const hit = this._performRaycast(controller, frame);
     if (!hit) return null;
 
-    const point = { ...hit.position };
+    // pointId/cellId/pickActorRole ride alongside x/y/z on each point —
+    // startPoint/endPoint below are plain spreads of these, so the fields
+    // carry through to persistence automatically. pointId is only
+    // meaningful relative to whichever polydata pickActorRole names.
+    const point = {
+      ...hit.position,
+      pointId: hit.pointId ?? null,
+      cellId: hit.cellId ?? null,
+      pickActorRole: hit.actorRole ?? null,
+    };
     const previous = this._points[this._points.length - 1] || null;
     this._points.push(point);
+
+    // The just-placed point is the active chain endpoint — keep it visible
+    // even if glyph density subsampling would otherwise drop it.
+    this._setSelectedGlyphPoint(point);
 
     if (!previous) {
       return { type: 'measurement-start-placed', data: { point } };
@@ -175,9 +193,19 @@ export class VRMeasureTool extends VRToolInterface {
     this._points.pop();
     this._previewPoint = null;
 
+    // The new chain endpoint (if any) becomes the selection hint; none left
+    // means nothing to pin anymore.
+    const newLast = this._points[this._points.length - 1] || null;
+    if (newLast) this._setSelectedGlyphPoint(newLast);
+    else this._clearSelectedGlyphPoint();
+
     // Removing point N also removes the segment (N-1 -> N).
     if (this._segments.length > this._points.length - 1 && this._segments.length) {
       const removed = this._segments.pop();
+      // Tombstone so an in-flight persistence POST (create) that resolves
+      // AFTER this undo knows to delete what it just created — see
+      // VRExplorationManager._persistVRMeasurement.
+      removed._deleted = true;
       return { type: 'measurement-removed', data: removed };
     }
 
@@ -204,8 +232,33 @@ export class VRMeasureTool extends VRToolInterface {
     this._points = [];
     this._segments = [];
     this._previewPoint = null;
+    this._clearSelectedGlyphPoint();
 
     return { type: 'measurement-path-completed', data: path };
+  }
+
+  /**
+   * Pin (or release) the glyph-density "always show this point" hint on the
+   * source dataset, keyed to the active chain endpoint. No-ops for a
+   * non-source pick (glyph/threshold/isosurface pointId isn't a
+   * source-dataset index — see raycastVR's excludeDerivedActors doc).
+   * @param {{pointId?:number|null, pickActorRole?:string|null}|null} point
+   * @private
+   */
+  _setSelectedGlyphPoint(point) {
+    const instanceId = this._context?.vrContext?.instanceId;
+    if (!instanceId) return;
+    if (point?.pickActorRole === 'source' && point?.pointId != null) {
+      vtkGlyphFeature.setSelectedPoint(instanceId, point.pointId);
+    } else {
+      vtkGlyphFeature.clearSelectedPoint(instanceId);
+    }
+  }
+
+  /** Release the glyph-density selection hint set by _setSelectedGlyphPoint. @private */
+  _clearSelectedGlyphPoint() {
+    const instanceId = this._context?.vrContext?.instanceId;
+    if (instanceId) vtkGlyphFeature.clearSelectedPoint(instanceId);
   }
 
   /** @returns {number} summed length of the active path */
@@ -435,9 +488,13 @@ export class VRMeasureTool extends VRToolInterface {
 
   _performRaycast(controller, frame) {
     if (!controller?.targetRay) return null;
+    // excludeDerivedActors: bias toward a pointId relative to the actual
+    // source dataset (see raycastVR's option doc) rather than derived (and,
+    // for glyphs, regenerated-on-density-change) geometry.
     return this._context.handler.raycastVR?.(
       this._context.vrContext,
-      controller.targetRay
+      controller.targetRay,
+      { excludeDerivedActors: true }
     );
   }
 

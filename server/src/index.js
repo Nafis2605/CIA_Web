@@ -295,6 +295,9 @@ const vrRouter = require("./routes/vr");
 // Matrix federation routes (Phase 5)
 const matrixRouter = require("./routes/matrix");
 
+// Render server token minting (short-lived, scoped credentials)
+const renderTokenRouter = require("./routes/renderToken");
+
 app.use("/api/files", optionalAuth, filesRouter);
 app.use("/api/annotations", optionalAuth, annotationsRouter);
 app.use("/api/views", optionalAuth, viewsRouter);
@@ -355,6 +358,11 @@ app.use("/api/gpu", gpuRouter);
 
 // Matrix federation routes (Phase 5)
 app.use("/api/matrix", optionalAuth, matrixRouter);
+
+// Render server token minting — router itself requires authenticate (see
+// renderToken.js), not just optionalAuth, since minting a credential must
+// reject anonymous callers outright.
+app.use("/api/render", renderTokenRouter);
 
 // ============================================================================
 // HEALTH & STATUS ENDPOINTS

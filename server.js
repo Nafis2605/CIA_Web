@@ -985,28 +985,50 @@ function detectUpdateOrigin(room) {
  * Build a snapshot Y.js update containing only durable roots — used for both
  * Room.close()'s shutdown snapshot and the periodic scheduleSnapshots
  * callback, so persisted state can never resurrect transient presence/pose/
- * lock/session data after a restart. Y.js has no native per-root filtered
- * encoding, so this copies durable root content into a scratch Y.Doc and
- * encodes that instead. This collapses per-op CRDT history for the copied
- * roots, which is fine — storeSnapshot already does a full overwrite
- * (`UPDATE ... SET document_state = $2`), i.e. snapshots are squashes today
- * regardless.
+ * lock/session data after a restart.
+ *
+ * This works by round-tripping the whole doc through Yjs's own update
+ * encoding into a scratch Y.Doc, then deleting the transient roots' content
+ * in the copy — NOT by copying wanted values across by reference. Some
+ * durable roots (e.g. visualizationState — see syncVisualizationToYjs in
+ * yjsSetup.js) nest already-integrated Y.Map/Y.Array values, and a Yjs shared
+ * type can only ever belong to one Y.Doc; `scratch.getMap(name).set(key,
+ * value)` with such a value throws. Y.applyUpdate always constructs fresh
+ * type instances owned by `scratch`, so nothing from `doc` is ever reused,
+ * and arbitrary nesting depth is handled automatically. With gc enabled
+ * (the default for a plain `new Y.Doc()`), deleting a transient root's
+ * entries drops their content from subsequent encodeStateAsUpdate calls —
+ * same net effect as the old copy-what's-wanted approach. This collapses
+ * per-op CRDT history for every root, which is fine — storeSnapshot already
+ * does a full overwrite (`UPDATE ... SET document_state = $2`), i.e.
+ * snapshots are squashes today regardless.
+ *
+ * Root type/name info is read from the ORIGINAL `doc.share` (not
+ * `scratch.share`): after Y.applyUpdate, an untouched root in `scratch.share`
+ * is a bare AbstractType stub, not yet upgraded to the concrete YMap/YArray
+ * subclass — `instanceof Y.Map` would never match, and stubs have no
+ * `.clear()`/`.delete()`. Calling `scratch.getMap(name)`/`getArray(name)`
+ * upgrades (or creates) the properly-typed instance to actually mutate.
  * @param {Y.Doc} doc
  * @returns {Uint8Array}
  */
 function buildDurableSnapshotState(doc) {
   const scratch = new Y.Doc();
+  Y.applyUpdate(scratch, Y.encodeStateAsUpdate(doc));
+
   for (const [name, type] of doc.share.entries()) {
-    if (!isDurableRootName(name)) continue;
+    if (isDurableRootName(name)) continue; // keep durable roots as-is
+
     if (type instanceof Y.Map) {
-      const target = scratch.getMap(name);
-      type.forEach((value, key) => target.set(key, value));
+      scratch.getMap(name).clear();
     } else if (type instanceof Y.Array) {
-      scratch.getArray(name).push(type.toArray());
+      const arr = scratch.getArray(name);
+      if (arr.length > 0) arr.delete(0, arr.length);
     } else {
-      syncLog.warn("Skipping unrecognized root type during snapshot filter:", name);
+      syncLog.warn("Could not strip unrecognized transient root type from snapshot:", name);
     }
   }
+
   return Y.encodeStateAsUpdate(scratch);
 }
 
@@ -1063,52 +1085,87 @@ async function checkProjectAccess(projectId, userId) {
   }
 }
 
+const ROOM_DOC_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ROOM_DOC_PROJ_PREFIX_RE =
+  /^project:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+
 /**
- * Check if user can access a Y.js room document.
+ * Check if user can access a Y.js room document, and resolve the room's
+ * real project id.
  *
  * Access rules:
  * 1. Room membership: if the roomId is a known room UUID, user must be in room_members
- *    OR the room must be public AND user must be a project member.
- * 2. Project membership: if projectId is provided and roomId lookup fails, fall back
- *    to project-level check (covers pre-DR6 room names that are project UUIDs).
- * 3. If neither roomId nor projectId resolves, deny access.
+ *    OR the room must be public AND user must be a project member (of that room's own project).
+ * 2. Legacy fallback: if roomId does NOT match any row in `rooms`, it is treated as a
+ *    pre-DR6 room name that IS a project UUID (bare UUID, or "project:<uuid>") — checked
+ *    via project_members using the UUID extracted from roomId itself.
+ * 3. Otherwise denied.
  *
- * @param {string} roomId      Y.js room name (typically a CIA room UUID)
- * @param {string} userId      Authenticated user ID
- * @param {string|null} projectId  Optional project UUID passed as URL param
- * @returns {Promise<boolean>}
+ * IMPORTANT: this never trusts a client-supplied projectId — the room-to-project
+ * relationship is always looked up from the database (or derived deterministically
+ * from roomId's own format), never from a separate, independently-controlled
+ * parameter. Otherwise a user could pair a private room's UUID with an unrelated
+ * project they belong to and slip past the room-membership check.
+ *
+ * @param {string} roomId Y.js room name (typically a CIA room UUID)
+ * @param {string} userId Authenticated user ID
+ * @returns {Promise<{allowed: boolean, projectId: string|null}>}
  */
-async function checkRoomDocumentAccess(roomId, userId, projectId) {
+async function checkRoomDocumentAccess(roomId, userId) {
   if (!persistence?.pool) {
-    wsLog.warn("Room access check skipped (no DB pool)");
-    return true; // Fail open when no DB (dev without postgres)
+    wsLog.warn("Room access check skipped (no DB pool) — denying access");
+    return { allowed: false, projectId: null }; // Fail closed — can't verify membership
   }
 
   try {
-    // Room membership check (private rooms: must be member; public rooms: project member)
-    const roomResult = await persistence.pool.query(
-      `SELECT 1 FROM room_members rm WHERE rm.room_id = $1 AND rm.user_id = $2
-       UNION
-       SELECT 1 FROM rooms r
-         JOIN project_members pm ON pm.project_id = r.project_id
-       WHERE r.id = $1 AND pm.user_id = $2 AND r.is_public = true`,
-      [roomId, userId]
-    );
-    if (roomResult.rows.length > 0) return true;
-
-    // Fallback: project-level check (covers legacy room names = project UUIDs)
-    if (projectId) {
-      const projResult = await persistence.pool.query(
-        `SELECT 1 FROM project_members WHERE project_id = $1 AND user_id = $2`,
-        [projectId, userId]
+    if (ROOM_DOC_UUID_RE.test(roomId)) {
+      // Room membership check (private rooms: must be member; public rooms: project member)
+      const roomResult = await persistence.pool.query(
+        `SELECT r.project_id FROM room_members rm
+           JOIN rooms r ON r.id = rm.room_id
+         WHERE rm.room_id = $1 AND rm.user_id = $2
+         UNION
+         SELECT r.project_id FROM rooms r
+           JOIN project_members pm ON pm.project_id = r.project_id
+         WHERE r.id = $1 AND pm.user_id = $2 AND r.is_public = true`,
+        [roomId, userId]
       );
-      if (projResult.rows.length > 0) return true;
+      if (roomResult.rows.length > 0) {
+        return { allowed: true, projectId: roomResult.rows[0].project_id };
+      }
+
+      // roomId is a real room the user isn't in — don't fall through to the
+      // legacy path below for a room that actually exists.
+      const roomExists = await persistence.pool.query(
+        `SELECT 1 FROM rooms WHERE id = $1`,
+        [roomId]
+      );
+      if (roomExists.rows.length > 0) {
+        return { allowed: false, projectId: null };
+      }
     }
 
-    return false;
+    // Legacy fallback: pre-DR6 room names ARE project UUIDs (no `rooms` row).
+    // Only the UUID embedded in roomId itself is trusted here.
+    const projPrefixMatch = ROOM_DOC_PROJ_PREFIX_RE.exec(roomId);
+    const legacyProjectId = projPrefixMatch
+      ? projPrefixMatch[1]
+      : ROOM_DOC_UUID_RE.test(roomId)
+        ? roomId
+        : null;
+    if (!legacyProjectId) return { allowed: false, projectId: null };
+
+    const projResult = await persistence.pool.query(
+      `SELECT 1 FROM project_members WHERE project_id = $1 AND user_id = $2`,
+      [legacyProjectId, userId]
+    );
+    return projResult.rows.length > 0
+      ? { allowed: true, projectId: legacyProjectId }
+      : { allowed: false, projectId: null };
   } catch (error) {
     wsLog.error("Failed to check room document access:", error.message);
-    return false;
+    return { allowed: false, projectId: null };
   }
 }
 
@@ -1147,7 +1204,10 @@ wss.on("connection", async (socket, req) => {
     return;
   }
 
-  // Extract projectId — prefer explicit URL param, fall back to room-name convention
+  // Extract projectId — prefer explicit URL param, fall back to room-name convention.
+  // This is only a display/logging hint and a DEV_BYPASS_AUTH convenience — it is
+  // never used to authorize room-document access. checkRoomDocumentAccess() below
+  // resolves the authoritative project from the room itself and overwrites this.
   let projectId = url.searchParams.get("projectId") || null;
   if (!projectId) {
     if (roomName.startsWith("project:")) {
@@ -1160,20 +1220,25 @@ wss.on("connection", async (socket, req) => {
 
   // DR6: Room document access check — membership required in production
   if (!DEV_BYPASS_AUTH) {
-    const hasAccess = await checkRoomDocumentAccess(roomName, socket.userId, projectId);
-    if (!hasAccess) {
+    const { allowed, projectId: verifiedProjectId } = await checkRoomDocumentAccess(
+      roomName,
+      socket.userId
+    );
+    if (!allowed) {
       wsLog.warn(
         "Y.js room access denied:",
         socket.userId,
         "→",
         roomName,
-        "(project:",
+        "(requested project hint:",
         projectId,
         ")"
       );
       socket.close(1008, "Access denied to room document");
       return;
     }
+    // Use the DB-verified project association, not the client-supplied hint.
+    projectId = verifiedProjectId;
   }
 
   socket.clientId = null; // Will be set from awareness
@@ -1365,8 +1430,16 @@ process.on("SIGTERM", shutdown);
 
 serverLog.info("Starting Y.js WebSocket server with persistence...");
 
-// Additive: exposes pure helper functions for unit testing (this file has no
+// Additive: exposes helper functions for unit testing (this file has no
 // other exports — it's the process entry point, started via `node server.js`,
 // not normally required as a module — requiring it still runs the startup
 // sequence above; only these functions are useful to import elsewhere).
-module.exports = { classifyTransientRoot, isDurableRootName, buildDurableSnapshotState };
+// checkRoomDocumentAccess reads module-scoped `persistence` internally, so
+// tests exercise it by mocking `persistence.pool.query` via the
+// YjsPersistenceService mock (see yjsWebsocketServer.test.js).
+module.exports = {
+  classifyTransientRoot,
+  isDurableRootName,
+  buildDurableSnapshotState,
+  checkRoomDocumentAccess,
+};

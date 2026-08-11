@@ -9,6 +9,7 @@ import vtkSphereSource from '@kitware/vtk.js/Filters/Sources/SphereSource';
 import { VRTextBillboard } from '@Core/vr/ui/VRTextBillboard.js';
 import { MAX_ANNOTATION_TEXT } from '@Core/vr/VRKeyboardModel.js';
 import { getUserName } from '@Collaboration/presence/userManagement.js';
+import { vtkGlyphFeature } from '@VTK/features/VTKGlyphFeature';
 
 // Apparent radius (metres) of a placed-annotation marker sphere, kept constant
 // as the world scales via VRToolInterface._apparentScale.
@@ -114,8 +115,10 @@ export class VRAnnotationTool extends VRToolInterface {
   }
 
   async deactivate() {
-    await super.deactivate();
+    // Must run BEFORE super.deactivate() clears this._context — cancelDraft()
+    // releases the glyph-selection hint via this._context.vrContext.instanceId.
     this.cancelDraft();
+    await super.deactivate();
     this._disposeDraftMarker();
     this._clearMarkers();
   }
@@ -394,14 +397,15 @@ export class VRAnnotationTool extends VRToolInterface {
     }
 
     if (triggerRisingEdge) {
-      // Data-control gate (VRManipulationLock, injected via the tool context).
-      // Checked on PLACEMENT, not on tool selection: a non-holder can still
-      // pick Annotate, aim, and find out on the first pull that they need the
-      // token — which is far clearer than a greyed-out button. Fails open when
-      // no predicate was injected. rightCtrl is guaranteed non-null here:
-      // triggerRisingEdge can only be true when triggerPressed was, which
-      // requires rightCtrl to have been truthy this frame.
-      if (this._context?.canManipulate?.('Annotation') === false) return null;
+      // Annotation placement is intentionally NOT gated by the shared
+      // VRManipulationLock data-control token — see VRExplorationManager.js's
+      // "DATA-MANIPULATION TOKEN" comment. It's an additive, per-user,
+      // non-conflicting write (unlike clip/threshold/glyph, which mutate ONE
+      // shared representation of the dataset), so any participant may place
+      // one at any time regardless of who holds the token. rightCtrl is
+      // guaranteed non-null here: triggerRisingEdge can only be true when
+      // triggerPressed was, which requires rightCtrl to have been truthy
+      // this frame.
       const hit = this._performRaycast(rightCtrl, frame);
       if (hit) return this._openDraft(hit);
     }
@@ -438,6 +442,13 @@ export class VRAnnotationTool extends VRToolInterface {
       id: `annot_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
       position: { ...hit.position },
       normal: hit.normal ? { ...hit.normal } : null,
+      // pointId is only meaningful relative to whichever polydata
+      // pickActorRole names — it does NOT index into the source dataset
+      // when pickActorRole is 'glyph'/'threshold'/'isosurface'. -1/null
+      // means no source point id could be resolved for this pick.
+      pointId: hit.pointId ?? null,
+      cellId: hit.cellId ?? null,
+      pickActorRole: hit.actorRole ?? null,
       timestamp: Date.now(),
       color: this._getAnnotationColor(),
       size: 0.02, // 2cm marker
@@ -445,7 +456,35 @@ export class VRAnnotationTool extends VRToolInterface {
       fallbackText: this._pendingLabel || ANNOTATION_LABEL_PRESETS[0],
     };
 
+    // A source-surface pick's point is being actively annotated — keep it
+    // visible even if glyph density subsampling would otherwise drop it.
+    this._setSelectedGlyphPoint(hit);
+
     return { type: 'annotation-pending', data: this._draft };
+  }
+
+  /**
+   * Pin (or release) the glyph-density "always show this point" hint on the
+   * source dataset, keyed to whatever the current draft is anchored to.
+   * No-ops for a non-source pick (glyph/threshold/isosurface pointId isn't a
+   * source-dataset index — see raycastVR's excludeDerivedActors doc).
+   * @param {{pointId?:number|null, actorRole?:string|null}|null} hit
+   * @private
+   */
+  _setSelectedGlyphPoint(hit) {
+    const instanceId = this._context?.vrContext?.instanceId;
+    if (!instanceId) return;
+    if (hit?.actorRole === 'source' && hit?.pointId != null) {
+      vtkGlyphFeature.setSelectedPoint(instanceId, hit.pointId);
+    } else {
+      vtkGlyphFeature.clearSelectedPoint(instanceId);
+    }
+  }
+
+  /** Release the glyph-density selection hint set by _setSelectedGlyphPoint. @private */
+  _clearSelectedGlyphPoint() {
+    const instanceId = this._context?.vrContext?.instanceId;
+    if (instanceId) vtkGlyphFeature.clearSelectedPoint(instanceId);
   }
 
   /**
@@ -510,6 +549,7 @@ export class VRAnnotationTool extends VRToolInterface {
 
     this._draft = null;
     this._suppressUntilRelease = true;
+    this._clearSelectedGlyphPoint();
 
     return { type: 'annotation-created', data: annotation };
   }
@@ -528,6 +568,7 @@ export class VRAnnotationTool extends VRToolInterface {
     this._draft = null;
     this._disposeDraftMarker();
     this._suppressUntilRelease = true;
+    this._clearSelectedGlyphPoint();
 
     return { type: 'annotation-cancelled', data: { id } };
   }
@@ -640,9 +681,13 @@ export class VRAnnotationTool extends VRToolInterface {
   _performRaycast(controller, frame) {
     if (!controller?.targetRay) return null;
 
+    // excludeDerivedActors: bias toward a pointId relative to the actual
+    // source dataset (see raycastVR's option doc) rather than derived (and,
+    // for glyphs, regenerated-on-density-change) geometry.
     return this._context.handler.raycastVR?.(
       this._context.vrContext,
-      controller.targetRay
+      controller.targetRay,
+      { excludeDerivedActors: true }
     );
   }
 

@@ -177,7 +177,7 @@ export class VRProbeTool extends VRToolInterface {
     if (rightCtrl && this._continuousMode && rightCtrl.triggerValue > 0.5) {
       const hit = this._performRaycast(rightCtrl, frame);
       if (hit) {
-        const probeData = this._probeAtPosition(hit.position);
+        const probeData = this._probeAtPosition(hit.position, hit.actor);
         this._currentProbe = {
           position: { ...hit.position },
           data: probeData,
@@ -213,7 +213,7 @@ export class VRProbeTool extends VRToolInterface {
       const hit = this._performRaycast(rightCtrl, frame);
 
       if (hit) {
-        const probeData = this._probeAtPosition(hit.position);
+        const probeData = this._probeAtPosition(hit.position, hit.actor);
 
         const probe = {
           id: `probe_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
@@ -296,11 +296,16 @@ export class VRProbeTool extends VRToolInterface {
     };
   }
 
-  _probeAtPosition(position) {
-    // Delegate to handler to get actual data values
+  _probeAtPosition(position, actor) {
+    // Delegate to handler to get actual data values. Passing the actor the
+    // raycast actually hit (rather than always the primary source actor)
+    // means probing a glyph/threshold/isosurface surface reads THAT
+    // actor's polydata instead of silently misreading the (possibly
+    // hidden) source dataset.
     const probeResult = this._context.handler.probeDataVR?.(
       this._context.vrContext,
-      position
+      position,
+      actor
     );
 
     if (probeResult) {

@@ -94,7 +94,7 @@ describe("SimpleAvatarFallback — pointer ray + surface hit marker", () => {
   });
 
   it("keeps body and hit marker at the SAME scale so the dot stays on the hand", () => {
-    avatar.updatePose(makePose({ pointerHit: { x: 0, y: 1, z: -2 } }), 4);
+    avatar.updatePose(makePose({ pointerHit: { position: { x: 0, y: 1, z: -2 } } }), 4);
 
     expect(avatar._hitMarkerActor.getScale()[0]).toBeCloseTo(
       avatar._headActor.getScale()[0]
@@ -118,7 +118,7 @@ describe("SimpleAvatarFallback — pointer ray + surface hit marker", () => {
   });
 
   it("terminates the ray AT the hit point when pointerHit is set", () => {
-    const hit = { x: 3, y: -2, z: 9 };
+    const hit = { position: { x: 3, y: -2, z: 9 } };
     avatar.updatePose(makePose({ pointerHit: hit }));
 
     const line = avatar._pointerLineSource;
@@ -138,7 +138,7 @@ describe("SimpleAvatarFallback — pointer ray + surface hit marker", () => {
   });
 
   it("shows the hit marker at the hit point", () => {
-    avatar.updatePose(makePose({ pointerHit: { x: 3, y: -2, z: 9 } }));
+    avatar.updatePose(makePose({ pointerHit: { position: { x: 3, y: -2, z: 9 } } }));
 
     expect(avatar._hitMarkerActor.getVisibility()).toBe(true);
     expect(avatar._hitMarkerActor.getPosition()).toEqual([3, -2, 9]);
@@ -155,15 +155,29 @@ describe("SimpleAvatarFallback — pointer ray + surface hit marker", () => {
   });
 
   it("scales the marker by the LOCAL viewer's 1/vrScale so it reads a constant physical size", () => {
-    avatar.updatePose(makePose({ pointerHit: { x: 0, y: 0, z: 0 } }), 4);
+    avatar.updatePose(makePose({ pointerHit: { position: { x: 0, y: 0, z: 0 } } }), 4);
     expect(avatar._hitMarkerActor.getScale()).toEqual([0.25, 0.25, 0.25]);
 
-    avatar.updatePose(makePose({ pointerHit: { x: 0, y: 0, z: 0 } }), 0.5);
+    avatar.updatePose(makePose({ pointerHit: { position: { x: 0, y: 0, z: 0 } } }), 0.5);
     expect(avatar._hitMarkerActor.getScale()).toEqual([2, 2, 2]);
 
     // Missing/zero scale must not produce Infinity
-    avatar.updatePose(makePose({ pointerHit: { x: 0, y: 0, z: 0 } }));
+    avatar.updatePose(makePose({ pointerHit: { position: { x: 0, y: 0, z: 0 } } }));
     expect(avatar._hitMarkerActor.getScale()).toEqual([1, 1, 1]);
+  });
+
+  it("tints the hit marker for a derived-actor pick, and resets to the user's color for a source hit", () => {
+    avatar.updatePose(
+      makePose({ pointerHit: { position: { x: 0, y: 0, z: 0 }, actorRole: "glyph" } })
+    );
+    expect(avatar._hitMarkerActor.getProperty().getColor()).toEqual(
+      expect.arrayContaining([0.75])
+    );
+
+    avatar.updatePose(
+      makePose({ pointerHit: { position: { x: 0, y: 0, z: 0 }, actorRole: "source" } })
+    );
+    expect(avatar._hitMarkerActor.getProperty().getColor()).toEqual(avatar._baseColor);
   });
 
   it("never lets the marker become a VR pick target", () => {

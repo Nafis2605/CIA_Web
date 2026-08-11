@@ -445,9 +445,14 @@ export function getVRSessionForView(viewConfigurationId) {
 
 /**
  * Try to claim the VR session slot for a view. If a live record already
- * exists there — another client claimed it first — that record is returned
- * UNCHANGED and the caller must adopt it rather than overwrite it. Otherwise
- * our record is written and returned.
+ * exists there AND belongs to a DIFFERENT host — another client claimed it
+ * first — that record is returned UNCHANGED and the caller must adopt it
+ * rather than overwrite it. If the live record belongs to the SAME host,
+ * this is not a competing claim — it's that host updating its own record
+ * (e.g. rekeying from a temporary id to the server-assigned one after a slow
+ * registration completes late), so it's allowed through, preserving the
+ * original createdAt/participantCount rather than resetting them. Otherwise
+ * (no live record at all) our record is written and returned.
  *
  * Two clients can call this "simultaneously" (neither sees a live record
  * yet) and both write; Y.js Map is last-writer-wins, so every client
@@ -459,14 +464,14 @@ export function getVRSessionForView(viewConfigurationId) {
  *
  * @param {string} viewConfigurationId
  * @param {{sessionId:string, hostUserId:string, hostUserName:string, datasetId?:string, projectId?:string, participantCount?:number}} record
- * @returns {object} the record that won the claim — ours, or the pre-existing live one
+ * @returns {object} the record that won the claim — ours, or the pre-existing live one from a different host
  */
 export function claimVRSession(viewConfigurationId, record) {
   let winner = record;
   try {
     ydoc.transact(() => {
       const existing = yVRSessions.get(viewConfigurationId);
-      if (isLiveVRSessionRecord(existing)) {
+      if (isLiveVRSessionRecord(existing) && existing.hostUserId !== record.hostUserId) {
         winner = existing;
         return;
       }
@@ -474,9 +479,9 @@ export function claimVRSession(viewConfigurationId, record) {
       winner = {
         ...record,
         viewConfigurationId,
-        createdAt: record.createdAt || now,
+        createdAt: existing?.createdAt || record.createdAt || now,
         lastHeartbeat: now,
-        participantCount: record.participantCount || 1,
+        participantCount: existing?.participantCount || record.participantCount || 1,
       };
       yVRSessions.set(viewConfigurationId, winner);
     });
@@ -488,15 +493,18 @@ export function claimVRSession(viewConfigurationId, record) {
 
 /**
  * Refresh lastHeartbeat so the record doesn't go stale while its session is
- * active. Any participant may call this, not just the host — no-op if there
- * is no record for the view (e.g. it was already released).
+ * active. Host-only: a non-host calling this is a no-op, so a guest can never
+ * keep a crashed/disconnected host's record artificially live — that would
+ * block the stale-record election in VRExplorationManager's
+ * _tickVRSessionRegistry from ever running after an ungraceful host
+ * disconnect (no clean releaseVRSession call).
  * @param {string} viewConfigurationId
- * @param {string} userId - unused today; kept for parity with releaseVRSession's signature
+ * @param {string} userId - caller's user id; must match the record's hostUserId to take effect
  */
 export function heartbeatVRSession(viewConfigurationId, userId) {
   try {
     const existing = yVRSessions.get(viewConfigurationId);
-    if (!existing) return;
+    if (!existing || existing.hostUserId !== userId) return;
     yVRSessions.set(viewConfigurationId, {
       ...existing,
       lastHeartbeat: Date.now(),

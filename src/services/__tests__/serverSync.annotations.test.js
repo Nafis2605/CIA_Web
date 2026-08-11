@@ -33,7 +33,9 @@ vi.mock("@UI/react/store/toastStore.js", () => ({
 const mockApplyDeltaEvents = vi.fn().mockResolvedValue({ lastAppliedEventId: null });
 const mockFetchDeltaSince = vi.fn().mockResolvedValue({ events: [] });
 const mockSaveSyncWatermark = vi.fn();
+const mockGetSyncWatermark = vi.fn().mockReturnValue(0);
 vi.mock("@Services/syncService.js", () => ({
+  getSyncWatermark: (...a) => mockGetSyncWatermark(...a),
   saveSyncWatermark: (...a) => mockSaveSyncWatermark(...a),
   fetchDeltaSince: (...a) => mockFetchDeltaSince(...a),
   applyDeltaEvents: (...a) => mockApplyDeltaEvents(...a),
@@ -62,6 +64,7 @@ describe("serverSync annotation/filter broadcast wiring", () => {
     mockSaveSyncWatermark.mockClear();
     mockApplyDeltaEvents.mockClear();
     mockFetchDeltaSince.mockClear();
+    mockGetSyncWatermark.mockClear();
   });
 
   test("annotation:created forwards to AnnotationManager and dispatches ws event", () => {

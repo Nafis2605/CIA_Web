@@ -12,6 +12,7 @@ vi.mock("@Utils/logger.js", () => {
 });
 
 import { VRMeasureTool } from "../VRMeasureTool.js";
+import { vtkGlyphFeature } from "@VTK/features/VTKGlyphFeature";
 
 function makeSpyRenderer() {
   const actors = [];
@@ -79,6 +80,36 @@ describe("VRMeasureTool — measurement rendering", () => {
     expect(tool.getMeasurements().length).toBe(1);
     expect(tool._segmentActors[0].actor.getVisibility()).toBe(true);
     expect(tool._segmentActors[0].label.getText()).toContain("5.000");
+  });
+
+  it("requests excludeDerivedActors and carries pointId/cellId/actorRole from each hit into the segment", () => {
+    raycastVR
+      .mockReset()
+      .mockReturnValueOnce({ position: { x: 0, y: 0, z: 0 }, pointId: 1, cellId: 10, actorRole: "source" })
+      .mockReturnValue({ position: { x: 3, y: 4, z: 0 }, pointId: 2, cellId: 11, actorRole: "glyph" });
+
+    placeStart();
+    const endAction = placeEnd();
+
+    expect(raycastVR).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      { excludeDerivedActors: true }
+    );
+    expect(endAction.data.startPoint).toMatchObject({ pointId: 1, cellId: 10, pickActorRole: "source" });
+    expect(endAction.data.endPoint).toMatchObject({ pointId: 2, cellId: 11, pickActorRole: "glyph" });
+  });
+
+  it("defaults pointId/cellId/pickActorRole to null when a hit carries none", () => {
+    raycastVR
+      .mockReset()
+      .mockReturnValue({ position: { x: 0, y: 0, z: 0 } });
+
+    placeStart();
+    const endAction = placeEnd();
+
+    expect(endAction.data.startPoint.pointId).toBeNull();
+    expect(endAction.data.endPoint.pickActorRole).toBeNull();
   });
 
   it("shows only the point marker while the segment is still open", () => {
@@ -219,6 +250,13 @@ describe("VRMeasureTool — chained polyline", () => {
     expect(tool.getMeasurements().length).toBe(1);
   });
 
+  it("undo tombstones the removed segment with _deleted, mirroring annotation undo", () => {
+    tap(tool); tap(tool);
+
+    const undone = tool.undoLast();
+    expect(undone.data._deleted).toBe(true);
+  });
+
   it("undo of a lone start point cancels rather than removing a segment", () => {
     tap(tool);
     expect(tool.undoLast()).toMatchObject({ type: "measurement-cancelled" });
@@ -287,5 +325,79 @@ describe("VRMeasureTool — chained polyline", () => {
   it("caps the path length rather than growing actors without bound", () => {
     for (let i = 0; i < 70; i++) tap(tool);
     expect(tool.getPoints().length).toBeLessThanOrEqual(64);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Glyph-density "keep this point visible" hint (source-surface picks only —
+// a glyph/threshold/isosurface pointId isn't a source-dataset index).
+// ---------------------------------------------------------------------------
+describe("VRMeasureTool — glyph selection hint", () => {
+  let tool;
+  const instanceId = "instance-1";
+
+  beforeEach(async () => {
+    vi.restoreAllMocks();
+    vi.spyOn(vtkGlyphFeature, "setSelectedPoint").mockImplementation(() => {});
+    vi.spyOn(vtkGlyphFeature, "clearSelectedPoint").mockImplementation(() => {});
+    tool = new VRMeasureTool();
+    await tool.activate({
+      handler: { raycastVR: vi.fn() },
+      vrContext: { instanceId, vrScale: 1 },
+    });
+  });
+
+  it("pins the source point when the active chain endpoint is a source-surface pick", () => {
+    tool._context.handler.raycastVR = vi.fn(() => ({
+      position: { x: 1, y: 0, z: 0 },
+      pointId: 7,
+      actorRole: "source",
+    }));
+
+    tool.handleInput(makeInputState({ triggerPressed: true }), {});
+
+    expect(vtkGlyphFeature.setSelectedPoint).toHaveBeenCalledWith(instanceId, 7);
+  });
+
+  it("moves the pin to the previous point on undo, or clears it when the path empties", () => {
+    let i = 0;
+    const points = [
+      { x: 0, y: 0, z: 0, pointId: 1 },
+      { x: 1, y: 0, z: 0, pointId: 2 },
+    ];
+    tool._context.handler.raycastVR = vi.fn(() => ({
+      position: points[i],
+      pointId: points[i].pointId,
+      actorRole: "source",
+    }));
+
+    tool.handleInput(makeInputState({ triggerPressed: true }), {});
+    i = 1;
+    tool._lastTriggerState = false;
+    tool.handleInput(makeInputState({ triggerPressed: true }), {});
+    expect(vtkGlyphFeature.setSelectedPoint).toHaveBeenLastCalledWith(instanceId, 2);
+
+    tool.undoLast();
+    expect(vtkGlyphFeature.setSelectedPoint).toHaveBeenLastCalledWith(instanceId, 1);
+
+    tool.undoLast();
+    expect(vtkGlyphFeature.clearSelectedPoint).toHaveBeenCalledWith(instanceId);
+  });
+
+  it("clears the pin on newPath and on deactivate", async () => {
+    tool._context.handler.raycastVR = vi.fn(() => ({
+      position: { x: 1, y: 0, z: 0 },
+      pointId: 7,
+      actorRole: "source",
+    }));
+    tool.handleInput(makeInputState({ triggerPressed: true }), {});
+    vtkGlyphFeature.clearSelectedPoint.mockClear();
+
+    tool.newPath();
+    expect(vtkGlyphFeature.clearSelectedPoint).toHaveBeenCalledWith(instanceId);
+
+    vtkGlyphFeature.clearSelectedPoint.mockClear();
+    await tool.deactivate();
+    expect(vtkGlyphFeature.clearSelectedPoint).toHaveBeenCalledWith(instanceId);
   });
 });

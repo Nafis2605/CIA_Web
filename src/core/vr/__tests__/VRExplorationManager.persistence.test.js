@@ -133,6 +133,89 @@ describe("VRExplorationManager tool-result persistence", () => {
     expect(data.serverId).toBe("srv-2");
   });
 
+  it("threads pointId/cellId/pickActorRole into annotation metadata", async () => {
+    mockAnnotationManager.createAnnotation.mockResolvedValue({ id: "srv-1" });
+    const data = {
+      id: "annot_local",
+      type: "marker",
+      position: { x: 1, y: 2, z: 3 },
+      normal: { x: 0, y: 1, z: 0 },
+      text: "",
+      pointId: 42,
+      cellId: 7,
+      pickActorRole: "source",
+    };
+
+    vrExplorationManager._handleToolAction({ type: "annotation-created", data });
+    await flush();
+
+    expect(mockAnnotationManager.createAnnotation).toHaveBeenCalledWith(
+      "ds-1",
+      expect.objectContaining({
+        metadata: expect.objectContaining({
+          pointId: 42,
+          cellId: 7,
+          pickActorRole: "source",
+        }),
+      }),
+      { projectId: "proj-1" }
+    );
+  });
+
+  it("defaults pointId/cellId/pickActorRole to null when the hit carried none", async () => {
+    mockAnnotationManager.createAnnotation.mockResolvedValue({ id: "srv-1" });
+    const data = {
+      id: "annot_local",
+      type: "marker",
+      position: { x: 1, y: 2, z: 3 },
+      text: "",
+    };
+
+    vrExplorationManager._handleToolAction({ type: "annotation-created", data });
+    await flush();
+
+    expect(mockAnnotationManager.createAnnotation).toHaveBeenCalledWith(
+      "ds-1",
+      expect.objectContaining({
+        metadata: expect.objectContaining({
+          pointId: null,
+          cellId: null,
+          pickActorRole: null,
+        }),
+      }),
+      { projectId: "proj-1" }
+    );
+  });
+
+  it("threads start/end pointId/cellId/pickActorRole into measurement metadata", async () => {
+    mockAnnotationManager.createAnnotation.mockResolvedValue({ id: "srv-2" });
+    const data = {
+      id: "measure_local",
+      startPoint: { x: 0, y: 0, z: 0, pointId: 1, cellId: 10, pickActorRole: "source" },
+      endPoint: { x: 2, y: 0, z: 0, pointId: 2, cellId: 11, pickActorRole: "glyph" },
+      distance: 2,
+      unit: "units",
+    };
+
+    vrExplorationManager._handleToolAction({ type: "measurement-created", data });
+    await flush();
+
+    expect(mockAnnotationManager.createAnnotation).toHaveBeenCalledWith(
+      "ds-1",
+      expect.objectContaining({
+        metadata: expect.objectContaining({
+          startPointId: 1,
+          startCellId: 10,
+          startActorRole: "source",
+          endPointId: 2,
+          endCellId: 11,
+          endActorRole: "glyph",
+        }),
+      }),
+      { projectId: "proj-1" }
+    );
+  });
+
   it("deletes the persisted annotation on undo when a server id exists", async () => {
     mockAnnotationManager.deleteAnnotation.mockResolvedValue();
 
@@ -289,5 +372,35 @@ describe("VR annotation draft persistence", () => {
 
     expect(data.serverId).toBe("srv-42");
     expect(mockAnnotationManager.deleteAnnotation).toHaveBeenCalledWith("ds-1", "srv-42");
+  });
+
+  it("in-flight undo (measurement): mark _deleted, resolve createAnnotation, assert deleteAnnotation fires", async () => {
+    let resolveCreate;
+    mockAnnotationManager.createAnnotation.mockImplementation(
+      () => new Promise((resolve) => { resolveCreate = resolve; })
+    );
+    mockAnnotationManager.deleteAnnotation.mockResolvedValue();
+
+    const data = {
+      id: "measure_local",
+      startPoint: { x: 0, y: 0, z: 0 },
+      endPoint: { x: 2, y: 0, z: 0 },
+      distance: 2,
+      unit: "units",
+    };
+
+    vrExplorationManager._handleToolAction({ type: "measurement-created", data });
+    // Let the create POST actually fire (and capture resolveCreate) before
+    // the user's undo lands — mirrors the same race as the annotation case
+    // above, via VRMeasureTool.undoLast()'s tombstone.
+    await flush();
+
+    data._deleted = true;
+
+    resolveCreate({ id: "srv-43" });
+    await flush();
+
+    expect(data.serverId).toBe("srv-43");
+    expect(mockAnnotationManager.deleteAnnotation).toHaveBeenCalledWith("ds-1", "srv-43");
   });
 });

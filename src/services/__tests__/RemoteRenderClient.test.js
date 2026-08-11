@@ -13,8 +13,11 @@ vi.mock("@Core/config/clientConfig.js", () => ({
   config: {
     renderMode: "server",
     renderWsUrl: "/render-ws",
-    renderServerToken: "",
   },
+}));
+
+vi.mock("@Services/renderTokenClient.js", () => ({
+  fetchRenderToken: vi.fn().mockResolvedValue(null),
 }));
 
 class MockWebSocket {
@@ -78,10 +81,14 @@ describe("RemoteRenderClient — per-instance isolation, disconnect rejection, t
     const b = new RemoteRenderClient();
 
     const connectA = a.connect();
+    // connect() now awaits fetchRenderToken() before opening the socket —
+    // flush that microtask before the mock WebSocket instance exists.
+    await vi.advanceTimersByTimeAsync(0);
     MockWebSocket.instances[0].simulateConnected("session-a");
     await connectA;
 
     const connectB = b.connect();
+    await vi.advanceTimersByTimeAsync(0);
     MockWebSocket.instances[1].simulateConnected("session-b");
     await connectB;
 
@@ -97,17 +104,23 @@ describe("RemoteRenderClient — per-instance isolation, disconnect rejection, t
     // flush that before simulating server responses.
     await vi.advanceTimersByTimeAsync(0);
 
+    // The server echoes back the id the client attached to its request
+    // (see RemoteRenderClient._sendAndAwait) — read it off what was
+    // actually sent so the mock response resolves the right pending entry.
+    const idA = MockWebSocket.instances[0].sent[0].id;
+    const idB = MockWebSocket.instances[1].sent[0].id;
+
     MockWebSocket.instances[1].simulateMessage({
-      type: "datasetLoaded", datasetId: "dataset-b", metadata: { for: "b" },
+      type: "datasetLoaded", datasetId: "dataset-b", metadata: { for: "b" }, id: idB,
     });
     MockWebSocket.instances[1].simulateMessage({
-      type: "frame", image: "img-b", width: 10, height: 10,
+      type: "frame", image: "img-b", width: 10, height: 10, id: idB,
     });
     MockWebSocket.instances[0].simulateMessage({
-      type: "datasetLoaded", datasetId: "dataset-a", metadata: { for: "a" },
+      type: "datasetLoaded", datasetId: "dataset-a", metadata: { for: "a" }, id: idA,
     });
     MockWebSocket.instances[0].simulateMessage({
-      type: "frame", image: "img-a", width: 10, height: 10,
+      type: "frame", image: "img-a", width: 10, height: 10, id: idA,
     });
 
     const [resultA, resultB] = await Promise.all([loadA, loadB]);
@@ -120,6 +133,9 @@ describe("RemoteRenderClient — per-instance isolation, disconnect rejection, t
   test("disconnecting rejects every in-flight request instead of hanging forever", async () => {
     const client = new RemoteRenderClient();
     const connectP = client.connect();
+    // connect() now awaits fetchRenderToken() before opening the socket —
+    // flush that microtask before the mock WebSocket instance exists.
+    await vi.advanceTimersByTimeAsync(0);
     MockWebSocket.instances[0].simulateConnected();
     await connectP;
 
@@ -138,6 +154,9 @@ describe("RemoteRenderClient — per-instance isolation, disconnect rejection, t
   test("a request that never gets a response times out", async () => {
     const client = new RemoteRenderClient();
     const connectP = client.connect();
+    // connect() now awaits fetchRenderToken() before opening the socket —
+    // flush that microtask before the mock WebSocket instance exists.
+    await vi.advanceTimersByTimeAsync(0);
     MockWebSocket.instances[0].simulateConnected();
     await connectP;
 
@@ -154,16 +173,20 @@ describe("RemoteRenderClient — per-instance isolation, disconnect rejection, t
   test("a response that arrives before the timeout resolves cleanly with no stray rejection later", async () => {
     const client = new RemoteRenderClient();
     const connectP = client.connect();
+    // connect() now awaits fetchRenderToken() before opening the socket —
+    // flush that microtask before the mock WebSocket instance exists.
+    await vi.advanceTimersByTimeAsync(0);
     MockWebSocket.instances[0].simulateConnected();
     await connectP;
 
     const loadP = client.loadDataset("dataset-a", "/a.vtp");
     await vi.advanceTimersByTimeAsync(0);
+    const id = MockWebSocket.instances[0].sent[0].id;
     MockWebSocket.instances[0].simulateMessage({
-      type: "datasetLoaded", datasetId: "dataset-a", metadata: { ok: true },
+      type: "datasetLoaded", datasetId: "dataset-a", metadata: { ok: true }, id,
     });
     MockWebSocket.instances[0].simulateMessage({
-      type: "frame", image: "img", width: 10, height: 10,
+      type: "frame", image: "img", width: 10, height: 10, id,
     });
 
     await expect(loadP).resolves.toMatchObject({ metadata: { ok: true } });
@@ -171,5 +194,41 @@ describe("RemoteRenderClient — per-instance isolation, disconnect rejection, t
     // The timeout timer from the original send must have been cleared —
     // advancing past it must not throw or reject anything.
     await vi.advanceTimersByTimeAsync(20_000);
+  });
+
+  test("two concurrent cameraUpdate calls each resolve with their own response (id-keyed, not type-keyed)", async () => {
+    // Before request ids, _pending was keyed by response TYPE
+    // ('cameraFrame') — a second concurrent cameraUpdate silently
+    // overwrote the first pending entry, so the first caller's promise
+    // never resolved until timeout. A drag + wheel-zoom firing close
+    // together hit exactly this.
+    const client = new RemoteRenderClient();
+    const connectP = client.connect();
+    // connect() now awaits fetchRenderToken() before opening the socket —
+    // flush that microtask before the mock WebSocket instance exists.
+    await vi.advanceTimersByTimeAsync(0);
+    MockWebSocket.instances[0].simulateConnected();
+    await connectP;
+
+    const first = client.updateCamera({ position: [0, 0, 1] });
+    const second = client.updateCamera({ position: [0, 0, 2] });
+    await vi.advanceTimersByTimeAsync(0);
+
+    const [firstId, secondId] = MockWebSocket.instances[0].sent
+      .filter((m) => m.type === "cameraUpdate")
+      .map((m) => m.id);
+    expect(firstId).not.toBe(secondId); // each request gets its own id
+
+    // Reply out of order — the second request's response arrives first.
+    MockWebSocket.instances[0].simulateMessage({
+      type: "frame", image: "img-second", width: 10, height: 10, id: secondId,
+    });
+    MockWebSocket.instances[0].simulateMessage({
+      type: "frame", image: "img-first", width: 10, height: 10, id: firstId,
+    });
+
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    expect(firstResult.image).toContain("img-first");
+    expect(secondResult.image).toContain("img-second");
   });
 });

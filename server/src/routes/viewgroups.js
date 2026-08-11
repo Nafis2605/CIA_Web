@@ -94,8 +94,12 @@ router.get('/', async (req, res, next) => {
 
         // Get views for each ViewGroup
         const viewGroups = await Promise.all(result.rows.map(async (vg) => {
+            // view_configurations has no view_type column — a view's "type"
+            // (e.g. 'vtk-slice', 'plotly-scatter') is derived client-side
+            // from the live instance (view.instanceType || view.type) and
+            // never persisted server-side, so it isn't queryable here.
             const viewsResult = await pool.query(
-                `SELECT vc.id, vc.name, vc.view_type, vc.dataset_id
+                `SELECT vc.id, vc.name, vc.dataset_id
                  FROM view_configurations vc
                  WHERE vc.view_group_id = $1
                  ORDER BY vc.created_at`,
@@ -126,7 +130,7 @@ router.get('/', async (req, res, next) => {
                 views: viewsResult.rows.map(v => ({
                     id: v.id,
                     name: v.name,
-                    viewType: v.view_type,
+                    viewType: null,
                     datasetId: v.dataset_id,
                 })),
                 link: linksResult.rows.length > 0 ? {
@@ -177,8 +181,10 @@ router.get('/:id', async (req, res, next) => {
         const vg = result.rows[0];
 
         // Get views in this ViewGroup
+        // view_configurations has no view_type column — see the identical
+        // note on the list route above.
         const viewsResult = await pool.query(
-            `SELECT vc.id, vc.name, vc.view_type, vc.dataset_id
+            `SELECT vc.id, vc.name, vc.dataset_id
              FROM view_configurations vc
              WHERE vc.view_group_id = $1
              ORDER BY vc.created_at`,
@@ -208,7 +214,7 @@ router.get('/:id', async (req, res, next) => {
             views: viewsResult.rows.map(v => ({
                 id: v.id,
                 name: v.name,
-                viewType: v.view_type,
+                viewType: null,
                 datasetId: v.dataset_id,
             })),
             link: linksResult.rows.length > 0 ? {
@@ -235,14 +241,29 @@ router.get('/:id', async (req, res, next) => {
  * Note: This route handles both:
  * - POST /api/viewgroups/workspaces/:workspaceId/viewgroups (when mounted at /api/viewgroups)
  * - POST /api/workspaces/:workspaceId/viewgroups/ (when mounted at /api/workspaces/:workspaceId/viewgroups)
+ *
+ * Registered as two SEPARATE router.post() calls sharing one handler,
+ * rather than a single call with an array of the two path patterns.
+ * Proven via an isolated repro: with an array of patterns, Express does
+ * NOT merge the parent mount's :workspaceId param into req.params for the
+ * '/' pattern (the one that actually matches when mounted at
+ * /api/workspaces/:workspaceId/viewgroups) even with mergeParams: true on
+ * this router — req.params comes back {}. Two separate registrations (same
+ * handler) merge correctly. This silently 500'd every viewgroup creation
+ * reached via the /api/workspaces/:workspaceId/viewgroups mount (e.g.
+ * loading any sample/uploaded dataset into a fresh canvas cell).
  */
-router.post(['/', '/workspaces/:workspaceId/viewgroups'], async (req, res, next) => {
+async function createViewGroup(req, res, next) {
     const { pool, wsManager } = req.app.locals;
 
     try {
         const user = getUser(req);
-        // workspaceId can come from route params or from the parent mount
-        const workspaceId = req.params.workspaceId;
+        // workspaceId can come from route params (parent mount) or, as a
+        // fail-safe if a future refactor of the mount/route structure loses
+        // that merge again, the request body — mirrors the GET listing
+        // route just above, which already falls back to req.query for the
+        // same reason.
+        const workspaceId = req.params.workspaceId || req.body.workspaceId;
         const {
             name = 'New Group',
             layoutId = 'single',
@@ -320,7 +341,9 @@ router.post(['/', '/workspaces/:workspaceId/viewgroups'], async (req, res, next)
         log.error('Failed to create ViewGroup:', error);
         next(error);
     }
-});
+}
+router.post('/', createViewGroup);
+router.post('/workspaces/:workspaceId/viewgroups', createViewGroup);
 
 /**
  * PUT /api/viewgroups/:id

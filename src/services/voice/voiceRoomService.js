@@ -109,6 +109,33 @@ class VoiceRoomService {
 
     // Audio elements for remote participants
     this._audioElements = new Map();
+
+    // Serializes every joinRoom()/leaveRoom() call onto one chain so they
+    // can never run concurrently against `this.room`. Without this, a fast
+    // leave-then-rejoin (or two call sites — e.g. the VR spatial menu and
+    // the voice bar — triggering near-simultaneously) could race: leaveRoom
+    // awaiting room.disconnect() while a concurrent joinRoom() replaces
+    // this.room with a new instance, and leaveRoom's trailing `this.room =
+    // null` then wipes out that new, live room with no handle left to it.
+    // Each call's actual work now runs strictly after the previous call's
+    // finished (success or failure) rather than overlapping.
+    this._opChain = Promise.resolve();
+  }
+
+  /**
+   * Run `fn` after every previously queued join/leave operation has
+   * settled, and make this call's own promise resolve/reject with `fn`'s
+   * outcome — chaining through a `.catch()` so one failed operation doesn't
+   * permanently wedge the queue for every call after it.
+   * @private
+   */
+  _enqueue(fn) {
+    const result = this._opChain.then(fn, fn);
+    // Swallow so a rejection doesn't become an unhandled rejection on the
+    // shared chain itself — `result` (returned to the caller) still carries
+    // the real outcome.
+    this._opChain = result.catch(() => {});
+    return result;
   }
 
   /**
@@ -183,19 +210,30 @@ class VoiceRoomService {
   }
 
   /**
-   * Join a voice room
+   * Join a voice room. Serialized with every other joinRoom()/leaveRoom()
+   * call via _enqueue — see the constructor's _opChain comment — so this
+   * can never run concurrently with another join/leave and race on
+   * `this.room`.
    * @param {string} roomName - Room name to join
    * @param {string} userName - User's display name
    * @returns {Promise<void>}
    */
-  async joinRoom(roomName, userName) {
+  joinRoom(roomName, userName) {
+    return this._enqueue(() => this._joinRoomInternal(roomName, userName));
+  }
+
+  /** @private */
+  async _joinRoomInternal(roomName, userName) {
     if (this.connectionState === VoiceConnectionState.CONNECTED) {
       if (this.currentRoomName === roomName) {
         log.debug("Already in this room");
         return;
       }
-      // Leave current room first
-      await this.leaveRoom();
+      // Leave current room first. Calls the internal method directly (not
+      // the public leaveRoom()) — we're already executing inside a queued
+      // slot on _opChain, so re-entering the queue here would deadlock
+      // (it would wait for this very call to finish before running).
+      await this._leaveRoomInternal();
     }
 
     this._setConnectionState(VoiceConnectionState.CONNECTING);
@@ -259,9 +297,15 @@ class VoiceRoomService {
   }
 
   /**
-   * Leave the current voice room
+   * Leave the current voice room. Serialized via _enqueue — see joinRoom's
+   * doc comment.
    */
-  async leaveRoom() {
+  leaveRoom() {
+    return this._enqueue(() => this._leaveRoomInternal());
+  }
+
+  /** @private */
+  async _leaveRoomInternal() {
     if (!this.room) return;
 
     log.debug("Leaving voice room...");

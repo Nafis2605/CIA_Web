@@ -110,7 +110,7 @@ vi.mock("@Services/visualizationSyncService.js", () => ({
 
 import { vrExplorationManager } from "../VRExplorationManager.js";
 import { apiClient } from "@Services/apiClient.js";
-import { yVRSessions, getVRSessionForView } from "@Collaboration/yjs/yjsSetup.js";
+import { yVRSessions, getVRSessionForView, claimVRSession } from "@Collaboration/yjs/yjsSetup.js";
 import { vrAvatarSystem } from "@Core/instances/types/vtk/vr/VTKVRAvatars.js";
 
 /** A deferred promise the test controls the resolution timing of. */
@@ -170,6 +170,17 @@ describe("VRExplorationManager — late VR session registration reconciliation (
     vrExplorationManager._activeSession = session;
     vrExplorationManager._activeContext = { instance: { datasetId: "ds-1" } };
     const localId = session.id;
+
+    // Seed the registry with the temp-id claim startExploration's Path 3
+    // would have made (and that _tickVRSessionRegistry's heartbeat would keep
+    // live) BEFORE the late reconciliation runs — without this, yVRSessions
+    // is empty and _reconcileLateRegistration's claim trivially succeeds
+    // regardless of the preserve-vs-overwrite logic being tested here.
+    claimVRSession("ds-1", {
+      sessionId: localId,
+      hostUserId: session.ownerUserId,
+      hostUserName: session.ownerUserName,
+    });
 
     // Timeout (20ms) wins the race — the POST is still pending.
     const result = await vrExplorationManager._tryRegisterSession(session, 20);

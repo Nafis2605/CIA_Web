@@ -7,6 +7,7 @@ const router = express.Router({ mergeParams: true }); // For :projectId from par
 const { createLogger } = require("../utils/logger");
 const {
   getUserId,
+  checkProjectAccess,
   checkProjectMembership,
   requireProjectPermission,
   getEffectivePermissions,
@@ -38,6 +39,11 @@ router.get("/", async (req, res, next) => {
     const { type } = req.query;
     const userId = getUserId(req);
     const { pool } = req.app.locals;
+
+    const access = await checkProjectAccess(pool, projectId, userId);
+    if (!access) {
+      return res.status(403).json({ error: "Access denied" });
+    }
 
     // Check if main room exists, create if not (ensures every project has a main room)
     const mainRoomCheck = await pool.query(
@@ -94,6 +100,28 @@ router.get("/", async (req, res, next) => {
 });
 
 /**
+ * GET /api/projects/:projectId/my-permissions
+ * Returns the calling user's effective permission set for this project,
+ * including any JSONB overrides from project_members.permissions.
+ *
+ * Registered before "/:roomId" below — Express matches routes in
+ * registration order, and "/:roomId" would otherwise capture this literal
+ * path (roomId = "my-permissions"), fail UUID validation, and make this
+ * handler unreachable.
+ */
+router.get("/my-permissions", async (req, res, next) => {
+  try {
+    const { projectId } = req.params;
+    const userId = getUserId(req);
+    const { pool } = req.app.locals;
+    const effective = await getEffectivePermissions(pool, projectId, userId);
+    res.json({ projectId, userId, permissions: [...effective] });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
  * GET /api/projects/:projectId/rooms/:roomId
  * Get a single room's details
  */
@@ -137,23 +165,6 @@ router.get("/:roomId", validateRoomId, async (req, res, next) => {
     res.json(result.rows[0]);
   } catch (error) {
     log.error("Error getting room:", error);
-    next(error);
-  }
-});
-
-/**
- * GET /api/projects/:projectId/my-permissions
- * Returns the calling user's effective permission set for this project,
- * including any JSONB overrides from project_members.permissions.
- */
-router.get("/my-permissions", async (req, res, next) => {
-  try {
-    const { projectId } = req.params;
-    const userId = getUserId(req);
-    const { pool } = req.app.locals;
-    const effective = await getEffectivePermissions(pool, projectId, userId);
-    res.json({ projectId, userId, permissions: [...effective] });
-  } catch (error) {
     next(error);
   }
 });
@@ -644,10 +655,30 @@ router.post("/:roomId/leave", async (req, res, next) => {
  * GET /api/projects/:projectId/rooms/:roomId/members
  * List members of a room
  */
-router.get("/:roomId/members", async (req, res, next) => {
+router.get("/:roomId/members", validateRoomId, async (req, res, next) => {
   try {
     const { projectId, roomId } = req.params;
+    const userId = getUserId(req);
     const { pool } = req.app.locals;
+
+    // Same access model as GET /:roomId — room member, or public room +
+    // project member. Checked with a plain query (not checkRoomAccess/
+    // requireRoomPermission) so this stays enforced consistently, the same
+    // way GET /:roomId is, rather than short-circuiting under DEV_BYPASS_AUTH.
+    const accessCheck = await pool.query(
+      `SELECT 1 FROM rooms r
+       WHERE r.id = $1 AND r.project_id = $3
+         AND (
+           EXISTS(SELECT 1 FROM room_members rm WHERE rm.room_id = r.id AND rm.user_id = $2)
+           OR (r.is_public = true AND EXISTS(
+             SELECT 1 FROM project_members pm WHERE pm.project_id = r.project_id AND pm.user_id = $2
+           ))
+         )`,
+      [roomId, userId, projectId]
+    );
+    if (accessCheck.rows.length === 0) {
+      return res.status(404).json({ error: "Room not found" });
+    }
 
     const result = await pool.query(
       `

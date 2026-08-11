@@ -148,7 +148,13 @@ describe("VRParticipantSync", () => {
         direction: { x: 0, y: 0, z: -1 },
         hand: "left",
       },
-      pointerHit: { x: 9, y: 8, z: 7 },
+      pointerHit: {
+        position: { x: 9, y: 8, z: 7 },
+        pointId: 12,
+        cellId: 4,
+        datasetId: "ds-1",
+        actorRole: "source",
+      },
     });
 
     const data = sync.getParticipantState("local-user");
@@ -158,7 +164,29 @@ describe("VRParticipantSync", () => {
       hand: "left",
       visible: true,
     });
-    expect(data.pointerHit).toEqual({ x: 9, y: 8, z: 7 });
+    expect(data.pointerHit).toEqual({
+      position: { x: 9, y: 8, z: 7 },
+      pointId: 12,
+      cellId: 4,
+      datasetId: "ds-1",
+      actorRole: "source",
+    });
+  });
+
+  it("defaults pointId/cellId/datasetId/actorRole when the pick carries none", () => {
+    sync.updateLocalState({
+      headPose: { position: { x: 0, y: 1.6, z: 0 } },
+      pointerHit: { position: { x: 1, y: 2, z: 3 } },
+    });
+
+    const data = sync.getParticipantState("local-user");
+    expect(data.pointerHit).toEqual({
+      position: { x: 1, y: 2, z: 3 },
+      pointId: -1,
+      cellId: -1,
+      datasetId: null,
+      actorRole: null,
+    });
   });
 
   it("sends a null pointer rather than a half-built one", () => {

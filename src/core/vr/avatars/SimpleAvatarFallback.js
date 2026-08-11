@@ -25,6 +25,11 @@ const HIT_MARKER_RADIUS_M = 0.02;
 // changing the avatar's silhouette.
 const ACTIVITY_HALO_RADIUS = HEAD_RADIUS * 1.6;
 const ACTIVITY_HALO_COLOR = [1.0, 0.72, 0.28]; // amber — matches the roster's holder card
+// Neutral tint for the hit marker when the remote pick landed on a derived
+// (glyph/threshold/isosurface) actor rather than the source dataset — a
+// resolved pointId there does NOT index the source dataset (see raycastVR's
+// actorRole doc), so this is a visible "heads up, this pick is derived" cue.
+const DERIVED_HIT_COLOR = [0.75, 0.75, 0.75];
 
 /**
  * Lightweight procedural avatar for VR presence.
@@ -67,6 +72,9 @@ export class SimpleAvatarFallback {
     // getUserColor() hands out `hsl(h, 70%, 60%)`, so this MUST go through the
     // full CSS parser — a hex-only one made every participant the same colour.
     const [r, g, b] = cssColorToRgb01(userInfo.color);
+    // Remembered so updatePose can reset the hit marker's tint back to this
+    // user's own color after a derived-actor pick (see DERIVED_HIT_COLOR).
+    this._baseColor = [r, g, b];
 
     // Head sphere
     this._headActor = this._makeSphere(HEAD_RADIUS, r, g, b, 0.9);
@@ -173,32 +181,41 @@ export class SimpleAvatarFallback {
       this._rightHandActor.setVisibility(false);
     }
 
-    // Pointer ray. `pose.pointerHit` (when the sender's ray actually met the
-    // geometry) is already in shared scene/data space — see
+    // Pointer ray. `pose.pointerHit.position` (when the sender's ray actually
+    // met the geometry) is already in shared scene/data space — see
     // RemoteAvatarController._toScenePose — so it is used verbatim as the ray's
     // far end. Terminating there instead of at a fixed RAY_LENGTH is what makes
     // two users agree on the point being discussed.
-    const hit = pose.pointerHit || null;
+    const hit = pose.pointerHit?.position ? pose.pointerHit : null;
     if (pose.pointer?.visible && pose.pointer?.origin && pose.pointer?.direction) {
       const { x: ox, y: oy, z: oz } = pose.pointer.origin;
       const { x: dx, y: dy, z: dz } = pose.pointer.direction;
       const lineSource = this._pointerLineSource;
       lineSource.setPoint1(ox, oy, oz);
       if (hit) {
-        lineSource.setPoint2(hit.x, hit.y, hit.z);
+        lineSource.setPoint2(hit.position.x, hit.position.y, hit.position.z);
       } else {
         lineSource.setPoint2(ox + dx * RAY_LENGTH, oy + dy * RAY_LENGTH, oz + dz * RAY_LENGTH);
       }
       this._pointerRayActor.setVisibility(true);
 
       if (hit) {
-        this._hitMarkerActor.setPosition(hit.x, hit.y, hit.z);
+        this._hitMarkerActor.setPosition(hit.position.x, hit.position.y, hit.position.z);
         // Constant apparent size: the sphere source is authored at
         // HIT_MARKER_RADIUS_M physical metres, and scene units are physical
         // metres divided by the local viewer's vrScale. Same `s` as the body
         // above — they must agree or the dot detaches from the pointing hand.
         this._hitMarkerActor.setScale(s, s, s);
         this._hitMarkerActor.setVisibility(true);
+        // Distinguish a derived-surface pick (glyph/threshold/isosurface —
+        // NOT a source-dataset point) from a source-surface hit, so a
+        // collaborator can tell at a glance whether the pointId being
+        // discussed indexes the actual dataset. Reset to the avatar's own
+        // color for a source hit (the common case) rather than leaving
+        // whatever tint a previous frame's derived hit left behind.
+        const isDerivedHit = !!hit.actorRole && hit.actorRole !== 'source';
+        const [tr, tg, tb] = isDerivedHit ? DERIVED_HIT_COLOR : this._baseColor;
+        this._hitMarkerActor.getProperty().setColor(tr, tg, tb);
       } else {
         this._hitMarkerActor.setVisibility(false);
       }

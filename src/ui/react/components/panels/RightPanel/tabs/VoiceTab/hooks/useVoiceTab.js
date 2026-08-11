@@ -282,7 +282,12 @@ export function useVoiceTab(options = {}) {
       if (connectionState === VoiceConnectionState.CONNECTED) {
         try {
           const userName = getUserName() || "Anonymous User";
-          await voiceRoomService.joinRoom(channelId, userName);
+          // Must go through getVoiceRoomName like every other join call site
+          // (useVoiceBar.js, voiceCommandHandlers.js, VRExplorationManager.js)
+          // — joining with the raw channelId landed the user in a session-
+          // unscoped room ("breakout-1") that nobody else's canonical
+          // `${sessionRoomId}:breakout-1` call would ever reach.
+          await voiceRoomService.joinRoom(getVoiceRoomName(channelId), userName);
           toast.success(
             `Switched to ${
               channels.find((c) => c.id === channelId)?.name || channelId

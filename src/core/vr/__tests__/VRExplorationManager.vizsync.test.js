@@ -169,14 +169,13 @@ describe("VRExplorationManager â€” VR visualization sync (clip/representati
     // Settings are chosen from what the DATA has rather than inherited from
     // VTKGlyphFeature's defaults, which assume an oriented arrow and a
     // meaningless absolute scaleFactor of 1.0. With a vector array present:
-    // arrow, oriented and scaled by that array's magnitude ('scalar' is the one
-    // SCALING_MODES entry that maps correctly onto vtk.js's enum).
+    // arrow, oriented and scaled by that array's magnitude.
     expect(vtkGlyphFeature.enableGlyphs).toHaveBeenCalledWith(
       "inst-1",
       { fake: true },
       expect.objectContaining({
         glyphType: "arrow",
-        scalingMode: "scalar",
+        scalingMode: "magnitude",
         orientationArray: "velocity",
         scaleArray: "velocity",
       })

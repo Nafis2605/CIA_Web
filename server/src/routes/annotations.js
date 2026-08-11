@@ -35,6 +35,19 @@ router.get("/", async (req, res, next) => {
       offset = 0,
     } = req.query;
 
+    // Every real caller scopes by dataset or project — an unscoped list would
+    // have no way to authorize which datasets'/projects' annotations the
+    // caller may see at all.
+    if (!fileId && !projectId) {
+      return res.status(400).json({ error: "fileId or projectId is required" });
+    }
+
+    // Filter by file (built-in datasets use non-UUID ids like "builtin-lungs"
+    // and never have server-side annotations, so short-circuit to empty)
+    if (fileId && !isValidUUID(fileId)) {
+      return res.json({ annotations: [], count: 0, limit: parseInt(limit), offset: parseInt(offset) });
+    }
+
     let query = `
       SELECT a.*,
              u.email as creator_email,
@@ -47,14 +60,24 @@ router.get("/", async (req, res, next) => {
     const values = [status];
     let paramIndex = 2;
 
-    // Filter by file (built-in datasets use non-UUID ids like "builtin-lungs"
-    // and never have server-side annotations, so short-circuit to empty)
-    if (fileId && !isValidUUID(fileId)) {
-      return res.json({ annotations: [], count: 0, limit: parseInt(limit), offset: parseInt(offset) });
-    }
     if (fileId) {
+      const auth = await authorizeDatasetAccess(pool, fileId, user?.id);
+      if (!auth) {
+        return res.status(404).json({ error: "File not found" });
+      }
+      if (!auth.authorized) {
+        return res.status(403).json({ error: "Not authorized to view annotations for this file" });
+      }
       query += ` AND a.dataset_id = $${paramIndex++}`;
       values.push(fileId);
+    } else {
+      // Scoped by projectId alone: verify project access, then restrict to
+      // that project's own datasets (annotations has no project_id column).
+      if (!(await checkProjectAccess(pool, projectId, user?.id))) {
+        return res.status(403).json({ error: "Not authorized to view annotations for this project" });
+      }
+      query += ` AND a.dataset_id IN (SELECT file_id FROM file_project_access WHERE project_id = $${paramIndex++})`;
+      values.push(projectId);
     }
 
     // Filter by branch
@@ -69,14 +92,15 @@ router.get("/", async (req, res, next) => {
       values.push(type);
     }
 
-    // Visibility filter
+    // Default: show public + user's private annotations. An explicit
+    // `visibility` filter narrows this further — it must never REPLACE the
+    // base restriction, or `?visibility=private` would return every user's
+    // private annotations, not just the caller's own.
+    query += ` AND (a.visibility = 'public' OR a.created_by = $${paramIndex++})`;
+    values.push(user?.id);
     if (visibility) {
       query += ` AND a.visibility = $${paramIndex++}`;
       values.push(visibility);
-    } else {
-      // Default: show public + user's private annotations
-      query += ` AND (a.visibility = 'public' OR a.created_by = $${paramIndex++})`;
-      values.push(user.id);
     }
 
     query += ` ORDER BY a.created_at DESC LIMIT $${paramIndex++} OFFSET $${paramIndex}`;
@@ -102,6 +126,7 @@ router.get("/", async (req, res, next) => {
 router.get("/:id", async (req, res, next) => {
   try {
     const { id } = req.params;
+    const user = getUser(req);
     const { pool } = req.app.locals;
 
     const result = await pool.query(
@@ -121,7 +146,18 @@ router.get("/:id", async (req, res, next) => {
       return res.status(404).json({ error: "Annotation not found" });
     }
 
-    res.json({ annotation: result.rows[0] });
+    const annotation = result.rows[0];
+
+    // 404, not 403 — don't confirm existence of an inaccessible annotation.
+    const auth = await authorizeDatasetAccess(pool, annotation.dataset_id, user?.id);
+    if (!auth?.authorized) {
+      return res.status(404).json({ error: "Annotation not found" });
+    }
+    if (annotation.visibility !== "public" && annotation.created_by !== user?.id) {
+      return res.status(404).json({ error: "Annotation not found" });
+    }
+
+    res.json({ annotation });
   } catch (error) {
     next(error);
   }
@@ -158,9 +194,9 @@ async function resolveBroadcastProjects(pool, fileId) {
 }
 
 /**
- * Whether `userId` may create annotations on `fileId`. Never trusts a
- * client-supplied projectId (which can be omitted or spoofed — see H15).
- * Authorization is derived from the file's OWN project associations
+ * Whether `userId` may read/create/modify annotations on `fileId`. Never
+ * trusts a client-supplied projectId (which can be omitted or spoofed — see
+ * H15). Authorization is derived from the file's OWN project associations
  * (file_project_access, the same source resolveBroadcastProjects reads) —
  * membership (or public-project access, via checkProjectAccess) in ANY of
  * them grants access. A file with no project association at all falls back
@@ -169,7 +205,7 @@ async function resolveBroadcastProjects(pool, fileId) {
  * Returns null if the file doesn't exist/isn't active, so callers can tell
  * "not found" apart from "not authorized".
  */
-async function authorizeAnnotationCreate(pool, fileId, userId) {
+async function authorizeDatasetAccess(pool, fileId, userId) {
   const fileResult = await pool.query(
     "SELECT id, organization_id, uploaded_by, public_path FROM datasets WHERE id = $1 AND status = 'active'",
     [fileId]
@@ -229,7 +265,7 @@ router.post("/", async (req, res, next) => {
     // Verify the file exists AND that the caller may annotate it — derived
     // server-side from the file's real project ownership, never from the
     // (omittable, spoofable) request body projectId (see H15).
-    const auth = await authorizeAnnotationCreate(pool, fileId, user?.id);
+    const auth = await authorizeDatasetAccess(pool, fileId, user?.id);
     if (!auth) {
       return res.status(404).json({ error: "File not found" });
     }
@@ -730,7 +766,7 @@ router.post("/batch", async (req, res, next) => {
       }
 
       if (!fileAuthCache.has(fileId)) {
-        const auth = await authorizeAnnotationCreate(pool, fileId, user?.id);
+        const auth = await authorizeDatasetAccess(pool, fileId, user?.id);
         fileAuthCache.set(fileId, !!auth?.authorized);
       }
       if (!fileAuthCache.get(fileId)) {
@@ -817,6 +853,7 @@ router.post("/:id/migrate", async (req, res, next) => {
 
   try {
     const { id } = req.params;
+    const user = getUser(req);
     const { targetVersionId, newCoordinates, status = "migrated" } = req.body;
 
     if (!targetVersionId) {
@@ -834,6 +871,30 @@ router.post("/:id/migrate", async (req, res, next) => {
     }
 
     const sourceAnnotation = original.rows[0];
+
+    // Only the creator may migrate an annotation (mirrors PUT/DELETE's
+    // creator-only checks above).
+    if (sourceAnnotation.created_by !== user?.id) {
+      return res.status(403).json({ error: "Only the annotation creator may migrate it" });
+    }
+
+    // Re-verify the creator still has access to the dataset (project access
+    // may have been revoked since the annotation was created).
+    const auth = await authorizeDatasetAccess(pool, sourceAnnotation.dataset_id, user.id);
+    if (!auth?.authorized) {
+      return res.status(403).json({ error: "Not authorized to migrate annotations for this dataset" });
+    }
+
+    // The target version must belong to the SAME dataset as the source
+    // annotation — otherwise a caller could re-point an annotation onto an
+    // unrelated dataset's version history.
+    const versionCheck = await pool.query(
+      "SELECT id FROM file_versions WHERE id = $1 AND file_id = $2",
+      [targetVersionId, sourceAnnotation.dataset_id]
+    );
+    if (versionCheck.rows.length === 0) {
+      return res.status(400).json({ error: "targetVersionId does not belong to this annotation's dataset" });
+    }
 
     // Create migrated copy
     // Note: Database schema uses 'position' for coordinates and 'content' for properties

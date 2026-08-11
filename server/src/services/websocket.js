@@ -425,6 +425,47 @@ class WebSocketManager {
   }
 
   /**
+   * Broadcast a message to every client subscribed to the PROJECT a
+   * workspace belongs to — there is no separate workspace-level
+   * subscription channel (clients only ever join a project room, see
+   * `rooms`/broadcastToProject above and serverSync.js's `join:project`),
+   * so this resolves workspace_id -> project_id and delegates.
+   *
+   * `server/src/routes/viewgroups.js` called a `broadcastToWorkspace`
+   * method here that never existed — every viewgroup/view-link create,
+   * delete, and duplicate call there threw `TypeError:
+   * wsManager.broadcastToWorkspace is not a function` the moment it reached
+   * this line, turning every one of those otherwise-successful writes into
+   * a 500. This method exists so those call sites' existing code keeps
+   * working unchanged. A personal workspace (project_id IS NULL) has no
+   * project to broadcast to and is silently skipped — nothing else to
+   * notify, same as the rest of this class's "no subscribers, no-op"
+   * convention (see broadcastToProject/broadcastToRoom above).
+   *
+   * Takes an event-type string plus a payload object (matching how every
+   * call site in viewgroups.js already invokes it) rather than a single
+   * pre-built message, and merges them into the `{type, ...payload}` shape
+   * broadcastToProject's other callers use (see workspaces.js's
+   * `workspace:merged` broadcast).
+   * @param {string} workspaceId
+   * @param {string} type
+   * @param {object} [payload]
+   */
+  async broadcastToWorkspace(workspaceId, type, payload = {}) {
+    if (!this.pool || !workspaceId) return;
+    try {
+      const result = await this.pool.query(
+        "SELECT project_id FROM workspaces WHERE id = $1",
+        [workspaceId]
+      );
+      const projectId = result.rows[0]?.project_id;
+      if (projectId) this.broadcastToProject(projectId, { type, ...payload });
+    } catch (err) {
+      ws.warn(`broadcastToWorkspace(${workspaceId}) failed:`, err.message);
+    }
+  }
+
+  /**
    * Alias for broadcastToProject - used by route handlers
    * @param {string} projectId - Project ID
    * @param {object} message - Message to broadcast

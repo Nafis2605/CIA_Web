@@ -15,6 +15,7 @@
  */
 
 import { config } from '@Core/config/clientConfig.js';
+import { fetchRenderToken } from '@Services/renderTokenClient.js';
 
 const DEFAULT_WS_URL = '/render-ws';
 const PING_INTERVAL_MS = 30_000;
@@ -27,10 +28,20 @@ class RemoteRenderClient {
         this._connected = false;
         this._connecting = false;
 
-        /** Pending promise resolvers keyed by response type */
+        /**
+         * Pending promise resolvers keyed by request id (see _sendAndAwait).
+         * Previously keyed by response TYPE ('datasetLoaded'/'cameraFrame'/
+         * 'resetFrame'), which assumed at most one request per type could be
+         * in flight at once — a second concurrent cameraUpdate (e.g. a drag
+         * and a wheel-zoom firing close together) silently overwrote the
+         * first pending entry, so the first caller's promise never resolved
+         * until timeout. Keying by id gives every request its own slot.
+         */
         this._pending = new Map();
-        /** Metadata received from datasetLoaded, waiting for frame */
-        this._pendingMeta = null;
+        /** datasetLoaded metadata waiting for its paired frame, keyed by request id */
+        this._pendingMetaById = new Map();
+        /** Monotonic counter feeding _nextRequestId */
+        this._reqCounter = 0;
 
         this._frameCallbacks = new Set();
         this._errorCallbacks = new Set();
@@ -52,14 +63,19 @@ class RemoteRenderClient {
 
     /**
      * Open WebSocket connection to the render server.
+     * @param {string|null} [datasetId] - When known up front (loadDataset
+     *   already knows it), the minted token is scoped to this dataset (see
+     *   server/src/routes/renderToken.js and app.py's loadDataset scope
+     *   check). Omitted for camera-only reconnects, where the connection is
+     *   expected to already exist.
      * @returns {Promise<string>} Resolves with session ID.
      */
-    connect() {
+    async connect(datasetId = null) {
         console.log('[RenderMode]', config.renderMode);
 
         if (this.isConnected) {
             console.log('[RenderServer] already connected, session:', this._sessionId);
-            return Promise.resolve(this._sessionId);
+            return this._sessionId;
         }
 
         if (this._connecting) {
@@ -70,10 +86,12 @@ class RemoteRenderClient {
 
         this._connecting = true;
         const baseWsUrl = config.renderWsUrl || DEFAULT_WS_URL;
-        // Browsers can't set custom headers on a WS handshake, so the access
-        // token (see H14) rides along as a query param instead.
-        const wsUrl = config.renderServerToken
-            ? `${baseWsUrl}?token=${encodeURIComponent(config.renderServerToken)}`
+
+        const token = await fetchRenderToken(datasetId);
+        // Browsers can't set custom headers on a WS handshake, so the token
+        // rides along as a query param instead.
+        const wsUrl = token
+            ? `${baseWsUrl}?token=${encodeURIComponent(token)}`
             : baseWsUrl;
         console.log('[RenderServer] connecting to', baseWsUrl);
 
@@ -134,11 +152,11 @@ class RemoteRenderClient {
      * @returns {Promise<{ metadata, image, width, height, camera }>}
      */
     async loadDataset(datasetId, path) {
-        await this._ensureConnected();
+        await this._ensureConnected(datasetId);
         console.log('[RenderServer] loading dataset:', { id: datasetId, path });
         console.log('[RenderServer] session:', this._sessionId);
 
-        return this._sendAndAwait('datasetLoaded', { type: 'loadDataset', datasetId, path });
+        return this._sendAndAwait({ type: 'loadDataset', datasetId, path });
     }
 
     /**
@@ -148,7 +166,7 @@ class RemoteRenderClient {
      */
     async updateCamera(camera) {
         await this._ensureConnected();
-        return this._sendAndAwait('cameraFrame', { type: 'cameraUpdate', camera });
+        return this._sendAndAwait({ type: 'cameraUpdate', camera });
     }
 
     /**
@@ -157,7 +175,7 @@ class RemoteRenderClient {
      */
     async resetCamera() {
         await this._ensureConnected();
-        return this._sendAndAwait('resetFrame', { type: 'resetCamera' });
+        return this._sendAndAwait({ type: 'resetCamera' });
     }
 
     /**
@@ -193,9 +211,9 @@ class RemoteRenderClient {
     // PRIVATE
     // =========================================================================
 
-    async _ensureConnected() {
+    async _ensureConnected(datasetId = null) {
         if (!this.isConnected) {
-            await this.connect();
+            await this.connect(datasetId);
         }
     }
 
@@ -209,26 +227,40 @@ class RemoteRenderClient {
     }
 
     /**
-     * Send a message and await its response, keyed by response type in
-     * `_pending`. Rejects if no response arrives within `timeoutMs`, or
-     * immediately if the connection drops first (see `_onDisconnect`).
-     * @param {string} pendingKey - response `type` this call is waiting for
-     * @param {object} message    - sent as-is via `_send`
+     * Assign this client's next request id. A plain incrementing counter,
+     * scoped to this client instance/connection — the server only needs to
+     * echo it back, never interpret it.
+     * @private
      */
-    _sendAndAwait(pendingKey, message, timeoutMs = REQUEST_TIMEOUT_MS) {
+    _nextRequestId() {
+        return `${Date.now()}-${++this._reqCounter}`;
+    }
+
+    /**
+     * Send a message and await its response, keyed by request id in
+     * `_pending` — the server echoes back the same `id` on every reply to
+     * this message (see server/render_server/app.py). Rejects if no
+     * response arrives within `timeoutMs`, or immediately if the connection
+     * drops first (see `_onDisconnect`).
+     * @param {object} message - sent via `_send`, with `id` attached
+     */
+    _sendAndAwait(message, timeoutMs = REQUEST_TIMEOUT_MS) {
+        const id = this._nextRequestId();
+        const withId = { ...message, id };
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
-                if (this._pending.get(pendingKey)) {
-                    this._pending.delete(pendingKey);
-                    reject(new Error(`Render server request timed out: ${pendingKey}`));
+                if (this._pending.get(id)) {
+                    this._pending.delete(id);
+                    this._pendingMetaById.delete(id);
+                    reject(new Error(`Render server request timed out: ${message.type}`));
                 }
             }, timeoutMs);
 
-            this._pending.set(pendingKey, {
+            this._pending.set(id, {
                 resolve: (value) => { clearTimeout(timer); resolve(value); },
                 reject: (err) => { clearTimeout(timer); reject(err); },
             });
-            this._send(message);
+            this._send(withId);
         });
     }
 
@@ -261,7 +293,11 @@ class RemoteRenderClient {
 
             case 'datasetLoaded': {
                 console.log('[RenderServer] server response metadata:', msg.metadata);
-                this._pendingMeta = msg;
+                // loadDataset's reply arrives as TWO messages sharing the
+                // same request id — this one (metadata) and the 'frame'
+                // that follows (image) — stashed here until the frame
+                // arrives to complete it (see the 'frame' case below).
+                if (msg.id != null) this._pendingMetaById.set(msg.id, msg);
                 break;
             }
 
@@ -280,26 +316,21 @@ class RemoteRenderClient {
                 // Notify live frame subscribers
                 this._frameCallbacks.forEach(cb => cb(frame));
 
-                // Resolve datasetLoaded promise (waits for first frame)
-                const loadR = this._pending.get('datasetLoaded');
-                if (loadR && this._pendingMeta) {
-                    this._pending.delete('datasetLoaded');
-                    loadR.resolve({ ...this._pendingMeta, ...frame });
-                    this._pendingMeta = null;
-                }
-
-                // Resolve camera update promise
-                const camR = this._pending.get('cameraFrame');
-                if (camR) {
-                    this._pending.delete('cameraFrame');
-                    camR.resolve(frame);
-                }
-
-                // Resolve reset promise
-                const resetR = this._pending.get('resetFrame');
-                if (resetR) {
-                    this._pending.delete('resetFrame');
-                    resetR.resolve(frame);
+                // Resolve whichever request this frame answers, identified
+                // by the id the server echoed back — not by guessing from
+                // which response TYPE happens to be pending, which broke
+                // under concurrent requests (see _pending's doc comment).
+                const id = msg.id;
+                const pending = id != null ? this._pending.get(id) : null;
+                if (pending) {
+                    this._pending.delete(id);
+                    const meta = this._pendingMetaById.get(id);
+                    if (meta) {
+                        this._pendingMetaById.delete(id);
+                        pending.resolve({ ...meta, ...frame });
+                    } else {
+                        pending.resolve(frame);
+                    }
                 }
                 break;
             }
@@ -307,6 +338,18 @@ class RemoteRenderClient {
             case 'error': {
                 console.warn('[RenderServer] error:', msg.message, '| stage:', msg.stage);
                 this._errorCallbacks.forEach(cb => cb({ message: msg.message, stage: msg.stage }));
+                // An error tied to a specific request (server echoes its id)
+                // only rejects THAT request, leaving unrelated concurrent
+                // requests alone. An id-less error (e.g. malformed JSON,
+                // rejected before any request could be parsed) falls back to
+                // rejecting everything in flight — there's no way to know
+                // which request it was about.
+                if (msg.id != null && this._pending.has(msg.id)) {
+                    this._pending.get(msg.id).reject(new Error(msg.message));
+                    this._pending.delete(msg.id);
+                    this._pendingMetaById.delete(msg.id);
+                    break;
+                }
                 // Reject all pending promises except 'connected'
                 for (const [key, r] of this._pending) {
                     if (key !== 'connected') {
@@ -336,7 +379,7 @@ class RemoteRenderClient {
         const err = new Error('Render server connection closed');
         for (const [, r] of this._pending) r.reject(err);
         this._pending.clear();
-        this._pendingMeta = null;
+        this._pendingMetaById.clear();
 
         this._connectWaiters.forEach(w => w.reject(err));
         this._connectWaiters = [];

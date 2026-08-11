@@ -383,6 +383,46 @@ describe("VRExplorationManager â€” session convergence (Y.js vr-sessions re
     });
   });
 
+  // H-failover: heartbeatVRSession used to let ANY participant refresh ANY
+  // record, so a surviving guest's own routine heartbeat kept a crashed
+  // host's record artificially "live" forever — getVRSessionForView never
+  // returned null, so the election branch below could never run after an
+  // ungraceful disconnect (headset crash, sleep, Wi-Fi loss, no clean
+  // releaseVRSession call). These pin that a non-host's heartbeat no longer
+  // revives someone else's stale record, and that failover actually
+  // completes once it can't be revived.
+  describe("host failover after ungraceful disconnect", () => {
+    it("a guest's heartbeat does not keep a crashed host's stale record alive, and failover promotes the guest", async () => {
+      workspaceManager.getInstance.mockReturnValueOnce(makeInstance("view-1", "inst-1"));
+      const session = await vrExplorationManager.startExploration("inst-1", {});
+
+      // The host (user-2, a different device — never observed locally as a
+      // VR participant) went silent well past VR_SESSION_STALE_MS with no
+      // clean release — simulating a crash/sleep/Wi-Fi loss rather than a
+      // graceful leave.
+      const now = Date.now();
+      yVRSessions.set("ds-1", {
+        sessionId: "vrsession_crashed_host",
+        viewConfigurationId: "ds-1",
+        hostUserId: "user-2",
+        hostUserName: "Other",
+        createdAt: now - 60000,
+        lastHeartbeat: now - 20000, // older than VR_SESSION_STALE_MS (15000)
+        participantCount: 2,
+      });
+
+      // getParticipantId() is mocked to "user-1" for this whole file — this
+      // tick's heartbeatVRSession(sessionKey, "user-1") call must NOT refresh
+      // user-2's record now that heartbeat is host-only.
+      vrExplorationManager._tickVRSessionRegistry("ds-1", session);
+
+      // The dead host's record was not revived, and — since user-1 is the
+      // only live VR participant — failover promoted it as the new host.
+      expect(getVRSessionForView("ds-1")?.hostUserId).toBe("user-1");
+      expect(getVRSessionForView("ds-1")?.sessionId).not.toBe("vrsession_crashed_host");
+    });
+  });
+
   // H4: _watchVRSessionConvergence used to self-unsubscribe 3s after session
   // start, so a host-promotion that happened later than that was visible only
   // to the client that performed it. It now stays attached for the session's

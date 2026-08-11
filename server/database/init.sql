@@ -120,6 +120,10 @@ CREATE TABLE datasets (
     hash VARCHAR(64),
     storage_key VARCHAR(500),
     public_path VARCHAR(500),
+    -- Stable identifier for bundled/built-in VTP datasets (public/vtp_files/
+    -- manifest.json, e.g. "builtin-lungs") — see migrations/020_bundled_dataset_ids.sql.
+    -- NULL for every normal uploaded dataset.
+    builtin_key VARCHAR(100) UNIQUE,
     point_count INTEGER,
     cell_count INTEGER,
     bounds JSONB,
@@ -1364,6 +1368,22 @@ VALUES
 ON CONFLICT (organization_id, user_id) DO UPDATE SET role = EXCLUDED.role;
 
 -- Note: Main room and workspaces are auto-created by triggers when project is inserted
+
+-- Bundled/built-in VTP datasets (public/vtp_files/manifest.json) get a real,
+-- stable UUID row so annotations/measurements on them flow through the
+-- normal authorization/storage path (see migrations/020_bundled_dataset_ids.sql
+-- for the full rationale). No organization_id/uploaded_by — these are shipped
+-- assets, not attributable to any user or org.
+INSERT INTO datasets (builtin_key, filename, file_type, file_size, public_path, status)
+VALUES
+    ('builtin-bones',        'Bones.vtp',       'vtp', 27272740, '/vtp_files/Bones.vtp',       'active'),
+    ('builtin-lung-vessels', 'LungVessels.vtp', 'vtp', 28826464, '/vtp_files/LungVessels.vtp', 'active'),
+    ('builtin-lungs',        'Lungs.vtp',       'vtp', 10750132, '/vtp_files/Lungs.vtp',       'active'),
+    ('builtin-skull',        'Skull.vtp',       'vtp', 19988316, '/vtp_files/Skull.vtp',       'active'),
+    ('builtin-ventricles',   'Ventricles.vtp',  'vtp', 16487240, '/vtp_files/Ventricles.vtp',  'active'),
+    ('builtin-disk',         'diskout.vtp',     'vtp', 483237,   '/vtp_files/diskout.vtp',     'active'),
+    ('builtin-earth',        'earth.vtp',       'vtp', 1233227,  '/vtp_files/earth.vtp',       'active')
+ON CONFLICT (builtin_key) DO NOTHING;
 
 -- ============================================================================
 -- DONE

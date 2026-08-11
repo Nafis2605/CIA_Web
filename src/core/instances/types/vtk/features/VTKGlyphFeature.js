@@ -107,13 +107,20 @@ const GLYPH_TYPES = {
 };
 
 /**
- * Scaling modes
+ * Scaling modes. Values match vtk.js's real Glyph3DMapper scale-mode enum
+ * (Rendering/Core/Glyph3DMapper/Constants.js: SCALE_BY_CONSTANT=0,
+ * SCALE_BY_MAGNITUDE=1, SCALE_BY_COMPONENTS=2) — there is no mode 3. An
+ * older version of this map used keys 'scalar'/'vector' that didn't match
+ * vtk.js's actual semantics ('vector' pointed at mode 2, i.e. component
+ * scaling, not magnitude/vector-length scaling), which made every
+ * magnitude-scaled glyph render as an uncontrolled per-axis stretch. Any
+ * stored config using the old key names falls back to the default via
+ * normalizeGlyphConfig below, rather than being silently misinterpreted.
  */
 const SCALING_MODES = {
   off: { name: 'No Scaling', mode: 0 },
-  scalar: { name: 'By Scalar', mode: 1 },
-  vector: { name: 'By Vector', mode: 2 },
-  components: { name: 'By Components', mode: 3 },
+  magnitude: { name: 'By Magnitude', mode: 1 },
+  components: { name: 'By Components', mode: 2 },
 };
 
 /**
@@ -132,7 +139,7 @@ const DEFAULT_SETTINGS = {
   enabled: false,
   glyphType: 'arrow',
   scaleFactor: 1.0,
-  scalingMode: 'vector',
+  scalingMode: 'magnitude',
   orientationMode: 'direction',
   orientationArray: null,
   scaleArray: null,
@@ -147,6 +154,28 @@ const MIN_DENSITY = 0.001;
 
 // Point count above which density auto-limits, preserving the old "maxGlyphs" safety behavior
 const AUTO_DENSITY_POINT_THRESHOLD = 10000;
+
+/**
+ * Deterministic (not fixed-phase) offset within a stride window, used by
+ * _buildSubsampledPolydata. Same windowIndex always yields the same offset —
+ * subsampling stays reproducible across renders/collaborators of the same
+ * dataset+density — while not always picking index 0 of every window, which
+ * biased subsampling toward whatever spatial/structural pattern correlates
+ * with point-insertion order (e.g. always the same row/column of a
+ * structured grid).
+ * @param {number} windowIndex
+ * @param {number} stride
+ * @returns {number} offset in [0, stride)
+ */
+function _deterministicStrideOffset(windowIndex, stride) {
+  if (stride <= 1) return 0;
+  const h = (Math.imul(windowIndex + 0x9e3779b9, 0x85ebca6b) >>> 0);
+  // The final >>> 0 matters: `^` coerces operands to SIGNED 32-bit before
+  // XORing, so without it the result can be negative, making `% stride`
+  // return a negative offset (JS % keeps the dividend's sign) — an
+  // out-of-range, sometimes negative srcIndex.
+  return (((h >>> 15) ^ h) >>> 0) % stride;
+}
 
 // =============================================================================
 // VTK GLYPH FEATURE
@@ -204,6 +233,11 @@ export class VTKGlyphFeature extends FeatureInterface {
       // Polydata references for density/subsampling
       basePolydata: null, // full-resolution polydata passed to enableGlyphs; owned by the dataset pipeline, never deleted here
       derivedPolydata: null, // strided subsample currently fed to glyphMapper input 0, or null when density === 1
+      // Source-dataset point index a VR tool currently has selected (e.g. an
+      // in-progress annotation/measurement anchor). Local-only — never synced
+      // via getConfigForSync — so subsampling never silently hides the exact
+      // point the user is interacting with. See setSelectedPoint.
+      selectedSourcePointId: null,
     };
 
     this.instanceStates.set(instanceId, state);
@@ -268,8 +302,12 @@ export class VTKGlyphFeature extends FeatureInterface {
       const name = pointData.getArrayName(i) || `Array ${i}`;
       const numComponents = array.getNumberOfComponents();
 
-      if (numComponents === 3) {
-        // Likely a vector array
+      // A 3-component array is offered as a vector (orientation/scale)
+      // candidate UNLESS its name looks like RGB color data — vtk.js data
+      // arrays carry no reliable "this is color" flag, so this is a
+      // heuristic, but it keeps an actual color array from being handed to
+      // setOrientationArray as if it were a direction field.
+      if (numComponents === 3 && !/^(rgb|rgba|colors?)$/i.test(name)) {
         vectorArrays.push({ name, index: i, components: numComponents });
       } else if (numComponents === 1) {
         // Scalar array
@@ -298,11 +336,25 @@ export class VTKGlyphFeature extends FeatureInterface {
     if (!state) return;
 
     const { sceneObjects } = state;
-    const { renderer, renderWindow } = sceneObjects;
+    const { renderer, renderWindow, actor } = sceneObjects;
 
     if (!renderer) {
       log.warn('Cannot enable glyphs: no renderer');
       return;
+    }
+
+    // Capture the main actor's visibility/point-size ONCE, before glyphs ever
+    // touch it, so disableGlyphs can restore whatever threshold/isosurface/
+    // user styling had set — rather than unconditionally forcing them to
+    // fixed values. Guarded so repeated enable calls (e.g. changing glyph
+    // type) without an intervening disable don't overwrite the real
+    // pre-glyph snapshot with a glyph-era one.
+    if (actor && !state._preGlyphStateCaptured) {
+      state.preGlyphActorVisibility =
+        typeof actor.getVisibility === 'function' ? actor.getVisibility() : true;
+      state.preGlyphPointSize =
+        typeof actor.getProperty === 'function' ? actor.getProperty().getPointSize() : 1;
+      state._preGlyphStateCaptured = true;
     }
 
     // Merge options with defaults
@@ -325,7 +377,7 @@ export class VTKGlyphFeature extends FeatureInterface {
     // Build the mapper input: subsampled polydata when density < 1, otherwise the base polydata directly
     const mapperInput = state.density >= 1
       ? polydata
-      : this._buildSubsampledPolydata(polydata, state.density);
+      : this._buildSubsampledPolydata(polydata, state.density, state.selectedSourcePointId);
     state.derivedPolydata = mapperInput === polydata ? null : mapperInput;
 
     // Create glyph mapper
@@ -334,10 +386,23 @@ export class VTKGlyphFeature extends FeatureInterface {
     glyphMapper.setInputConnection(glyphSource.getOutputPort(), 1);
     glyphMapper.setScaleFactor(state.scaleFactor);
 
-    // Configure scaling mode
+    // Configure scaling mode — only if a usable backing array actually
+    // exists, otherwise vtk.js's own Glyph3DMapper.buildArrays errors
+    // internally (components mode with no valid 3-component array) or
+    // silently scales by whatever active scalars happen to be present
+    // (magnitude mode with no scaleArray and no active scalars). Degrade to
+    // 'off' rather than misconfigure the mapper.
     const scalingConfig = SCALING_MODES[state.scalingMode];
-    glyphMapper.setScaling(scalingConfig.mode !== 0);
-    glyphMapper.setScaleMode(scalingConfig.mode);
+    const mapperPointData = mapperInput.getPointData();
+    if (scalingConfig.mode !== 0 && !this._hasUsableScaleArray(mapperPointData, scalingConfig.mode, state.scaleArray)) {
+      log.warn(
+        `Glyph scaling mode '${state.scalingMode}' has no usable array (scaleArray: ${state.scaleArray || 'none'}) — degrading to 'off'`
+      );
+      state.scalingMode = 'off';
+    }
+    const effectiveScalingConfig = SCALING_MODES[state.scalingMode];
+    glyphMapper.setScaling(effectiveScalingConfig.mode !== 0);
+    glyphMapper.setScaleMode(effectiveScalingConfig.mode);
 
     // Set orientation array if specified
     if (state.orientationArray) {
@@ -355,12 +420,12 @@ export class VTKGlyphFeature extends FeatureInterface {
     glyphActor.setMapper(glyphMapper);
 
     // Set color
+    let colorTransferFunction = null;
     if (state.colorMode === 'solid') {
       glyphActor.getProperty().setColor(...state.solidColor);
       glyphMapper.setScalarVisibility(false);
     } else if (state.colorArray) {
-      glyphMapper.setScalarVisibility(true);
-      glyphMapper.setColorByArrayName(state.colorArray);
+      colorTransferFunction = this._configureScalarColoring(glyphMapper, mapperInput, state.colorArray);
     }
 
     // Add to renderer
@@ -370,6 +435,7 @@ export class VTKGlyphFeature extends FeatureInterface {
     state.glyphSource = glyphSource;
     state.glyphMapper = glyphMapper;
     state.glyphActor = glyphActor;
+    state.colorTransferFunction = colorTransferFunction;
     state.enabled = true;
 
     renderWindow?.render();
@@ -384,19 +450,18 @@ export class VTKGlyphFeature extends FeatureInterface {
     const state = this.instanceStates.get(instanceId);
     if (!state) return;
 
-    this._disableGlyphs(state);
-
-    // Ensure original actor is visible with reasonable point size for point clouds
+    // Restore whatever visibility/point-size the main actor had BEFORE
+    // glyphs were ever enabled (captured once in enableGlyphs), instead of
+    // unconditionally forcing visible/size-5 — which could override
+    // threshold/isosurface or user styling that had the actor hidden or
+    // sized differently on purpose.
     const { actor } = state.sceneObjects || {};
-    if (actor) {
-      actor.setVisibility(true);
-      // If point data, ensure visible point size
-      const currentPointSize = actor.getProperty().getPointSize();
-      if (currentPointSize < 2) {
-        actor.getProperty().setPointSize(5);
-        log.debug('Restored point size after disabling glyphs');
-      }
+    if (actor && state._preGlyphStateCaptured) {
+      actor.setVisibility(state.preGlyphActorVisibility);
+      actor.getProperty().setPointSize(state.preGlyphPointSize);
     }
+
+    this._disableGlyphs(state);
 
     state.sceneObjects.renderWindow?.render();
 
@@ -439,6 +504,11 @@ export class VTKGlyphFeature extends FeatureInterface {
     state.derivedPolydata = null;
     state.basePolydata = null;
     state.enabled = false;
+    // Next enableGlyphs() should capture a FRESH pre-glyph snapshot, since
+    // the actor's visibility/point-size may have changed while glyphs were on.
+    state._preGlyphStateCaptured = false;
+    state.preGlyphActorVisibility = undefined;
+    state.preGlyphPointSize = undefined;
   }
 
   /**
@@ -512,6 +582,10 @@ export class VTKGlyphFeature extends FeatureInterface {
     if (state.glyphActor) {
       state.glyphActor.getProperty().setColor(...rgb);
       state.glyphMapper?.setScalarVisibility(false);
+      if (state.colorTransferFunction) {
+        state.colorTransferFunction.delete();
+        state.colorTransferFunction = null;
+      }
       state.sceneObjects.renderWindow?.render();
     }
   }
@@ -533,12 +607,95 @@ export class VTKGlyphFeature extends FeatureInterface {
     if (mode === 'solid') {
       state.glyphActor.getProperty().setColor(...state.solidColor);
       state.glyphMapper.setScalarVisibility(false);
+      if (state.colorTransferFunction) {
+        state.colorTransferFunction.delete();
+        state.colorTransferFunction = null;
+      }
     } else if (mode === 'scalar' && state.colorArray) {
-      state.glyphMapper.setScalarVisibility(true);
-      state.glyphMapper.setColorByArrayName(state.colorArray);
+      if (state.colorTransferFunction) {
+        state.colorTransferFunction.delete();
+      }
+      const mapperInput = state.glyphMapper.getInputData(0);
+      state.colorTransferFunction = this._configureScalarColoring(state.glyphMapper, mapperInput, state.colorArray);
     }
 
     state.sceneObjects.renderWindow?.render();
+  }
+
+  /**
+   * Configure scalar coloring on a glyph mapper with an actual lookup table
+   * and data range (mirrors VTKScalarColoringFeature's pattern). Without
+   * this, vtk.js defaults to scalarRange [0,1] and an auto-generated lookup
+   * table, which essentially never matches the real data's range.
+   * @returns {object} the created vtkColorTransferFunction (caller owns its lifecycle)
+   */
+  _configureScalarColoring(mapper, polydata, arrayName) {
+    const array = polydata?.getPointData()?.getArrayByName(arrayName);
+    const range = array ? array.getRange() : [0, 1];
+
+    const ctfun = vtkColorTransferFunction.newInstance();
+    ctfun.addRGBPoint(range[0], 0, 0, 0);
+    ctfun.addRGBPoint(range[1], 1, 1, 1);
+
+    mapper.setScalarVisibility(true);
+    mapper.setColorByArrayName(arrayName);
+    mapper.setLookupTable(ctfun);
+    mapper.setScalarRange(range[0], range[1]);
+
+    return ctfun;
+  }
+
+  /**
+   * Set scaling mode and, optionally, the array it scales by. Re-validates
+   * against the currently-bound polydata the same way enableGlyphs does,
+   * degrading to 'off' rather than misconfiguring the mapper.
+   */
+  setScalingMode(instanceId, mode, scaleArray = null) {
+    const state = this.instanceStates.get(instanceId);
+    if (!state || !SCALING_MODES[mode]) return;
+
+    state.scalingMode = mode;
+    if (scaleArray !== undefined) state.scaleArray = scaleArray;
+
+    if (!state.glyphMapper) return;
+
+    const mapperInput = state.glyphMapper.getInputData(0);
+    const pointData = mapperInput?.getPointData();
+    const scalingConfig = SCALING_MODES[state.scalingMode];
+    const usable =
+      scalingConfig.mode === 0 ||
+      (pointData && this._hasUsableScaleArray(pointData, scalingConfig.mode, state.scaleArray));
+    if (!usable) {
+      log.warn(`setScalingMode: '${mode}' has no usable array — degrading to 'off'`);
+      state.scalingMode = 'off';
+    }
+
+    const effective = SCALING_MODES[state.scalingMode];
+    state.glyphMapper.setScaling(effective.mode !== 0);
+    state.glyphMapper.setScaleMode(effective.mode);
+    if (state.scaleArray) {
+      state.glyphMapper.setScaleArray(state.scaleArray);
+    }
+
+    state.sceneObjects.renderWindow?.render();
+  }
+
+  /**
+   * Whether polydata has an array that would actually back the given
+   * Glyph3DMapper scale mode. 'components' mode strictly needs a genuine
+   * 3-component array (a named scaleArray, or the active vectors);
+   * 'magnitude' mode accepts any named scaleArray or falls back to whatever
+   * active scalars/vectors vtk.js itself would use.
+   */
+  _hasUsableScaleArray(pointData, mode, scaleArrayName) {
+    if (mode === SCALING_MODES.components.mode) {
+      const named = scaleArrayName ? pointData.getArrayByName(scaleArrayName) : null;
+      if (named && named.getNumberOfComponents() === 3) return true;
+      return pointData.getVectors()?.getNumberOfComponents() === 3;
+    }
+    // magnitude mode
+    if (scaleArrayName && pointData.hasArray(scaleArrayName)) return true;
+    return !!(pointData.getScalars() || pointData.getVectors());
   }
 
   /**
@@ -556,7 +713,7 @@ export class VTKGlyphFeature extends FeatureInterface {
     const previousDerived = state.derivedPolydata;
     const nextInput = state.density >= 1
       ? state.basePolydata
-      : this._buildSubsampledPolydata(state.basePolydata, state.density);
+      : this._buildSubsampledPolydata(state.basePolydata, state.density, state.selectedSourcePointId);
 
     state.glyphMapper.setInputData(nextInput, 0);
     state.derivedPolydata = nextInput === state.basePolydata ? null : nextInput;
@@ -570,10 +727,56 @@ export class VTKGlyphFeature extends FeatureInterface {
   }
 
   /**
-   * Build a strided subsample of polydata (points + all point-data arrays) for glyph density control.
-   * A real derived vtk.js polydata source, not a rendering hack.
+   * Mark a source-dataset point index as "currently selected" (e.g. a VR
+   * tool's in-progress annotation/measurement anchor), so subsequent glyph
+   * subsampling force-includes it rather than silently hiding it. Rebuilds
+   * the subsampled input immediately if glyphs are enabled below density 1,
+   * mirroring setDensity.
    */
-  _buildSubsampledPolydata(polydata, density) {
+  setSelectedPoint(instanceId, sourcePointId) {
+    const state = this.instanceStates.get(instanceId);
+    if (!state) return;
+
+    state.selectedSourcePointId = sourcePointId ?? null;
+    this._refreshSubsampleForSelection(instanceId);
+  }
+
+  /**
+   * Clear the current selection (annotation/measurement session ended) so
+   * subsampling reverts to its normal stride pattern.
+   */
+  clearSelectedPoint(instanceId) {
+    const state = this.instanceStates.get(instanceId);
+    if (!state) return;
+
+    state.selectedSourcePointId = null;
+    this._refreshSubsampleForSelection(instanceId);
+  }
+
+  /**
+   * Shared by setSelectedPoint/clearSelectedPoint: rebuild the glyph
+   * mapper's subsampled input so a selection change is reflected immediately,
+   * without duplicating setDensity's rebuild/dispose logic.
+   * @private
+   */
+  _refreshSubsampleForSelection(instanceId) {
+    const state = this.instanceStates.get(instanceId);
+    if (!state?.enabled || !state.glyphMapper || !state.basePolydata || state.density >= 1) {
+      return;
+    }
+    this.setDensity(instanceId, state.density);
+  }
+
+  /**
+   * Build a subsample of polydata (points + all point-data arrays) for glyph density control.
+   * A real derived vtk.js polydata source, not a rendering hack.
+   * @param {number|null} [selectedSourcePointId] - a source-dataset point index
+   *   that must survive subsampling (e.g. a VR tool's in-progress annotation/
+   *   measurement anchor) even if the stride pattern wouldn't otherwise pick
+   *   it. Appended as an extra slot when missing, never displaces an already-
+   *   sampled point.
+   */
+  _buildSubsampledPolydata(polydata, density, selectedSourcePointId = null) {
     const points = polydata.getPoints();
     const srcXYZ = points.getData();
     const numPoints = points.getNumberOfPoints();
@@ -583,9 +786,36 @@ export class VTKGlyphFeature extends FeatureInterface {
     if (stride <= 1) return polydata;
 
     const keepCount = Math.max(1, Math.ceil(numPoints / stride));
-    const dstXYZ = new Float32Array(keepCount * 3);
-    for (let d = 0, s = 0; d < keepCount; d++, s += stride) {
-      const srcIndex = Math.min(s, numPoints - 1);
+
+    // Which source point backs each output slot, computed once. A
+    // deterministic (not always-index-0) offset within each stride window
+    // avoids systematically favoring whatever spatial/structural pattern
+    // correlates with point-insertion order (e.g. always the same row/column
+    // of a structured grid) — while staying reproducible across renders of
+    // the same dataset+density, unlike true randomness would be.
+    const srcIndexList = [];
+    for (let d = 0, w = 0; d < keepCount; d++, w++) {
+      const offset = _deterministicStrideOffset(w, stride);
+      srcIndexList.push(Math.min(w * stride + offset, numPoints - 1));
+    }
+
+    // Force-include the currently selected point so it never silently
+    // disappears from view just because it fell outside the stride pattern.
+    if (
+      selectedSourcePointId != null &&
+      selectedSourcePointId >= 0 &&
+      selectedSourcePointId < numPoints &&
+      !srcIndexList.includes(selectedSourcePointId)
+    ) {
+      srcIndexList.push(selectedSourcePointId);
+    }
+
+    const srcIndices = Int32Array.from(srcIndexList);
+    const finalCount = srcIndices.length;
+
+    const dstXYZ = new Float32Array(finalCount * 3);
+    for (let d = 0; d < finalCount; d++) {
+      const srcIndex = srcIndices[d];
       dstXYZ[d * 3] = srcXYZ[srcIndex * 3];
       dstXYZ[d * 3 + 1] = srcXYZ[srcIndex * 3 + 1];
       dstXYZ[d * 3 + 2] = srcXYZ[srcIndex * 3 + 2];
@@ -597,7 +827,7 @@ export class VTKGlyphFeature extends FeatureInterface {
     const derived = vtkPolyData.newInstance();
     derived.setPoints(newPoints);
 
-    // Carry every point-data array along with the SAME stride so array[i] still matches point[i]
+    // Carry every point-data array along with the SAME sampled indices so array[i] still matches point[i]
     const srcPointData = polydata.getPointData();
     const dstPointData = derived.getPointData();
     for (let i = 0; i < srcPointData.getNumberOfArrays(); i++) {
@@ -606,9 +836,9 @@ export class VTKGlyphFeature extends FeatureInterface {
 
       const numComponents = array.getNumberOfComponents();
       const srcValues = array.getData();
-      const dstValues = new srcValues.constructor(keepCount * numComponents);
-      for (let d = 0, s = 0; d < keepCount; d++, s += stride) {
-        const srcIndex = Math.min(s, numPoints - 1);
+      const dstValues = new srcValues.constructor(finalCount * numComponents);
+      for (let d = 0; d < finalCount; d++) {
+        const srcIndex = srcIndices[d];
         for (let c = 0; c < numComponents; c++) {
           dstValues[d * numComponents + c] = srcValues[srcIndex * numComponents + c];
         }
@@ -620,6 +850,24 @@ export class VTKGlyphFeature extends FeatureInterface {
         values: dstValues,
       }));
     }
+
+    // addArray alone doesn't assign scalar/vector "role" — preserve whichever
+    // array was ACTIVE on the source, so Glyph3DMapper's scale/orient
+    // fallback (which reads getScalars()/getVectors()) keeps working on
+    // subsampled data even though the named array is present either way.
+    const srcScalarsName = srcPointData.getScalars()?.getName();
+    const srcVectorsName = srcPointData.getVectors()?.getName();
+    if (srcScalarsName) dstPointData.setActiveScalars(srcScalarsName);
+    if (srcVectorsName) dstPointData.setActiveVectors(srcVectorsName);
+
+    // Record which source point each surviving glyph came from, so a pick
+    // against this (regenerated-on-density-change) geometry can be traced
+    // back to a real point index in the original, full-resolution dataset.
+    dstPointData.addArray(vtkDataArray.newInstance({
+      name: 'SourcePointId',
+      numberOfComponents: 1,
+      values: srcIndices,
+    }));
 
     return derived;
   }
@@ -687,6 +935,9 @@ export class VTKGlyphFeature extends FeatureInterface {
     if (config.orientationArray !== state.orientationArray) {
       this.setOrientationArray(instanceId, config.orientationArray);
     }
+    if (config.scalingMode !== state.scalingMode || config.scaleArray !== state.scaleArray) {
+      this.setScalingMode(instanceId, config.scalingMode, config.scaleArray);
+    }
     if (
       config.colorMode !== state.colorMode ||
       config.colorArray !== state.colorArray ||
@@ -716,12 +967,20 @@ export function isVectorOrientationAvailable(vectorArrays) {
 }
 
 /**
- * Whether the glyph feature has anything to render at all (vector or scalar arrays)
+ * Whether the glyph feature has anything to render at all. A vector or
+ * scalar array unlocks orientation/scaling by data, but even a point-only
+ * dataset (no arrays whatsoever) can still render constant-scale sphere/dot
+ * glyphs at every point — so `hasPoints` alone is enough to make the
+ * feature available, just with fewer glyph-type/scaling options.
+ * @param {Array} vectorArrays
+ * @param {Array} scalarArrays
+ * @param {boolean} [hasPoints=false] whether the dataset has at least one point
  */
-export function isGlyphFeatureAvailable(vectorArrays, scalarArrays) {
+export function isGlyphFeatureAvailable(vectorArrays, scalarArrays, hasPoints = false) {
   return (
     isVectorOrientationAvailable(vectorArrays) ||
-    (Array.isArray(scalarArrays) && scalarArrays.length > 0)
+    (Array.isArray(scalarArrays) && scalarArrays.length > 0) ||
+    !!hasPoints
   );
 }
 

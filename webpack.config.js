@@ -1,11 +1,32 @@
 const path = require("path");
 const HtmlWebpackPlugin = require("html-webpack-plugin");
 const fs = require("fs");
+const os = require("os");
 const webpack = require("webpack");
 require("dotenv").config();
 
 // Allow HTTP mode for local voice chat testing (LiveKit without TLS)
 const useHttps = process.env.USE_HTTP !== "true";
+
+/**
+ * Non-internal IPv4 addresses this machine is reachable at on the LAN —
+ * what a physically separate device (Oculus/Meta Quest, Apple Vision Pro)
+ * needs instead of "localhost", which on THEIR browser resolves to the
+ * headset itself, not this dev machine. See docs/apple-vision-pro.md /
+ * docs/quest-voice-setup.md for the full headset-connectivity story.
+ */
+function getLanIPv4Addresses() {
+  const addresses = [];
+  const interfaces = os.networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name] || []) {
+      if (iface.family === "IPv4" && !iface.internal) {
+        addresses.push(iface.address);
+      }
+    }
+  }
+  return addresses;
+}
 
 // Build server config based on protocol preference
 const getServerConfig = () => {
@@ -20,6 +41,18 @@ const getServerConfig = () => {
 
   if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
     console.log("🔒 Running in HTTPS mode with certificates");
+    const lanIPs = getLanIPv4Addresses();
+    if (lanIPs.length > 0) {
+      console.log(
+        `📡 LAN access (for a headset — Quest, Vision Pro): ${lanIPs
+          .map((ip) => `https://${ip}:8081`)
+          .join(", ")}`
+      );
+      console.log(
+        "   (the cert must include this IP in its SAN list — see ./scripts/generate-certs.sh <ip>;" +
+          " a headset that doesn't trust the cert's CA will show a warning to click through)"
+      );
+    }
     return {
       type: "https",
       options: {
@@ -47,7 +80,10 @@ const getServerConfig = () => {
   return undefined;
 };
 
-module.exports = {
+module.exports = (env, argv) => {
+  const isProduction = argv.mode === "production";
+
+  return {
   entry: {
     main: "./src/index.js",
     embed: "./src/embed.js",
@@ -63,9 +99,11 @@ module.exports = {
     // loading /main.bundle.js from site root.
     publicPath: "/",
   },
-  mode: "development",
-  // eval-cheap-module-source-map is much faster than source-map for dev
-  devtool: "eval-cheap-module-source-map",
+  mode: argv.mode || "development",
+  // eval-cheap-module-source-map is much faster than source-map for dev;
+  // production gets a real, non-eval source-map (CSP-safe, doesn't ship
+  // readable source inline in the bundle).
+  devtool: isProduction ? "source-map" : "eval-cheap-module-source-map",
   // Filesystem cache dramatically speeds up cold starts after first build
   cache: {
     type: "filesystem",
@@ -231,7 +269,7 @@ module.exports = {
         process.env.YJS_WEBSOCKET_URL || "/yjs-ws"
       ),
       "process.env.NODE_ENV": JSON.stringify(
-        process.env.NODE_ENV || "development"
+        isProduction ? "production" : (process.env.NODE_ENV || "development")
       ),
       __API_BASE_URL__: JSON.stringify(process.env.API_BASE_URL || "/api"),
       __YJS_WS_URL__: JSON.stringify(
@@ -268,9 +306,6 @@ module.exports = {
       __RENDER_WS_URL__: JSON.stringify(
         process.env.RENDER_WS_URL || "/render-ws"
       ),
-      __RENDER_SERVER_TOKEN__: JSON.stringify(
-        process.env.RENDER_SERVER_TOKEN || ""
-      ),
     }),
   ],
   // Ignore controller.html
@@ -295,4 +330,5 @@ module.exports = {
       "@VTK": path.resolve(__dirname, "src/core/instances/types/vtk"),
     },
   },
+  };
 };

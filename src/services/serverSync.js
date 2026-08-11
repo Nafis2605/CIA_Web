@@ -8,7 +8,7 @@ import { resolveWsUrl } from "@Utils/resolveWsUrl.js";
 import { authService } from "@Services/authService.js";
 import { useComputeJobStore } from "@UI/react/store/computeJobStore.js";
 import { toast } from "@UI/react/store/toastStore.js";
-import { saveSyncWatermark } from "@Services/syncService.js";
+import { getSyncWatermark, saveSyncWatermark } from "@Services/syncService.js";
 import { metricsService } from "@Services/metrics/metricsService.js";
 
 // Debounce window for delta back-fill requests.
@@ -24,6 +24,16 @@ class ServerSyncService {
     this.maxReconnectDelay = 30000;
     this._reconnectTimer = null;
     this._resumeListenersAttached = false;
+    // Set by disconnect(), cleared by connect() — distinguishes "the app
+    // closed this on purpose" (sign-out) from a network drop, so onclose/
+    // the resume listeners don't immediately reconnect right after we asked
+    // to stay disconnected.
+    this._intentionalDisconnect = false;
+    // Named references to the listeners _setupNetworkResumeListeners adds,
+    // so disconnect() can actually remove them (an anonymous inline handler
+    // can't be passed to removeEventListener).
+    this._onNetworkResume = null;
+    this._onVisibilityChange = null;
     this.handlers = new Map();
     this.datasetManager = null;
     this.viewConfigurationManager = null;
@@ -43,9 +53,25 @@ class ServerSyncService {
   /**
    * Set the workspace scope for watermark tracking.
    * Call this after the user joins a workspace.
+   *
+   * Restores the persisted watermark (localStorage, via getSyncWatermark)
+   * into memory immediately — without this, every reconnect/reload started
+   * `_lastWatermark` back at 0 regardless of what had already been synced,
+   * relying entirely on the REACTIVE gap check in a later live message to
+   * ever notice anything was missed (see auth:success below for the other
+   * half of this fix).
    */
   setWorkspaceId(workspaceId) {
     this._workspaceId = workspaceId;
+    this._restoreWatermark();
+  }
+
+  /**
+   * @private
+   */
+  _restoreWatermark() {
+    if (!this._workspaceId) return;
+    this._lastWatermark = getSyncWatermark(this._workspaceId, this._userId);
   }
 
   initialize(datasetManager, viewConfigurationManager = null) {
@@ -68,6 +94,9 @@ class ServerSyncService {
     this._resumeListenersAttached = true;
 
     const tryResumeNow = () => {
+      // The app asked to stay disconnected (e.g. sign-out) — a stray
+      // online/focus/visibility signal must not undo that.
+      if (this._intentionalDisconnect) return;
       if (this.isConnected) return;
       if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
       log.info("Network/visibility resume signal — attempting immediate reconnect");
@@ -78,11 +107,15 @@ class ServerSyncService {
       this.reconnectAttempts = 0;
       this.connect();
     };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") tryResumeNow();
+    };
+
+    this._onNetworkResume = tryResumeNow;
+    this._onVisibilityChange = onVisibilityChange;
 
     window.addEventListener("online", tryResumeNow);
-    document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "visible") tryResumeNow();
-    });
+    document.addEventListener("visibilitychange", onVisibilityChange);
     window.addEventListener("focus", tryResumeNow);
   }
 
@@ -119,6 +152,11 @@ class ServerSyncService {
   }
 
   connect() {
+    // A fresh connect() (initial load, or a deliberate reconnect after a
+    // prior disconnect()) means the app wants to be connected again —
+    // clear the flag so onclose/resume listeners aren't stuck refusing to
+    // reconnect after this point.
+    this._intentionalDisconnect = false;
     // config.apiBaseUrl is normally a relative "/api" path, in which case the
     // live broadcast socket rides the same origin via the webpack devServer's
     // /app-ws proxy (mounted at /app-ws rather than /ws because webpack-dev-
@@ -146,6 +184,9 @@ class ServerSyncService {
       this.ws.onclose = () => {
         log.info("Disconnected");
         this.isConnected = false;
+        // A close the app itself initiated (disconnect()) must not schedule
+        // a reconnect — that's the entire point of "intentional".
+        if (this._intentionalDisconnect) return;
         this._scheduleReconnect();
       };
       this.ws.onerror = (error) => log.error("WebSocket error", error);
@@ -173,6 +214,15 @@ class ServerSyncService {
       // Store the database userId in sessionManager and locally for watermark scoping
       sessionManager.setUserInfo(msg.userId, msg.email || null);
       this._userId = msg.userId || null;
+      // _userId wasn't known the first time setWorkspaceId() ran (it's set
+      // above, right here) — re-restore now that both halves of the
+      // watermark's storage key are available.
+      this._restoreWatermark();
+      // Request a delta unconditionally, not just reactively on the next
+      // live message's sequence gap: a reconnect after any time offline may
+      // have missed events, and a quiet room might not produce a live
+      // message for a while (or ever) to reveal that reactively.
+      this._triggerDeltaFetch();
       if (this.pendingProjectId) {
         this._send({ type: "join:project", projectId: this.pendingProjectId });
       }
@@ -813,7 +863,21 @@ class ServerSyncService {
     });
   }
 
+  /**
+   * Deliberately close the connection and keep it closed — e.g. on sign-out.
+   * Marks the close as intentional (see _intentionalDisconnect) so onclose
+   * and the online/visibility/focus resume listeners don't immediately
+   * reconnect, and removes those listeners so they don't leak past this
+   * disconnect. A later connect() (e.g. re-login) clears the flag and
+   * re-attaches listeners via _setupNetworkResumeListeners as normal.
+   */
   disconnect() {
+    this._intentionalDisconnect = true;
+
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
     if (this._deltaFetchTimer) {
       clearTimeout(this._deltaFetchTimer);
       this._deltaFetchTimer = null;
@@ -826,6 +890,19 @@ class ServerSyncService {
       this._authUnsubscribe();
       this._authUnsubscribe = null;
     }
+
+    if (typeof window !== "undefined") {
+      if (this._onNetworkResume) {
+        window.removeEventListener("online", this._onNetworkResume);
+        window.removeEventListener("focus", this._onNetworkResume);
+      }
+      if (this._onVisibilityChange) {
+        document.removeEventListener("visibilitychange", this._onVisibilityChange);
+      }
+    }
+    this._onNetworkResume = null;
+    this._onVisibilityChange = null;
+    this._resumeListenersAttached = false;
   }
 }
 

@@ -1,0 +1,68 @@
+# docker-compose.prod.yml — production gateway overlay
+#
+# Usage:
+#   docker-compose -f docker-compose.yml -f docker-compose.prod.yml up
+#   (add docker-compose.gpu.yml too if rendering on an NVIDIA host — all
+#   three overlays compose freely, same pattern as the existing GPU overlay)
+#
+# Adds two things the base docker-compose.yml doesn't have:
+#   1. `gateway` — nginx reverse proxy (docker/nginx/nginx.conf) fronting
+#      every collaboration/render/voice WebSocket and HTTP route on 80/443,
+#      TLS-terminating so no individual service needs to be reachable on
+#      its own host port. See docs/production-gateway.md for the full
+#      route table and TLS certificate setup.
+#   2. `token-server` — containerizes the LiveKit token-minting server
+#      (repo-root token-server.js), which in dev only runs ad hoc on the
+#      host via `npm run token-server`. Production needs it reachable from
+#      the gateway over the internal Docker network like every other
+#      backend service.
+#
+# This overlay does NOT publish api/yjs/render-server/postgres/etc. on
+# their own host ports — remove or keep the base file's `ports:` mappings
+# per your own network policy; the gateway reaching them over the internal
+# `default` network doesn't require host-port publication at all.
+
+services:
+  gateway:
+    image: nginx:1.27-alpine
+    container_name: cia-gateway
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./dist:/usr/share/nginx/html:ro
+      # Real certificates — NOT provided by this repo. See
+      # docs/production-gateway.md for how to supply them (a mounted
+      # cert.pem/key.pem pair, or swap this service for one fronted by a
+      # managed TLS terminator/load balancer in front of nginx instead).
+      - ./certs/prod:/etc/nginx/certs:ro
+    depends_on:
+      - api
+      - yjs
+      - render-server
+      - token-server
+    restart: unless-stopped
+
+  token-server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile.token-server
+    container_name: cia-token-server
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      DEV_BYPASS_AUTH: ${DEV_BYPASS_AUTH:-false}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB:-cia_analytics}
+      DB_USER: ${POSTGRES_USER:-ciauser}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-ciadevpassword}
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-cia-web}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
+      LIVEKIT_URL: ${LIVEKIT_URL:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped

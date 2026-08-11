@@ -216,8 +216,10 @@ export class VRParticipantSync {
       pointer: this._serializePointer(state.pointer),
       // ...whereas pointerHit is the point where that ray met the SHARED
       // geometry. It is already in data space and identical for every viewer,
-      // so it must never be re-transformed on receipt.
-      pointerHit: this._serializePoint(state.pointerHit),
+      // so it must never be re-transformed on receipt. Also carries pick
+      // identity (pointId/cellId/datasetId/actorRole) so collaborators can
+      // see not just WHERE a participant is pointing but WHAT they've hit.
+      pointerHit: this._serializePick(state.pointerHit),
 
       // Cursor (for desktop participants)
       cursorPosition: state.cursorPosition || null,
@@ -379,6 +381,26 @@ export class VRParticipantSync {
       return null;
     }
     return { x: p.x, y: p.y, z: p.z };
+  }
+
+  /**
+   * @param {{position?:object, pointId?:number, cellId?:number,
+   *   datasetId?:string|null, actorRole?:string|null}|null|undefined} pick
+   * @returns {{position:object, pointId:number, cellId:number,
+   *   datasetId:string|null, actorRole:string|null}|null}
+   * @private
+   */
+  _serializePick(pick) {
+    const position = this._serializePoint(pick?.position);
+    if (!position) return null;
+
+    return {
+      position,
+      pointId: typeof pick.pointId === 'number' ? pick.pointId : -1,
+      cellId: typeof pick.cellId === 'number' ? pick.cellId : -1,
+      datasetId: pick.datasetId ?? null,
+      actorRole: pick.actorRole ?? null,
+    };
   }
 
   _serializePose(pose) {

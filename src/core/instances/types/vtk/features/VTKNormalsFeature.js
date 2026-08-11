@@ -297,6 +297,10 @@ export class VTKNormalsFeature extends FeatureInterface {
     const glyphActor = vtkActor.newInstance();
     glyphActor.setMapper(glyphMapper);
     glyphActor.getProperty().setColor(...state.glyphColor);
+    // Normal-vector arrows are a visualization overlay, not part of the
+    // dataset — unpickable so VR raycasts (annotation/measurement/probe)
+    // hit the underlying surface instead of an arrow glyph.
+    glyphActor.setPickable(false);
 
     // Add to renderer
     renderer.addActor(glyphActor);
