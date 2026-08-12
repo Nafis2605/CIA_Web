@@ -201,6 +201,31 @@ describe("VRExplorationManager._onFrame â€” input arbitration (R2)", () => 
     expect(navUpdate.mock.calls[0][0].controllers.right.triggerPressed).toBe(false);
   });
 
+  it("resolves activePointerHand on the raw inputState and it survives into both nav and tool clones", () => {
+    // PINCH_SOURCE is a gripless transient-pointer source mapped onto
+    // controllers.right by _gatherInputState, with isSelectPressed() true —
+    // so the only pressed hand this frame is right.
+    runFrame();
+
+    const raw = mockSpatialHitTest.mock.calls[0][0];
+    expect(raw.activePointerHand).toBe("right");
+    // _gateInputState's clone is a shallow spread of inputState's top-level
+    // keys — activePointerHand must survive into both navInput and toolInput
+    // without any special-case plumbing.
+    expect(navUpdate.mock.calls[0][0].activePointerHand).toBe("right");
+    expect(toolUpdate.mock.calls[0][0].activePointerHand).toBe("right");
+  });
+
+  it("_gateInputState preserves an arbitrary top-level field (activePointerHand) through its clone", () => {
+    const raw = {
+      activePointerHand: "left",
+      controllers: { right: { triggerPressed: true, triggerValue: 1 } },
+    };
+    const gated = vrExplorationManager._gateInputState(raw, new Set(["right"]));
+    expect(gated.activePointerHand).toBe("left");
+    expect(gated.controllers.right.triggerPressed).toBe(false);
+  });
+
   it("strips grip only while the menu is grip-dragging", () => {
     const raw = {
       controllers: {

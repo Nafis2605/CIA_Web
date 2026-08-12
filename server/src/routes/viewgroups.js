@@ -7,7 +7,8 @@ const express = require('express');
 const router = express.Router({ mergeParams: true });
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
-const { getUser } = require('../middleware/auth');
+const { getUser, checkWorkspaceAccess } = require('../middleware/auth');
+const { hasPermission, PERMISSIONS } = require('../utils/permissions');
 const { createLogger } = require('../utils/logger');
 const { writeSyncEvent, buildSnapshot } = require('../services/syncEventService');
 const { diffObjects } = require('../utils/jsonDiff');
@@ -34,6 +35,47 @@ function toSnakeCase(str) {
     return str.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
 }
 
+/**
+ * Resolve the workspace a view lives in, via its ViewGroup. Shared by every
+ * view-link and reconciliation route below, all of which need a view's
+ * workspace to authorize against.
+ *
+ * view_configurations has no canvas_id/workspace_id column of its own — the
+ * only FK path to a workspace is view_group_id -> viewgroups.workspace_id
+ * (confirmed against the live schema; view_configurations.project_id can't
+ * be used instead since a project can have multiple workspaces). The
+ * original inline version of this query (before it was factored out here)
+ * joined through a nonexistent vc.canvas_id -> canvases table instead,
+ * which made every call throw `column vc.canvas_id does not exist` — so
+ * POST/DELETE /links/view always 500'd right after successfully writing to
+ * view_links, since that broken lookup ran (for the broadcast) before the
+ * response was sent. A view not currently in any ViewGroup has no workspace
+ * resolvable this way and returns null, same as an unknown viewId.
+ */
+async function resolveViewWorkspaceId(pool, viewId) {
+    const result = await pool.query(
+        `SELECT vg.workspace_id AS workspace_id
+         FROM view_configurations vc
+         JOIN viewgroups vg ON vc.view_group_id = vg.id
+         WHERE vc.id = $1`,
+        [viewId]
+    );
+    return result.rows[0]?.workspace_id || null;
+}
+
+/**
+ * Verify the caller has `permission` in `workspaceId`. Returns the response
+ * on failure (caller should `if (result) return;`), or null on success.
+ */
+async function authorizeWorkspace(pool, workspaceId, userId, permission, res) {
+    const { allowed, role } = await checkWorkspaceAccess(pool, workspaceId, userId);
+    if (!allowed || !hasPermission(role, permission)) {
+        res.status(403).json({ error: 'Not authorized for this workspace' });
+        return true;
+    }
+    return false;
+}
+
 // ============================================================================
 // VIEWGROUP CRUD ENDPOINTS
 // ============================================================================
@@ -50,6 +92,15 @@ router.get('/', async (req, res, next) => {
         // or from query params (when mounted at /api/viewgroups)
         const workspaceId = req.params.workspaceId || req.query.workspaceId;
         const { projectId, includeImplicit = 'false' } = req.query;
+
+        // Every real call site scopes by one or the other (ViewGroupManager.js
+        // always sends workspaceId or projectId) — without this floor, an
+        // unscoped request has no boundary other than owner/visibility below
+        // and would list every group/public-visibility ViewGroup in the DB.
+        if (!workspaceId && !projectId) {
+            return res.status(400).json({ error: 'workspaceId or projectId is required' });
+        }
+        if (workspaceId && (await authorizeWorkspace(pool, workspaceId, user?.id, PERMISSIONS.WORKSPACE_READ, res))) return;
 
         let query = `
             SELECT vg.*,
@@ -179,6 +230,15 @@ router.get('/:id', async (req, res, next) => {
         }
 
         const vg = result.rows[0];
+        const user = getUser(req);
+
+        // Private ViewGroups are only accessible to their owner
+        if (vg.visibility === 'private' && vg.owner_id !== user?.id) {
+            return res.status(403).json({ error: 'Access denied to private ViewGroup' });
+        }
+        if (vg.owner_id !== user?.id) {
+            if (await authorizeWorkspace(pool, vg.workspace_id, user?.id, PERMISSIONS.WORKSPACE_READ, res)) return;
+        }
 
         // Get views in this ViewGroup
         // view_configurations has no view_type column — see the identical
@@ -264,6 +324,10 @@ async function createViewGroup(req, res, next) {
         // route just above, which already falls back to req.query for the
         // same reason.
         const workspaceId = req.params.workspaceId || req.body.workspaceId;
+        if (!workspaceId) {
+            return res.status(400).json({ error: 'workspaceId is required' });
+        }
+        if (await authorizeWorkspace(pool, workspaceId, user.id, PERMISSIONS.WORKSPACE_UPDATE, res)) return;
         const {
             name = 'New Group',
             layoutId = 'single',
@@ -423,6 +487,18 @@ router.put('/:id', async (req, res, next) => {
             const oldResult = await client.query('SELECT * FROM viewgroups WHERE id = $1', [id]);
             oldStateForPatch = oldResult.rows[0] || null;
 
+            if (!oldStateForPatch) {
+                await client.query('ROLLBACK');
+                client.release();
+                return res.status(404).json({ error: 'ViewGroup not found' });
+            }
+            const { allowed, role } = await checkWorkspaceAccess(pool, oldStateForPatch.workspace_id, user?.id);
+            if (!allowed || !hasPermission(role, PERMISSIONS.WORKSPACE_UPDATE)) {
+                await client.query('ROLLBACK');
+                client.release();
+                return res.status(403).json({ error: 'Not authorized for this workspace' });
+            }
+
             const result = await client.query(
                 `UPDATE viewgroups SET ${updates.join(', ')} WHERE ${whereClause} RETURNING *`,
                 values
@@ -489,10 +565,14 @@ router.put('/:id', async (req, res, next) => {
 
         log.info(`Updated ViewGroup ${id}`);
 
-        // Broadcast to connected clients (enriched payload)
+        // Broadcast to connected clients (enriched payload).
+        // NOTE: this used to call broadcastToProject(viewGroup.workspace_id, ...)
+        // — passing a workspace_id where broadcastToProject expects a
+        // project_id (rooms are keyed by project_id). Since no room is ever
+        // keyed by a workspace id, that made this broadcast a silent no-op.
+        // broadcastToWorkspace resolves workspace_id -> project_id itself.
         if (wsManager && viewGroup.workspace_id) {
-            wsManager.broadcastToProject(viewGroup.workspace_id, {
-                type: 'viewgroup:updated',
+            wsManager.broadcastToWorkspace(viewGroup.workspace_id, 'viewgroup:updated', {
                 viewGroup: {
                     id: viewGroup.id,
                     workspaceId: viewGroup.workspace_id,
@@ -542,6 +622,7 @@ router.delete('/:id', async (req, res, next) => {
     const { pool, wsManager } = req.app.locals;
 
     try {
+        const user = getUser(req);
         const { id } = req.params;
 
         // Get workspace ID for broadcast before deleting
@@ -555,6 +636,7 @@ router.delete('/:id', async (req, res, next) => {
         }
 
         const workspaceId = vgResult.rows[0].workspace_id;
+        if (await authorizeWorkspace(pool, workspaceId, user?.id, PERMISSIONS.WORKSPACE_DELETE, res)) return;
 
         // Remove view_group_id from any views in this group
         await pool.query(
@@ -573,10 +655,12 @@ router.delete('/:id', async (req, res, next) => {
 
         log.info(`Deleted ViewGroup ${id}`);
 
-        // Broadcast to connected clients
+        // Broadcast to connected clients (workspaceId included so remote
+        // handlers can filter by it — see ViewGroupManager._handleRemoteDeleted)
         if (wsManager && workspaceId) {
             wsManager.broadcastToWorkspace(workspaceId, 'viewgroup:deleted', {
                 viewGroupId: id,
+                workspaceId,
             });
         }
 
@@ -614,6 +698,11 @@ router.post('/:id/duplicate', async (req, res, next) => {
         }
 
         const original = originalResult.rows[0];
+        if (original.visibility === 'private' && original.owner_id !== user.id) {
+            return res.status(403).json({ error: 'Access denied to private ViewGroup' });
+        }
+        if (await authorizeWorkspace(pool, original.workspace_id, user.id, PERMISSIONS.WORKSPACE_UPDATE, res)) return;
+
         const newId = uuidv4();
 
         // Create duplicate
@@ -702,14 +791,19 @@ router.post('/:id/duplicate', async (req, res, next) => {
 });
 
 // ============================================================================
-// VIEW LINK ENDPOINTS
+// VIEW LINK ENDPOINTS — mounted at /api/links (see module.exports at the
+// bottom of this file: this router is exposed as viewgroupsRouter.viewLinksRouter,
+// separately from the CRUD `router` above, so its relative paths below
+// ('/view', '/viewgroup', ...) resolve to /api/links/view, /api/links/viewgroup
+// etc. instead of double-prefixing to /api/links/links/view.
 // ============================================================================
+const linksRouter = express.Router();
 
 /**
  * POST /api/links/view
  * Create a View-to-View link
  */
-router.post('/links/view', async (req, res, next) => {
+linksRouter.post('/view', async (req, res, next) => {
     const { pool, wsManager } = req.app.locals;
 
     try {
@@ -724,6 +818,12 @@ router.post('/links/view', async (req, res, next) => {
         if (!sourceViewId || !targetViewId || !property) {
             return res.status(400).json({ error: 'sourceViewId, targetViewId, and property are required' });
         }
+
+        const workspaceId = await resolveViewWorkspaceId(pool, sourceViewId);
+        if (!workspaceId) {
+            return res.status(404).json({ error: 'Source view not found' });
+        }
+        if (await authorizeWorkspace(pool, workspaceId, user.id, PERMISSIONS.WORKSPACE_UPDATE, res)) return;
 
         const id = uuidv4();
 
@@ -742,17 +842,8 @@ router.post('/links/view', async (req, res, next) => {
 
         log.info(`Created view link: ${sourceViewId} -> ${targetViewId} (${property}, ${mode})`);
 
-        // Get workspace for broadcast
-        const viewResult = await pool.query(
-            `SELECT w.id as workspace_id FROM view_configurations vc
-             JOIN canvases c ON vc.canvas_id = c.id
-             JOIN workspaces w ON c.workspace_id = w.id
-             WHERE vc.id = $1`,
-            [sourceViewId]
-        );
-
-        if (wsManager && viewResult.rows[0]?.workspace_id) {
-            wsManager.broadcastToWorkspace(viewResult.rows[0].workspace_id, 'viewlink:created', {
+        if (wsManager) {
+            wsManager.broadcastToWorkspace(workspaceId, 'viewlink:created', {
                 link: {
                     id: link.id,
                     sourceViewId: link.source_view_id,
@@ -784,10 +875,11 @@ router.post('/links/view', async (req, res, next) => {
  * DELETE /api/links/view/:id
  * Delete a View-to-View link
  */
-router.delete('/links/view/:id', async (req, res, next) => {
+linksRouter.delete('/view/:id', async (req, res, next) => {
     const { pool, wsManager } = req.app.locals;
 
     try {
+        const user = getUser(req);
         const { id } = req.params;
 
         // Get link details before deleting
@@ -798,22 +890,17 @@ router.delete('/links/view/:id', async (req, res, next) => {
         }
 
         const link = linkResult.rows[0];
+        const workspaceId = await resolveViewWorkspaceId(pool, link.source_view_id);
+        if (workspaceId) {
+            if (await authorizeWorkspace(pool, workspaceId, user?.id, PERMISSIONS.WORKSPACE_DELETE, res)) return;
+        }
 
         await pool.query('DELETE FROM view_links WHERE id = $1', [id]);
 
         log.info(`Deleted view link ${id}`);
 
-        // Get workspace for broadcast
-        const viewResult = await pool.query(
-            `SELECT w.id as workspace_id FROM view_configurations vc
-             JOIN canvases c ON vc.canvas_id = c.id
-             JOIN workspaces w ON c.workspace_id = w.id
-             WHERE vc.id = $1`,
-            [link.source_view_id]
-        );
-
-        if (wsManager && viewResult.rows[0]?.workspace_id) {
-            wsManager.broadcastToWorkspace(viewResult.rows[0].workspace_id, 'viewlink:deleted', {
+        if (wsManager && workspaceId) {
+            wsManager.broadcastToWorkspace(workspaceId, 'viewlink:deleted', {
                 linkId: id,
                 sourceViewId: link.source_view_id,
                 targetViewId: link.target_view_id,
@@ -827,6 +914,83 @@ router.delete('/links/view/:id', async (req, res, next) => {
     }
 });
 
+/**
+ * PATCH /api/links/view/:id
+ * Update a View-to-View link's mode and/or active flag
+ */
+linksRouter.patch('/view/:id', async (req, res, next) => {
+    const { pool, wsManager } = req.app.locals;
+
+    try {
+        const user = getUser(req);
+        const { id } = req.params;
+        const { mode, active } = req.body;
+
+        if (mode === undefined && active === undefined) {
+            return res.status(400).json({ error: 'mode or active is required' });
+        }
+
+        const linkResult = await pool.query('SELECT * FROM view_links WHERE id = $1', [id]);
+        if (linkResult.rows.length === 0) {
+            return res.status(404).json({ error: 'View link not found' });
+        }
+        const existing = linkResult.rows[0];
+
+        const workspaceId = await resolveViewWorkspaceId(pool, existing.source_view_id);
+        if (!workspaceId) {
+            return res.status(404).json({ error: 'Source view not found' });
+        }
+        if (await authorizeWorkspace(pool, workspaceId, user?.id, PERMISSIONS.WORKSPACE_UPDATE, res)) return;
+
+        const updates = [];
+        const values = [id];
+        let paramIndex = 2;
+        if (mode !== undefined) {
+            updates.push(`mode = $${paramIndex++}`);
+            values.push(mode);
+        }
+        if (active !== undefined) {
+            updates.push(`active = $${paramIndex++}`);
+            values.push(active);
+        }
+
+        const result = await pool.query(
+            `UPDATE view_links SET ${updates.join(', ')} WHERE id = $1 RETURNING *`,
+            values
+        );
+        const link = result.rows[0];
+
+        log.info(`Updated view link ${id}`);
+
+        if (wsManager) {
+            wsManager.broadcastToWorkspace(workspaceId, 'viewlink:updated', {
+                link: {
+                    id: link.id,
+                    sourceViewId: link.source_view_id,
+                    targetViewId: link.target_view_id,
+                    property: link.property,
+                    mode: link.mode,
+                    active: link.active,
+                },
+            });
+        }
+
+        res.json({
+            link: {
+                id: link.id,
+                sourceViewId: link.source_view_id,
+                targetViewId: link.target_view_id,
+                property: link.property,
+                mode: link.mode,
+                active: link.active,
+            },
+        });
+    } catch (error) {
+        log.error('Failed to update view link:', error);
+        next(error);
+    }
+});
+
 // ============================================================================
 // VIEWGROUP LINK ENDPOINTS
 // ============================================================================
@@ -835,13 +999,10 @@ router.delete('/links/view/:id', async (req, res, next) => {
  * POST /api/links/viewgroup
  * Create a ViewGroup-to-ViewGroup link (implements Originator Principle)
  */
-router.post('/links/viewgroup', async (req, res, next) => {
+linksRouter.post('/viewgroup', async (req, res, next) => {
     const { pool, wsManager } = req.app.locals;
-    const client = await pool.connect();
 
     try {
-        await client.query('BEGIN');
-
         const user = getUser(req);
         const {
             originatorGroupId,
@@ -854,69 +1015,99 @@ router.post('/links/viewgroup', async (req, res, next) => {
             return res.status(400).json({ error: 'originatorGroupId and targetGroupId are required' });
         }
 
-        const id = uuidv4();
-
-        // Create VG link
-        const result = await client.query(
-            `INSERT INTO view_group_links (
-                id, originator_group_id, target_group_id, mode, properties, active,
-                created_at, created_by
-            ) VALUES ($1, $2, $3, $4, $5, true, NOW(), $6)
-            RETURNING *`,
-            [id, originatorGroupId, targetGroupId, mode, JSON.stringify(properties), user.id]
+        // originatorGroupId/targetGroupId are independently client-supplied
+        // with no same-workspace constraint — resolve and authorize BOTH
+        // workspaces touched, on `pool` (no transaction yet), before any
+        // mutation begins.
+        const wsResult = await pool.query(
+            'SELECT id, workspace_id FROM viewgroups WHERE id = ANY($1)',
+            [[originatorGroupId, targetGroupId]]
         );
-
-        const vgLink = result.rows[0];
-
-        // ORIGINATOR PRINCIPLE: Pause originator's incoming follow links
-        await client.query(
-            `UPDATE view_links SET paused_by_vg_link = $1
-             WHERE target_view_id IN (
-                 SELECT id FROM view_configurations WHERE view_group_id = $2
-             )
-             AND mode = 'follow'
-             AND paused_by_vg_link IS NULL`,
-            [id, originatorGroupId]
-        );
-
-        // Create individual view links for all matching views
-        // (Links from originator views to target views for specified properties)
-        const originatorViews = await client.query(
-            'SELECT id FROM view_configurations WHERE view_group_id = $1',
-            [originatorGroupId]
-        );
-        const targetViews = await client.query(
-            'SELECT id FROM view_configurations WHERE view_group_id = $1',
-            [targetGroupId]
-        );
-
-        for (const sourceView of originatorViews.rows) {
-            for (const targetView of targetViews.rows) {
-                for (const property of properties) {
-                    await client.query(
-                        `INSERT INTO view_links (
-                            id, source_view_id, target_view_id, property, mode, active,
-                            follower_last_synced_at, created_at, created_by
-                        ) VALUES ($1, $2, $3, $4, $5, true, NOW(), NOW(), $6)
-                        ON CONFLICT (source_view_id, target_view_id, property) DO NOTHING`,
-                        [uuidv4(), sourceView.id, targetView.id, property, mode, user.id]
-                    );
-                }
-            }
+        const workspaceByGroupId = Object.fromEntries(wsResult.rows.map(r => [r.id, r.workspace_id]));
+        if (!workspaceByGroupId[originatorGroupId] || !workspaceByGroupId[targetGroupId]) {
+            return res.status(404).json({ error: 'ViewGroup not found' });
+        }
+        const touchedWorkspaceIds = [...new Set([
+            workspaceByGroupId[originatorGroupId],
+            workspaceByGroupId[targetGroupId],
+        ])];
+        for (const workspaceId of touchedWorkspaceIds) {
+            if (await authorizeWorkspace(pool, workspaceId, user.id, PERMISSIONS.WORKSPACE_UPDATE, res)) return;
         }
 
-        await client.query('COMMIT');
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
 
-        log.info(`Created VG link: ${originatorGroupId} -> ${targetGroupId} (${mode})`);
+            const id = uuidv4();
 
-        // Get workspace for broadcast
-        const vgResult = await client.query(
-            'SELECT workspace_id FROM viewgroups WHERE id = $1',
-            [originatorGroupId]
-        );
+            // Create VG link
+            const result = await client.query(
+                `INSERT INTO view_group_links (
+                    id, originator_group_id, target_group_id, mode, properties, active,
+                    created_at, created_by
+                ) VALUES ($1, $2, $3, $4, $5, true, NOW(), $6)
+                RETURNING *`,
+                [id, originatorGroupId, targetGroupId, mode, JSON.stringify(properties), user.id]
+            );
 
-        if (wsManager && vgResult.rows[0]?.workspace_id) {
-            wsManager.broadcastToWorkspace(vgResult.rows[0].workspace_id, 'vglink:created', {
+            const vgLink = result.rows[0];
+
+            // ORIGINATOR PRINCIPLE: Pause originator's incoming follow links
+            await client.query(
+                `UPDATE view_links SET paused_by_vg_link = $1
+                 WHERE target_view_id IN (
+                     SELECT id FROM view_configurations WHERE view_group_id = $2
+                 )
+                 AND mode = 'follow'
+                 AND paused_by_vg_link IS NULL`,
+                [id, originatorGroupId]
+            );
+
+            // Create individual view links for all matching views
+            // (Links from originator views to target views for specified properties)
+            const originatorViews = await client.query(
+                'SELECT id FROM view_configurations WHERE view_group_id = $1',
+                [originatorGroupId]
+            );
+            const targetViews = await client.query(
+                'SELECT id FROM view_configurations WHERE view_group_id = $1',
+                [targetGroupId]
+            );
+
+            for (const sourceView of originatorViews.rows) {
+                for (const targetView of targetViews.rows) {
+                    for (const property of properties) {
+                        await client.query(
+                            `INSERT INTO view_links (
+                                id, source_view_id, target_view_id, property, mode, active,
+                                follower_last_synced_at, created_at, created_by
+                            ) VALUES ($1, $2, $3, $4, $5, true, NOW(), NOW(), $6)
+                            ON CONFLICT (source_view_id, target_view_id, property) DO NOTHING`,
+                            [uuidv4(), sourceView.id, targetView.id, property, mode, user.id]
+                        );
+                    }
+                }
+            }
+
+            await client.query('COMMIT');
+
+            log.info(`Created VG link: ${originatorGroupId} -> ${targetGroupId} (${mode})`);
+
+            if (wsManager) {
+                wsManager.broadcastToWorkspace(workspaceByGroupId[originatorGroupId], 'vglink:created', {
+                    link: {
+                        id: vgLink.id,
+                        originatorGroupId: vgLink.originator_group_id,
+                        targetGroupId: vgLink.target_group_id,
+                        mode: vgLink.mode,
+                        properties: vgLink.properties,
+                        active: vgLink.active,
+                    },
+                });
+            }
+
+            res.status(201).json({
                 link: {
                     id: vgLink.id,
                     originatorGroupId: vgLink.originator_group_id,
@@ -926,24 +1117,16 @@ router.post('/links/viewgroup', async (req, res, next) => {
                     active: vgLink.active,
                 },
             });
+        } catch (error) {
+            await client.query('ROLLBACK');
+            log.error('Failed to create VG link:', error);
+            next(error);
+        } finally {
+            client.release();
         }
-
-        res.status(201).json({
-            link: {
-                id: vgLink.id,
-                originatorGroupId: vgLink.originator_group_id,
-                targetGroupId: vgLink.target_group_id,
-                mode: vgLink.mode,
-                properties: vgLink.properties,
-                active: vgLink.active,
-            },
-        });
     } catch (error) {
-        await client.query('ROLLBACK');
-        log.error('Failed to create VG link:', error);
+        log.error('Failed to authorize VG link creation:', error);
         next(error);
-    } finally {
-        client.release();
     }
 });
 
@@ -951,73 +1134,93 @@ router.post('/links/viewgroup', async (req, res, next) => {
  * DELETE /api/links/viewgroup/:id
  * Delete a ViewGroup-to-ViewGroup link (restores paused links)
  */
-router.delete('/links/viewgroup/:id', async (req, res, next) => {
+linksRouter.delete('/viewgroup/:id', async (req, res, next) => {
     const { pool, wsManager } = req.app.locals;
-    const client = await pool.connect();
 
     try {
-        await client.query('BEGIN');
-
+        const user = getUser(req);
         const { id } = req.params;
 
-        // Get link details before deleting
-        const linkResult = await client.query('SELECT * FROM view_group_links WHERE id = $1', [id]);
-
+        // Get link details before deleting (plain pool read — no mutation yet)
+        const linkResult = await pool.query('SELECT * FROM view_group_links WHERE id = $1', [id]);
         if (linkResult.rows.length === 0) {
             return res.status(404).json({ error: 'ViewGroup link not found' });
         }
-
         const link = linkResult.rows[0];
 
-        // Restore paused links (clear paused_by_vg_link)
-        await client.query(
-            'UPDATE view_links SET paused_by_vg_link = NULL WHERE paused_by_vg_link = $1',
-            [id]
+        const wsResult = await pool.query(
+            'SELECT id, workspace_id FROM viewgroups WHERE id = ANY($1)',
+            [[link.originator_group_id, link.target_group_id]]
         );
-
-        // Delete the VG link
-        await client.query('DELETE FROM view_group_links WHERE id = $1', [id]);
-
-        await client.query('COMMIT');
-
-        log.info(`Deleted VG link ${id}`);
-
-        // Get workspace for broadcast
-        const vgResult = await client.query(
-            'SELECT workspace_id FROM viewgroups WHERE id = $1',
-            [link.originator_group_id]
-        );
-
-        if (wsManager && vgResult.rows[0]?.workspace_id) {
-            wsManager.broadcastToWorkspace(vgResult.rows[0].workspace_id, 'vglink:deleted', {
-                linkId: id,
-                originatorGroupId: link.originator_group_id,
-                targetGroupId: link.target_group_id,
-            });
+        const touchedWorkspaceIds = [...new Set(wsResult.rows.map(r => r.workspace_id).filter(Boolean))];
+        for (const workspaceId of touchedWorkspaceIds) {
+            if (await authorizeWorkspace(pool, workspaceId, user?.id, PERMISSIONS.WORKSPACE_DELETE, res)) return;
         }
 
-        res.status(204).send();
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+
+            // Restore paused links (clear paused_by_vg_link)
+            await client.query(
+                'UPDATE view_links SET paused_by_vg_link = NULL WHERE paused_by_vg_link = $1',
+                [id]
+            );
+
+            // Delete the VG link
+            await client.query('DELETE FROM view_group_links WHERE id = $1', [id]);
+
+            await client.query('COMMIT');
+
+            log.info(`Deleted VG link ${id}`);
+
+            const originatorWorkspaceId = wsResult.rows.find(r => r.id === link.originator_group_id)?.workspace_id;
+            if (wsManager && originatorWorkspaceId) {
+                wsManager.broadcastToWorkspace(originatorWorkspaceId, 'vglink:deleted', {
+                    linkId: id,
+                    originatorGroupId: link.originator_group_id,
+                    targetGroupId: link.target_group_id,
+                });
+            }
+
+            res.status(204).send();
+        } catch (error) {
+            await client.query('ROLLBACK');
+            log.error('Failed to delete VG link:', error);
+            next(error);
+        } finally {
+            client.release();
+        }
     } catch (error) {
-        await client.query('ROLLBACK');
-        log.error('Failed to delete VG link:', error);
+        log.error('Failed to authorize VG link deletion:', error);
         next(error);
-    } finally {
-        client.release();
     }
 });
 
 // ============================================================================
-// RECONCILIATION ENDPOINTS
+// RECONCILIATION ENDPOINTS — mounted at /api/views alongside viewsRouter and
+// thumbnailsRouter (see index.js); exposed as viewgroupsRouter.reconciliationRouter,
+// see module.exports at the bottom of this file. Relative paths below
+// ('/:viewId/reconciliation-status', ...) resolve to /api/views/:viewId/...
+// instead of double-prefixing to /api/views/views/:viewId/....
 // ============================================================================
+const reconciliationRouter = express.Router();
 
 /**
  * GET /api/views/:viewId/reconciliation-status
  * Check if a view needs reconciliation (has diverged from leader)
  */
-router.get('/views/:viewId/reconciliation-status', async (req, res, next) => {
+reconciliationRouter.get('/:viewId/reconciliation-status', async (req, res, next) => {
     try {
+        const user = getUser(req);
         const { viewId } = req.params;
         const { pool } = req.app.locals;
+
+        const workspaceId = await resolveViewWorkspaceId(pool, viewId);
+        if (!workspaceId) {
+            return res.status(404).json({ error: 'View not found' });
+        }
+        if (await authorizeWorkspace(pool, workspaceId, user?.id, PERMISSIONS.WORKSPACE_READ, res)) return;
 
         // Find all follow links where this view is the follower (source)
         const linksResult = await pool.query(
@@ -1054,10 +1257,11 @@ router.get('/views/:viewId/reconciliation-status', async (req, res, next) => {
  * POST /api/views/:viewId/reconcile
  * Reconcile a diverged follower view
  */
-router.post('/views/:viewId/reconcile', async (req, res, next) => {
+reconciliationRouter.post('/:viewId/reconcile', async (req, res, next) => {
     const { pool, wsManager } = req.app.locals;
 
     try {
+        const user = getUser(req);
         const { viewId } = req.params;
         const { linkId, action } = req.body; // action: 'sync_to_leader' | 'keep_mine'
 
@@ -1065,18 +1269,38 @@ router.post('/views/:viewId/reconcile', async (req, res, next) => {
             return res.status(400).json({ error: 'linkId and action are required' });
         }
 
+        const workspaceId = await resolveViewWorkspaceId(pool, viewId);
+        if (!workspaceId) {
+            return res.status(404).json({ error: 'View not found' });
+        }
+        if (await authorizeWorkspace(pool, workspaceId, user?.id, PERMISSIONS.WORKSPACE_UPDATE, res)) return;
+
+        // Scope both mutations to source_view_id = viewId too, not just
+        // id = linkId — otherwise a caller with legitimate access to viewId
+        // could pass a linkId belonging to a DIFFERENT view/workspace and
+        // still mutate/delete it, bypassing the workspace check above.
+        let rowCount;
         if (action === 'sync_to_leader') {
             // Clear diverged state - sync will happen on next property update
-            await pool.query(
+            const result = await pool.query(
                 `UPDATE view_links
                  SET follower_diverged_at = NULL,
                      follower_last_synced_at = NOW()
-                 WHERE id = $1`,
-                [linkId]
+                 WHERE id = $1 AND source_view_id = $2`,
+                [linkId, viewId]
             );
+            rowCount = result.rowCount;
         } else if (action === 'keep_mine') {
             // Break the link (delete it)
-            await pool.query('DELETE FROM view_links WHERE id = $1', [linkId]);
+            const result = await pool.query(
+                'DELETE FROM view_links WHERE id = $1 AND source_view_id = $2',
+                [linkId, viewId]
+            );
+            rowCount = result.rowCount;
+        }
+
+        if (rowCount === 0) {
+            return res.status(404).json({ error: 'Reconciliation link not found for this view' });
         }
 
         log.info(`Reconciled view ${viewId}, link ${linkId}, action=${action}`);
@@ -1092,16 +1316,23 @@ router.post('/views/:viewId/reconcile', async (req, res, next) => {
  * POST /api/views/:viewId/mark-diverged
  * Mark a follower view as diverged from its leader
  */
-router.post('/views/:viewId/mark-diverged', async (req, res, next) => {
+reconciliationRouter.post('/:viewId/mark-diverged', async (req, res, next) => {
     const { pool } = req.app.locals;
 
     try {
+        const user = getUser(req);
         const { viewId } = req.params;
         const { property } = req.body;
 
         if (!property) {
             return res.status(400).json({ error: 'property is required' });
         }
+
+        const workspaceId = await resolveViewWorkspaceId(pool, viewId);
+        if (!workspaceId) {
+            return res.status(404).json({ error: 'View not found' });
+        }
+        if (await authorizeWorkspace(pool, workspaceId, user?.id, PERMISSIONS.WORKSPACE_UPDATE, res)) return;
 
         // Find the follow link for this property and mark as diverged
         await pool.query(
@@ -1128,13 +1359,19 @@ router.post('/views/:viewId/mark-diverged', async (req, res, next) => {
  * POST /api/views/:viewId/activity
  * Record view activity for reconciliation tracking
  */
-router.post('/views/:viewId/activity', async (req, res, next) => {
+reconciliationRouter.post('/:viewId/activity', async (req, res, next) => {
     const { pool } = req.app.locals;
 
     try {
         const user = getUser(req);
         const { viewId } = req.params;
         const { active } = req.body;
+
+        const workspaceId = await resolveViewWorkspaceId(pool, viewId);
+        if (!workspaceId) {
+            return res.status(404).json({ error: 'View not found' });
+        }
+        if (await authorizeWorkspace(pool, workspaceId, user?.id, PERMISSIONS.WORKSPACE_READ, res)) return;
 
         if (active) {
             // Start activity session
@@ -1164,10 +1401,17 @@ router.post('/views/:viewId/activity', async (req, res, next) => {
  * GET /api/views/:viewId/is-active
  * Check if any user is currently active on a view
  */
-router.get('/views/:viewId/is-active', async (req, res, next) => {
+reconciliationRouter.get('/:viewId/is-active', async (req, res, next) => {
     try {
+        const user = getUser(req);
         const { viewId } = req.params;
         const { pool } = req.app.locals;
+
+        const workspaceId = await resolveViewWorkspaceId(pool, viewId);
+        if (!workspaceId) {
+            return res.status(404).json({ error: 'View not found' });
+        }
+        if (await authorizeWorkspace(pool, workspaceId, user?.id, PERMISSIONS.WORKSPACE_READ, res)) return;
 
         const result = await pool.query(
             `SELECT COUNT(*) as active_count
@@ -1185,4 +1429,11 @@ router.get('/views/:viewId/is-active', async (req, res, next) => {
     }
 });
 
+// Attach the link/reconciliation routers as properties on the default CRUD
+// router (rather than exporting an object) so every existing
+// `require('../routes/viewgroups')` call site keeps working unchanged —
+// index.js, server/src/__tests__/viewgroupsWorkspaceMount.test.js, and
+// server/src/__tests__/helpers/testApp.js all use it as a router directly.
+router.viewLinksRouter = linksRouter;
+router.reconciliationRouter = reconciliationRouter;
 module.exports = router;

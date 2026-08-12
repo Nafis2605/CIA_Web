@@ -17,9 +17,29 @@
 // which picker API we call and how we read it back, with no GL context.
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import vtkCellPicker from "@kitware/vtk.js/Rendering/Core/CellPicker";
+import vtkPolyData from "@kitware/vtk.js/Common/DataModel/PolyData";
+import vtkPoints from "@kitware/vtk.js/Common/Core/Points";
+import vtkActor from "@kitware/vtk.js/Rendering/Core/Actor";
+import vtkMapper from "@kitware/vtk.js/Rendering/Core/Mapper";
 import { vtkGlyphFeature } from "@VTK/features/VTKGlyphFeature";
 import { vtkThresholdFeature } from "@VTK/features/VTKThresholdFeature";
 import { VTKInstanceHandler } from "../VTKInstanceHandler.js";
+
+// Real vtk.js actor/mapper/polydata, matching VTKInstanceHandler.probeVR.test.js's
+// pattern — needed for the actor-transform regression tests below, since a mock
+// getMatrix() would hide exactly the forward-vs-inverse transform mistakes this
+// class of bug is made of.
+function makeRealActorWithPoints(points) {
+  const pts = vtkPoints.newInstance();
+  pts.setData(new Float64Array(points), 3);
+  const polyData = vtkPolyData.newInstance();
+  polyData.setPoints(pts);
+  const mapper = vtkMapper.newInstance();
+  mapper.setInputData(polyData);
+  const actor = vtkActor.newInstance();
+  actor.setMapper(mapper);
+  return actor;
+}
 
 vi.mock("@kitware/vtk.js/Rendering/Core/CellPicker", () => {
   const newInstance = vi.fn(() => ({
@@ -374,10 +394,66 @@ describe("VTKInstanceHandler.raycastVR", () => {
       expect(result.actorRole).toBe("source");
     });
 
-    it("returns pointId -1 when the actor's polydata can't be resolved", () => {
+    it("snaps position to the resolved vertex's own coordinates, preserving the raw hit as surfacePosition", () => {
+      // Regression test for the bug where `position` stayed the raw,
+      // un-snapped cell-picker intersection even though `pointId` names a
+      // specific vertex — the two silently disagreed. Mocked pick position
+      // is [1,2,3] (CellPicker mock default); candidate id 1 at (1,2,2) is
+      // nearest (dist2=1) but is NOT the pick position itself, so a
+      // regression back to the raw surface point is distinguishable.
+      const ctx = makeVrContext();
+      handler.raycastVR(ctx, RAY); // prime the cached picker
+
+      const fakePolyData = {
+        getCellPoints: () => ({ cellType: 5, cellPointIds: [0, 1, 2] }),
+        getPoints: () => ({
+          getData: () => new Float32Array([0, 0, 0, 1, 2, 2, 10, 10, 10]),
+        }),
+      };
+      const hitActor = ctx.sceneObjects.actor; // no getMatrix -> identity transform
+      hitActor.getMapper = () => ({ getInputData: () => fakePolyData });
+      ctx._vrPicker.getActors.mockReturnValue([hitActor]);
+
+      const result = handler.raycastVR(ctx, RAY);
+      expect(result.pointId).toBe(1);
+      expect(result.position).toEqual({ x: 1, y: 2, z: 2 });
+      expect(result.surfacePosition).toEqual({ x: 1, y: 2, z: 3 });
+    });
+
+    it("compares the WORLD-space pick position against candidates in a single consistent space (accounts for actor Position)", () => {
+      // Regression test: the pre-fix code compared `position` (WORLD-space,
+      // from vtkCellPicker.getPickPosition()) directly against the
+      // polydata's raw LOCAL-space point coordinates. Here the actor is
+      // translated +5 on X/Y/Z, so comparing un-transformed would pick the
+      // WRONG candidate (id 2, (10,10,10), dist2=66) instead of the true
+      // nearest (id 1, (1,0,0) + translation = (6,5,5), dist2=0).
+      const ctx = makeVrContext();
+      handler.raycastVR(ctx, RAY); // prime the cached picker
+
+      const fakePolyData = {
+        getCellPoints: () => ({ cellType: 5, cellPointIds: [0, 1, 2] }),
+        getPoints: () => ({
+          getData: () => new Float32Array([0, 0, 0, 1, 0, 0, 10, 10, 10]),
+        }),
+      };
+      const actor = vtkActor.newInstance();
+      actor.setPosition(5, 5, 5);
+      actor.setMapper({ getInputData: () => fakePolyData });
+      ctx._vrPicker.getActors.mockReturnValue([actor]);
+      ctx._vrPicker.getPickPosition.mockReturnValue([6, 5, 5]);
+
+      const result = handler.raycastVR(ctx, RAY);
+      expect(result.pointId).toBe(1);
+      // Forward transform of the resolved vertex (1,0,0) through the same
+      // +5/+5/+5 actor translation used above.
+      expect(result.position).toEqual({ x: 6, y: 5, z: 5 });
+    });
+
+    it("returns pointId -1 when the actor's polydata can't be resolved, and position falls back to the raw surface hit", () => {
       const ctx = makeVrContext();
       const result = handler.raycastVR(ctx, RAY);
       expect(result.pointId).toBe(-1);
+      expect(result.position).toEqual(result.surfacePosition);
     });
 
     it("returns pointId -1 (not a throw) when getCellPoints itself throws", () => {
@@ -421,6 +497,9 @@ describe("VTKInstanceHandler.raycastVR", () => {
       expect(result.hit).toBe(true);
       expect(result.pointId).toBe(-1);
       expect(result.cellId).toBe(42);
+      // No vertex was resolved (pointId -1), so position must NOT be
+      // snapped — it stays the raw surface intersection, same as surfacePosition.
+      expect(result.position).toEqual(result.surfacePosition);
     });
 
     it("'exactPoint' mode bypasses the cell picker entirely and uses vtkPointPicker", () => {
@@ -446,10 +525,21 @@ describe("VTKInstanceHandler.raycastVR", () => {
     it("'exactPoint' mode returns a hit shaped like the cell-picker path, with cellId -1", () => {
       const ctx = makeVrContext();
       const hitActor = ctx.sceneObjects.actor;
+      // vtkPointPicker's real getPickPosition() is never populated by
+      // pick3DPoint() (see _raycastExactPoint's comment) — production code
+      // resolves position from pointId + the actor's own polydata instead,
+      // so the mock must supply that, not a canned getPickPosition() value.
+      hitActor.getMapper = () => ({
+        getInputData: () => ({
+          getPoints: () => ({
+            getNumberOfPoints: () => 6,
+            getData: () => new Float32Array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3]),
+          }),
+        }),
+      });
       handler.raycastVR(ctx, RAY, { selectionMode: "exactPoint" }); // prime cache
       ctx._vrPointPicker.getActors.mockReturnValue([hitActor]);
-      ctx._vrPointPicker.getPointId.mockReturnValue(5);
-      ctx._vrPointPicker.getPickPosition.mockReturnValue([1, 2, 3]);
+      ctx._vrPointPicker.getPointId.mockReturnValue(5); // -> coords[15..17] = [1,2,3]
 
       const result = handler.raycastVR(ctx, RAY, { selectionMode: "exactPoint" });
       expect(result).toMatchObject({
@@ -463,9 +553,19 @@ describe("VTKInstanceHandler.raycastVR", () => {
 
     it("automatically falls back to exactPoint when the cell picker misses against a cell-less (point-cloud) target", () => {
       const ctx = makeVrContext();
-      const pointCloudPolyData = { getNumberOfCells: () => 0 };
       const hitActor = ctx.sceneObjects.actor;
-      hitActor.getMapper = () => ({ getInputData: () => pointCloudPolyData });
+      // Zero cells (so raycastVR's zero-cell fallback triggers) but real
+      // points, so _raycastExactPoint's polydata-based position resolution
+      // has something to resolve pointId 3 -> [4,5,6] against.
+      hitActor.getMapper = () => ({
+        getInputData: () => ({
+          getNumberOfCells: () => 0,
+          getPoints: () => ({
+            getNumberOfPoints: () => 4,
+            getData: () => new Float32Array([0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 5, 6]),
+          }),
+        }),
+      });
 
       handler.raycastVR(ctx, RAY); // creates _vrPicker (default mock: cellId=42, a hit)
       ctx._vrPicker.getCellId.mockReturnValue(-1); // now force a miss
@@ -474,11 +574,52 @@ describe("VTKInstanceHandler.raycastVR", () => {
       // which lazily creates _vrPointPicker for the first time.
       handler.raycastVR(ctx, RAY);
       ctx._vrPointPicker.getActors.mockReturnValue([hitActor]);
-      ctx._vrPointPicker.getPointId.mockReturnValue(3);
-      ctx._vrPointPicker.getPickPosition.mockReturnValue([4, 5, 6]);
+      ctx._vrPointPicker.getPointId.mockReturnValue(3); // -> coords[9..11] = [4,5,6]
 
       const result = handler.raycastVR(ctx, RAY); // default 'nearestVertex' mode
-      expect(result).toMatchObject({ hit: true, pointId: 3, cellId: -1 });
+      expect(result).toMatchObject({
+        hit: true,
+        position: { x: 4, y: 5, z: 6 },
+        pointId: 3,
+        cellId: -1,
+      });
+    });
+
+    it("resolves the exact-point position in WORLD space via the actor's matrix, not raw local coordinates", () => {
+      // Regression test for the bug where _raycastExactPoint read
+      // picker.getPickPosition() — which vtkPointPicker never populates on a
+      // pick3DPoint() hit — instead of resolving the picked point itself.
+      // A local point at the origin on an actor translated +10 on X must
+      // come back as WORLD (10, 0, 0), not local (0, 0, 0) and not the
+      // picker's stale [0, 0, 0] default.
+      const ctx = makeVrContext();
+      const actor = makeRealActorWithPoints([0, 0, 0]);
+      actor.setPosition(10, 0, 0);
+
+      handler.raycastVR(ctx, RAY, { selectionMode: "exactPoint" }); // prime cache
+      ctx._vrPointPicker.getActors.mockReturnValue([actor]);
+      ctx._vrPointPicker.getPointId.mockReturnValue(0);
+
+      const result = handler.raycastVR(ctx, RAY, { selectionMode: "exactPoint" });
+      expect(result).not.toBeNull();
+      expect(result.position.x).toBeCloseTo(10);
+      expect(result.position.y).toBeCloseTo(0);
+      expect(result.position.z).toBeCloseTo(0);
+    });
+
+    it("returns null for 'exactPoint' when the resolved pointId can't be mapped to a real point", () => {
+      const ctx = makeVrContext();
+      const hitActor = ctx.sceneObjects.actor;
+      hitActor.getMapper = () => ({
+        getInputData: () => ({
+          getPoints: () => ({ getNumberOfPoints: () => 2, getData: () => new Float32Array([0, 0, 0, 1, 1, 1]) }),
+        }),
+      });
+      handler.raycastVR(ctx, RAY, { selectionMode: "exactPoint" }); // prime cache
+      ctx._vrPointPicker.getActors.mockReturnValue([hitActor]);
+      ctx._vrPointPicker.getPointId.mockReturnValue(7); // out of range (only 2 points)
+
+      expect(handler.raycastVR(ctx, RAY, { selectionMode: "exactPoint" })).toBeNull();
     });
 
     it("does NOT fall back to exactPoint in 'surface' mode", () => {

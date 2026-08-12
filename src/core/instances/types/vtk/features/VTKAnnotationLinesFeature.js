@@ -37,6 +37,7 @@ import { FeatureInterface } from "@Core/instances/features/FeatureInterface.js";
 import { render as log } from "@Utils/logger.js";
 import { apiClient } from "@Services/apiClient.js";
 import { getAnnotationManager } from "@Init/appInitializer.js";
+import { isBuiltInDatasetId, resolveBuiltInDatasetId } from "@Services/builtInDatasets.js";
 import { hexToRgb, rgbToHex } from "@Utils/colorHelpers.js";
 import { VRTextBillboard } from "@Core/vr/ui/VRTextBillboard.js";
 
@@ -105,16 +106,36 @@ export function parseMeasurementAnnotation(annotation) {
  * type 'point', position [x,y,z] in data space, text, metadata.color).
  *
  * @param {object} annotation - Annotation model instance or server row
- * @returns {{ id: string, position: number[], text: string, color: number[]|null, authorName: string|null } | null}
+ * @returns {{ id: string, position: number[], localPosition: number[]|null,
+ *   pointId: number|null, cellId: number|null, pickActorRole: string|null,
+ *   text: string, color: number[]|null, authorName: string|null } | null}
  */
 export function parsePointAnnotation(annotation) {
   try {
     if (!annotation || annotation.type !== "point") return null;
     if (!isFinitePoint(annotation.position)) return null;
 
+    const localPosition = isFinitePoint(annotation.metadata?.localPosition)
+      ? [
+          annotation.metadata.localPosition[0],
+          annotation.metadata.localPosition[1],
+          annotation.metadata.localPosition[2],
+        ]
+      : null;
+
     return {
       id: annotation.id,
       position: [annotation.position[0], annotation.position[1], annotation.position[2]],
+      // Actor-relative point, for re-anchoring on a data-actor transform
+      // change — see VTKInstanceHandler._applyVRDataRotation and
+      // syncActorTransforms below. null (absent on legacy annotations, or a
+      // glyph/derived-actor pick) means the marker stays pinned in world
+      // space, exactly as before this existed.
+      localPosition,
+      pointId: typeof annotation.metadata?.pointId === "number" ? annotation.metadata.pointId : null,
+      cellId: typeof annotation.metadata?.cellId === "number" ? annotation.metadata.cellId : null,
+      pickActorRole:
+        typeof annotation.metadata?.pickActorRole === "string" ? annotation.metadata.pickActorRole : null,
       text: typeof annotation.text === "string" ? annotation.text : "",
       color: normalizeColor(annotation.metadata?.color),
       // Display name only (see VRExplorationManager._persistVRAnnotation) —
@@ -151,6 +172,26 @@ function isFinitePoint(p) {
     p.length >= 3 &&
     p.slice(0, 3).every((v) => typeof v === "number" && Number.isFinite(v))
   );
+}
+
+/**
+ * vtk.js's Prop3D.computeMatrix() transposes its result, so actor.getMatrix()
+ * comes back transposed relative to what actor.setUserMatrix() expects as
+ * input (confirmed empirically: setUserMatrix(M) -> getMatrix() -> feeding
+ * that STRAIGHT into a second actor's setUserMatrix() produces a visibly
+ * different — wrong — transform, not the same one mirrored). Same transpose
+ * VTKInstanceHandler._transformPointByActorMatrix already applies before
+ * handing a matrix to vtkMatrixBuilder, needed here for the same reason:
+ * copying one actor's rendered transform onto another via
+ * setUserMatrix(getMatrix()) requires undoing that transpose first.
+ */
+function transposeMatrix4x4(m) {
+  return [
+    m[0], m[4], m[8], m[12],
+    m[1], m[5], m[9], m[13],
+    m[2], m[6], m[10], m[14],
+    m[3], m[7], m[11], m[15],
+  ];
 }
 
 function _distanceBetween(a, b) {
@@ -190,7 +231,7 @@ export class VTKAnnotationLinesFeature extends FeatureInterface {
    * state, and subscribe to live AnnotationManager events.
    */
   async initialize(instanceId, instanceData) {
-    const { sceneObjects, datasetId } = instanceData;
+    const { sceneObjects, datasetId: rawDatasetId } = instanceData;
 
     if (!sceneObjects?.renderer) {
       log.warn(`Cannot initialize annotation lines: no renderer for ${instanceId}`);
@@ -202,6 +243,16 @@ export class VTKAnnotationLinesFeature extends FeatureInterface {
     // first so actors/subscriptions from an earlier initialize() don't leak.
     if (this.instanceStates.has(instanceId)) {
       await this.cleanup(instanceId);
+    }
+
+    // Built-in datasets carry a local manifest key here (e.g. "builtin-
+    // lungs"), but AnnotationManager's create/broadcast events and the
+    // /annotations REST endpoint key on the resolved server UUID. Resolve
+    // before subscribing so no live event window is missed. Fall back to
+    // the raw key on a failed resolve rather than nulling the scope out.
+    let datasetId = rawDatasetId || null;
+    if (datasetId && isBuiltInDatasetId(datasetId)) {
+      datasetId = (await resolveBuiltInDatasetId(datasetId)) || datasetId;
     }
 
     const state = {
@@ -234,13 +285,42 @@ export class VTKAnnotationLinesFeature extends FeatureInterface {
     const state = this.instanceStates.get(instanceId);
     if (!state) return;
 
-    if (state.datasetId === datasetId) return;
+    let resolvedId = datasetId || null;
+    if (resolvedId && isBuiltInDatasetId(resolvedId)) {
+      resolvedId = (await resolveBuiltInDatasetId(resolvedId)) || resolvedId;
+    }
+
+    if (state.datasetId === resolvedId) return;
 
     this._clearAllLines(state);
-    state.datasetId = datasetId || null;
+    state.datasetId = resolvedId;
 
     if (state.datasetId) {
       await this._loadExistingMeasurements(instanceId, state);
+    }
+  }
+
+  /**
+   * Re-anchor every locally-anchored point marker (see _addOrUpdatePoint's
+   * `anchored` flag) to the data actor's CURRENT transform. Called by
+   * VTKInstanceHandler whenever that actor's matrix actually changes (VR
+   * two-hand twist, or its restore on VR exit) — never per-frame
+   * unconditionally, matching the caller's own dirty-check. No-ops safely if
+   * the instance or its data actor can't be found. Markers with no
+   * localPosition (glyph/derived-actor picks, legacy annotations) are left
+   * untouched — they were never anchored in the first place.
+   */
+  syncActorTransforms(instanceId) {
+    const state = this.instanceStates.get(instanceId);
+    if (!state) return;
+    const dataActor = state.sceneObjects?.actor;
+    if (typeof dataActor?.getMatrix !== "function") return;
+
+    const matrix = transposeMatrix4x4(dataActor.getMatrix());
+    for (const entry of state.points.values()) {
+      if (entry.anchored && typeof entry.actor?.setUserMatrix === "function") {
+        entry.actor.setUserMatrix(matrix);
+      }
     }
   }
 
@@ -469,8 +549,18 @@ export class VTKAnnotationLinesFeature extends FeatureInterface {
     try {
       const radius = this._computePointRadius(state);
 
+      // Anchored markers (a resolvable local point) are built in the data
+      // actor's LOCAL space and get its UserMatrix applied directly, so
+      // vtk.js's own rendering pipeline keeps them glued to the mesh as it's
+      // rotated/translated/scaled later — see syncActorTransforms. A marker
+      // with no local point (glyph/derived-actor pick, or a legacy
+      // annotation) keeps today's behavior exactly: baked at world position,
+      // never re-anchored.
+      const anchored = !!parsed.localPosition;
+      const center = anchored ? parsed.localPosition : parsed.position;
+
       const sphereSource = vtkSphereSource.newInstance({
-        center: parsed.position,
+        center,
         radius,
         thetaResolution: 16,
         phiResolution: 16,
@@ -487,9 +577,16 @@ export class VTKAnnotationLinesFeature extends FeatureInterface {
       // persisted marker must not be a live raycast target either.
       actor.setPickable(false);
 
+      if (anchored) {
+        const dataActor = state.sceneObjects.actor;
+        if (typeof dataActor?.getMatrix === "function" && typeof actor.setUserMatrix === "function") {
+          actor.setUserMatrix(transposeMatrix4x4(dataActor.getMatrix()));
+        }
+      }
+
       renderer.addActor(actor);
 
-      const entry = { actor, mapper, sphereSource, labelBillboard: null };
+      const entry = { actor, mapper, sphereSource, labelBillboard: null, anchored };
 
       // Optional floating text label just above the marker (skips the default
       // 'VR marker' placeholder text to avoid cluttering the scene).

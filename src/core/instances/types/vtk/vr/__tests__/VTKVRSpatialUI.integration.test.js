@@ -944,3 +944,86 @@ describe("VRSpatialUI status/hint label repaint gate", () => {
     expect(ui._statusCtx.fillText).toHaveBeenCalledTimes(2);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Active-hand arbitration (right-hand hardcoding fix): _pickRay/hitTest used
+// to always prefer the right controller whenever it existed at all, so a
+// LEFT-hand-only aim/trigger was never read for menu hit-testing. They now
+// prefer inputState.activePointerHand (set by
+// VRExplorationManager._resolveActivePointerHand) when that hand has a
+// tracked controller this frame.
+// ---------------------------------------------------------------------------
+
+describe("VRSpatialUI hitTest — active-hand arbitration", () => {
+  let getContextSpy;
+
+  beforeEach(() => {
+    getContextSpy = vi
+      .spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockImplementation(() => createFakeCtx());
+    vi.stubGlobal(
+      "Path2D",
+      class FakePath2D {
+        constructor(_pathData) {}
+      }
+    );
+  });
+
+  afterEach(() => {
+    getContextSpy.mockRestore();
+  });
+
+  /** Same shape as makeInputStateAimedAt, but the ray lives under `hand`. */
+  function makeInputStateAimedAtWithHand(target, hand, { triggerPressed = false, headY = 1.6 } = {}) {
+    const origin = [0, headY, 0];
+    const d = [target[0] - origin[0], target[1] - origin[1], target[2] - origin[2]];
+    const len = Math.hypot(...d) || 1;
+    const dir = d.map((v) => v / len);
+    const matrix = [1, 0, 0, 0, 0, 1, 0, 0, -dir[0], -dir[1], -dir[2], 0, 0, 0, 0, 1];
+    const controller = {
+      pose: { position: { x: origin[0], y: origin[1], z: origin[2] } },
+      targetRay: { position: { x: origin[0], y: origin[1], z: origin[2] }, matrix },
+      triggerPressed,
+    };
+    return {
+      activePointerHand: hand,
+      headPose: { position: { x: origin[0], y: origin[1], z: origin[2] }, orientation: { x: 0, y: 0, z: 0, w: 1 } },
+      controllers: {
+        left: hand === "left" ? controller : null,
+        right: hand === "right" ? controller : null,
+      },
+    };
+  }
+
+  it("resolves a LEFT-hand hover/activation when activePointerHand is 'left' and only the left controller is tracked", () => {
+    const ui = new VRSpatialUI();
+    ui.initialize(makeFakeRenderer(), makeManager(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+    // Prime layout with a right-handed frame first (panel needs an initial
+    // anchor/layout pass), matching every other test in this file.
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+
+    const undoPos = ui._buttonActors.get("undo").actor.getPosition();
+    const result = ui.hitTest(makeInputStateAimedAtWithHand(undoPos, "left", { triggerPressed: true }));
+
+    expect(result.hand).toBe("left");
+    expect(result.buttonId).toBe("undo");
+    expect(result.consumingTrigger).toBe(true);
+  });
+
+  it("falls back to whichever controller IS tracked when the resolved active hand has none this frame", () => {
+    const ui = new VRSpatialUI();
+    ui.initialize(makeFakeRenderer(), makeManager(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+    ui.update(makeInputState(), { vrScale: 1.0, vrOrigin: [0, 0, 0] });
+
+    const undoPos = ui._buttonActors.get("undo").actor.getPosition();
+    // activePointerHand says 'left', but only the right controller is
+    // tracked this frame (e.g. left went idle/untracked) — must still fall
+    // back to right rather than picking up nothing.
+    const input = makeInputStateAimedAtWithHand(undoPos, "right", { triggerPressed: true });
+    input.activePointerHand = "left";
+    const result = ui.hitTest(input);
+
+    expect(result.hand).toBe("right");
+    expect(result.buttonId).toBe("undo");
+  });
+});

@@ -21,6 +21,8 @@
 // stops being able to catch the class of bug it was written for.
 import { describe, it, expect, beforeEach } from "vitest";
 import vtkCubeSource from "@kitware/vtk.js/Filters/Sources/CubeSource";
+import vtkPolyData from "@kitware/vtk.js/Common/DataModel/PolyData";
+import vtkPoints from "@kitware/vtk.js/Common/Core/Points";
 import vtkMapper from "@kitware/vtk.js/Rendering/Core/Mapper";
 import vtkActor from "@kitware/vtk.js/Rendering/Core/Actor";
 import { VTKInstanceHandler } from "../VTKInstanceHandler.js";
@@ -59,6 +61,19 @@ function makeCubeActor() {
   });
   const mapper = vtkMapper.newInstance();
   mapper.setInputData(cube.getOutputData());
+  const actor = vtkActor.newInstance();
+  actor.setMapper(mapper);
+  return actor;
+}
+
+/** A real point-cloud actor (points, zero cells) for exact-point picking. */
+function makePointCloudActor(points) {
+  const pts = vtkPoints.newInstance();
+  pts.setData(new Float64Array(points), 3);
+  const polyData = vtkPolyData.newInstance();
+  polyData.setPoints(pts);
+  const mapper = vtkMapper.newInstance();
+  mapper.setInputData(polyData);
   const actor = vtkActor.newInstance();
   actor.setMapper(mapper);
   return actor;
@@ -113,10 +128,17 @@ describe("raycastVR — real vtkCellPicker, real geometry", () => {
 
     expect(result).not.toBeNull();
     expect(result.cellId).toBeGreaterThanOrEqual(0);
-    // The near face of a cube spanning -1..1 sits at z = +1.
+    // surfacePosition is the raw, un-snapped ray/face intersection: the near
+    // face of a cube spanning -1..1 sits at z = +1, hit dead-center.
+    expect(result.surfacePosition.z).toBeCloseTo(1, 5);
+    expect(result.surfacePosition.x).toBeCloseTo(0, 5);
+    expect(result.surfacePosition.y).toBeCloseTo(0, 5);
+    // position is snapped to the resolved vertex (pointId) — one of the +Z
+    // face's four real corners, not the interpolated face center.
+    expect(result.pointId).toBeGreaterThanOrEqual(0);
     expect(result.position.z).toBeCloseTo(1, 5);
-    expect(result.position.x).toBeCloseTo(0, 5);
-    expect(result.position.y).toBeCloseTo(0, 5);
+    expect(Math.abs(result.position.x)).toBeCloseTo(1, 5);
+    expect(Math.abs(result.position.y)).toBeCloseTo(1, 5);
   });
 
   it("returns null when the ray points away from the geometry", () => {
@@ -170,5 +192,75 @@ describe("raycastVR — real vtkCellPicker, real geometry", () => {
 
     expect(result).not.toBeNull();
     expect(result.position.z).toBeCloseTo(1, 5);
+  });
+});
+
+// This describe block exists because the sibling unit file mocks vtkPointPicker
+// wholesale, with getPickPosition() stubbed by hand to whatever the test wants.
+// That hid the real defect: vtkPointPicker.pick3DPoint() never populates the
+// singular getPickPosition() on a hit (confirmed against the installed vtk.js
+// source — only publicAPI.pick(), the 2D/display-coordinate method, does that).
+// _raycastExactPoint must resolve the position itself from pointId + the
+// actor's own polydata + its matrix — this exercises that against the REAL
+// vtkPointPicker, with no mocking, so a regression here fails for real.
+describe("raycastVR — real vtkPointPicker, real point-cloud geometry", () => {
+  let handler;
+
+  beforeEach(() => {
+    handler = new VTKInstanceHandler();
+  });
+
+  it("resolves the exact-point position from pointId + the actor's matrix, not a stale getPickPosition()", () => {
+    // A single point at the actor's local origin; the actor itself is
+    // translated +2 on X, so the correct WORLD-space hit is (2, 0, 0) — a
+    // value that can only come from resolving pointId 0 against the
+    // polydata and applying the actor's matrix, not from the real
+    // vtkPointPicker's getPickPosition() (which stays [0, 0, 0]).
+    const actor = makePointCloudActor([0, 0, 0]);
+    actor.setPosition(2, 0, 0);
+    const ctx = {
+      dataBounds: [-1, 1, -1, 1, -1, 1],
+      vrScale: VR_SCALE,
+      vrOrigin: [...VR_ORIGIN],
+      sceneObjects: {
+        renderer: makeRendererStub([actor]),
+        actor,
+      },
+    };
+
+    const result = handler.raycastVR(
+      ctx,
+      { origin: xrPointFor([2, 0, 5]), direction: { x: 0, y: 0, z: -1 } },
+      { selectionMode: "exactPoint" }
+    );
+
+    expect(result).not.toBeNull();
+    expect(result.hit).toBe(true);
+    expect(result.cellId).toBe(-1);
+    expect(result.pointId).toBe(0);
+    expect(result.position.x).toBeCloseTo(2, 3);
+    expect(result.position.y).toBeCloseTo(0, 3);
+    expect(result.position.z).toBeCloseTo(0, 3);
+  });
+
+  it("returns null for a ray that misses every point", () => {
+    const actor = makePointCloudActor([0, 0, 0]);
+    const ctx = {
+      dataBounds: [-1, 1, -1, 1, -1, 1],
+      vrScale: VR_SCALE,
+      vrOrigin: [...VR_ORIGIN],
+      sceneObjects: {
+        renderer: makeRendererStub([actor]),
+        actor,
+      },
+    };
+
+    const result = handler.raycastVR(
+      ctx,
+      { origin: xrPointFor([5, 5, 5]), direction: { x: 0, y: 0, z: -1 } },
+      { selectionMode: "exactPoint" }
+    );
+
+    expect(result).toBeNull();
   });
 });

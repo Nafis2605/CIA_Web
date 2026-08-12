@@ -1950,14 +1950,22 @@ export class VRSpatialUI {
   }
 
   /**
-   * Extract a pickable ray from input. Prefers the right controller's target
-   * ray (also the Vision Pro transient-pointer path, which _gatherInputState
-   * maps onto controllers.right). Returns { origin:[x,y,z], direction:[x,y,z] }
-   * or null.
+   * Extract a pickable ray from input. Prefers whichever hand
+   * VRExplorationManager._resolveActivePointerHand resolved as active this
+   * frame (inputState.activePointerHand — the hand that most recently pulled
+   * its trigger), falling back to the old right-then-left preference only
+   * when the resolved hand has no controller tracked this frame (also covers
+   * the Vision Pro transient-pointer path, which _gatherInputState maps onto
+   * controllers.right, and any caller that hasn't run the resolver, e.g.
+   * tests constructing inputState directly). Returns
+   * { origin:[x,y,z], direction:[x,y,z] } or null.
    * @private
    */
   _pickRay(inputState) {
-    const hand = inputState.controllers?.right ? "right" : "left";
+    const preferred = inputState.activePointerHand;
+    const hand = inputState.controllers?.[preferred]
+      ? preferred
+      : inputState.controllers?.right ? "right" : "left";
     return this._rayForHand(inputState, hand);
   }
 
@@ -1980,7 +1988,11 @@ export class VRSpatialUI {
   }
 
   _isSelectPressed(inputState) {
-    const ctrl = inputState.controllers?.right || inputState.controllers?.left;
+    const preferred = inputState.activePointerHand;
+    const ctrl =
+      inputState.controllers?.[preferred] ||
+      inputState.controllers?.right ||
+      inputState.controllers?.left;
     return !!ctrl?.triggerPressed;
   }
 
@@ -2166,7 +2178,10 @@ export class VRSpatialUI {
     this._lastSelectPressed = selectPressed;
     this._rememberGripState(inputState);
 
-    const hand = ray?.hand || (inputState.controllers?.right ? "right" : "left");
+    const preferred = inputState.activePointerHand;
+    const hand =
+      ray?.hand ||
+      (inputState.controllers?.[preferred] ? preferred : inputState.controllers?.right ? "right" : "left");
     return {
       hovering,
       buttonId: hovering ? "__reshow__" : null,

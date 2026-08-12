@@ -4,7 +4,7 @@
 
 const WebSocket = require("ws");
 const { createLogger } = require("../utils/logger");
-const { DEV_BYPASS_AUTH, verifyJwtToken } = require("../middleware/auth");
+const { DEV_BYPASS_AUTH, verifyJwtToken, checkWorkspaceAccess } = require("../middleware/auth");
 
 const ws = createLogger("ws");
 const auth = createLogger("auth");
@@ -425,11 +425,15 @@ class WebSocketManager {
   }
 
   /**
-   * Broadcast a message to every client subscribed to the PROJECT a
-   * workspace belongs to — there is no separate workspace-level
-   * subscription channel (clients only ever join a project room, see
-   * `rooms`/broadcastToProject above and serverSync.js's `join:project`),
-   * so this resolves workspace_id -> project_id and delegates.
+   * Broadcast a message to clients subscribed to the PROJECT a workspace
+   * belongs to, FILTERED to only those with access to that specific
+   * workspace — there is no separate workspace-level subscription channel
+   * (clients only ever join a project room, see `rooms`/broadcastToProject
+   * above and serverSync.js's `join:project`), so this resolves
+   * workspace_id -> project_id, then checks each distinct socket user's
+   * workspace membership before sending, instead of delegating straight to
+   * broadcastToProject (which would send to every project member,
+   * regardless of workspace).
    *
    * `server/src/routes/viewgroups.js` called a `broadcastToWorkspace`
    * method here that never existed — every viewgroup/view-link create,
@@ -459,7 +463,30 @@ class WebSocketManager {
         [workspaceId]
       );
       const projectId = result.rows[0]?.project_id;
-      if (projectId) this.broadcastToProject(projectId, { type, ...payload });
+      if (!projectId) return;
+
+      const room = this.rooms.get(projectId);
+      if (!room) return;
+
+      // Group sockets by userId so membership is checked once per distinct
+      // user, not once per socket/tab (checkWorkspaceAccess is a DB round
+      // trip; this event class is low-frequency ViewGroup/link mutations,
+      // not per-frame cursor updates, so this stays cheap).
+      const socketsByUserId = new Map();
+      for (const socket of room) {
+        if (socket.readyState !== WebSocket.OPEN || !socket.userId) continue;
+        if (!socketsByUserId.has(socket.userId)) socketsByUserId.set(socket.userId, []);
+        socketsByUserId.get(socket.userId).push(socket);
+      }
+
+      const message = JSON.stringify({ type, ...payload });
+      await Promise.all(
+        Array.from(socketsByUserId.entries()).map(async ([userId, sockets]) => {
+          const { allowed } = await checkWorkspaceAccess(this.pool, workspaceId, userId);
+          if (!allowed) return;
+          for (const socket of sockets) socket.send(message);
+        })
+      );
     } catch (err) {
       ws.warn(`broadcastToWorkspace(${workspaceId}) failed:`, err.message);
     }

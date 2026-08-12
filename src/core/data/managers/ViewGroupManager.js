@@ -167,7 +167,7 @@ export class ViewGroupManager extends BaseManager {
                 this._handleRemoteUpdated(data.viewGroup);
                 break;
             case 'viewgroup:deleted':
-                this._handleRemoteDeleted(data.viewGroupId);
+                this._handleRemoteDeleted(data.viewGroupId, data.workspaceId);
                 break;
             case 'viewgroup:linked':
                 this._handleRemoteLinked(data);
@@ -1177,7 +1177,17 @@ export class ViewGroupManager extends BaseManager {
     // REMOTE EVENT HANDLERS
     // ===========================================================================
 
+    // Defense-in-depth: a broadcast is scoped server-side to one workspace
+    // (see websocket.js's broadcastToWorkspace), but this manager instance
+    // is itself scoped to a single workspace (this._workspaceId, set in
+    // initialize()) — ignore anything for a different one rather than
+    // trusting the payload blindly.
+    _isForThisWorkspace(workspaceId) {
+        return !workspaceId || !this._workspaceId || workspaceId === this._workspaceId;
+    }
+
     _handleRemoteCreated(serverData) {
+        if (!this._isForThisWorkspace(serverData?.workspaceId)) return;
         if (this._viewGroups.has(serverData.id)) return;
 
         const viewGroup = ViewGroup.fromServerResponse(serverData);
@@ -1188,6 +1198,8 @@ export class ViewGroupManager extends BaseManager {
     }
 
     _handleRemoteUpdated(serverData) {
+        if (!this._isForThisWorkspace(serverData?.workspaceId)) return;
+
         const existing = this._viewGroups.get(serverData.id);
         if (!existing) {
             this._handleRemoteCreated(serverData);
@@ -1202,7 +1214,9 @@ export class ViewGroupManager extends BaseManager {
         this._emit('viewGroupUpdated', { viewGroup: updated, isRemote: true });
     }
 
-    _handleRemoteDeleted(viewGroupId) {
+    _handleRemoteDeleted(viewGroupId, workspaceId) {
+        if (!this._isForThisWorkspace(workspaceId)) return;
+
         const viewGroup = this._viewGroups.get(viewGroupId);
         if (!viewGroup) return;
 

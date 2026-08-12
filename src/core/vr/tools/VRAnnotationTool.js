@@ -84,6 +84,13 @@ export class VRAnnotationTool extends VRToolInterface {
     this._pendingLabel = ANNOTATION_LABEL_PRESETS[0];
     this._colorIndex = 0;
 
+    // Per-hand rising-edge latches (see handleInput) — keyed by hand rather
+    // than a single scalar so a hand switch between frames (see
+    // VRExplorationManager._resolveActivePointerHand) can't misread a stale
+    // latch as a rising/falling edge for the OTHER hand's physical trigger.
+    this._lastTriggerState = { left: false, right: false };
+    this._lastAButtonState = { left: false, right: false };
+
     // The in-progress draft: a fixed point with nothing persisted yet, filled
     // in by the spatial keyboard and resolved by confirmDraft()/cancelDraft().
     // { id, position, normal, timestamp, color, size, text, fallbackText }
@@ -344,7 +351,14 @@ export class VRAnnotationTool extends VRToolInterface {
 
   handleInput(inputState, frame) {
     const { controllers } = inputState;
-    const rightCtrl = controllers.right;
+    // Whichever hand VRExplorationManager._resolveActivePointerHand resolved
+    // as active this frame (the hand that most recently pulled its trigger),
+    // instead of hardcoding the right controller — see that method's doc for
+    // why. Defaults to 'right' so callers that construct inputState directly
+    // (tests, or any path that hasn't run the resolver) behave exactly as
+    // before this existed.
+    const activeHand = inputState.activePointerHand === 'left' ? 'left' : 'right';
+    const activeCtrl = controllers[activeHand];
 
     // Rising-edge detection: update _lastTriggerState unconditionally,
     // BEFORE acting on it, so a held trigger places exactly once per pull
@@ -354,20 +368,20 @@ export class VRAnnotationTool extends VRToolInterface {
     // every single frame the trigger stayed down. Same discipline now
     // applies to the A-button edge below, for the same reason.
     //
-    // Read via optional chaining and update the latch even when rightCtrl
+    // Read via optional chaining and update the latch even when activeCtrl
     // is absent — a gripless/transient-pointer source (Vision Pro) is only
     // present in inputState while a pinch is physically held, so it
-    // vanishes on every release. Bailing out on `!rightCtrl` BEFORE this
+    // vanishes on every release. Bailing out on `!activeCtrl` BEFORE this
     // update (the previous bug) left the latch permanently stuck at `true`
     // from the last pinch that did reach it, so no later pinch could ever
     // read as a fresh rising edge again.
-    const triggerPressed = !!rightCtrl?.triggerPressed;
-    const triggerRisingEdge = triggerPressed && !this._lastTriggerState;
-    this._lastTriggerState = triggerPressed;
+    const triggerPressed = !!activeCtrl?.triggerPressed;
+    const triggerRisingEdge = triggerPressed && !this._lastTriggerState[activeHand];
+    this._lastTriggerState[activeHand] = triggerPressed;
 
-    const aPressed = !!rightCtrl?.buttons?.a;
-    const aRisingEdge = aPressed && !this._lastAButtonState;
-    this._lastAButtonState = aPressed;
+    const aPressed = !!activeCtrl?.buttons?.a;
+    const aRisingEdge = aPressed && !this._lastAButtonState[activeHand];
+    this._lastAButtonState[activeHand] = aPressed;
 
     // Modal: while a draft is open, the keyboard owns input — no raycast, no
     // new placement. The A-button is still honoured here as a Quest
@@ -385,8 +399,8 @@ export class VRAnnotationTool extends VRToolInterface {
     // one more trigger-held window so that consumed pinch can't be misread as
     // a fresh placement the instant the pointer leaves the panel.
     //
-    // Gated on `triggerPressed`, not on `rightCtrl` directly, so a
-    // gripless/transient-pointer release — which makes rightCtrl disappear
+    // Gated on `triggerPressed`, not on `activeCtrl` directly, so a
+    // gripless/transient-pointer release — which makes activeCtrl disappear
     // entirely rather than merely flip triggerPressed to false — still
     // clears this flag. Missing that on the disappearance frame would leave
     // it stuck `true` forever, identically to the _lastTriggerState bug this
@@ -402,11 +416,11 @@ export class VRAnnotationTool extends VRToolInterface {
       // "DATA-MANIPULATION TOKEN" comment. It's an additive, per-user,
       // non-conflicting write (unlike clip/threshold/glyph, which mutate ONE
       // shared representation of the dataset), so any participant may place
-      // one at any time regardless of who holds the token. rightCtrl is
+      // one at any time regardless of who holds the token. activeCtrl is
       // guaranteed non-null here: triggerRisingEdge can only be true when
-      // triggerPressed was, which requires rightCtrl to have been truthy
+      // triggerPressed was, which requires activeCtrl to have been truthy
       // this frame.
-      const hit = this._performRaycast(rightCtrl, frame);
+      const hit = this._performRaycast(activeCtrl, frame);
       if (hit) return this._openDraft(hit);
     }
 
@@ -441,6 +455,12 @@ export class VRAnnotationTool extends VRToolInterface {
     this._draft = {
       id: `annot_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
       position: { ...hit.position },
+      // Local-space (actor-relative) point, so the marker can be re-anchored
+      // if the data actor is later rotated/translated/scaled — see
+      // VTKAnnotationLinesFeature.syncActorTransforms. null when not
+      // recoverable (e.g. a glyph/derived-actor pick); the marker then stays
+      // pinned in world space exactly as before this existed.
+      localPosition: this._resolveLocalPosition(hit),
       normal: hit.normal ? { ...hit.normal } : null,
       // pointId is only meaningful relative to whichever polydata
       // pickActorRole names — it does NOT index into the source dataset
@@ -461,6 +481,37 @@ export class VRAnnotationTool extends VRToolInterface {
     this._setSelectedGlyphPoint(hit);
 
     return { type: 'annotation-pending', data: this._draft };
+  }
+
+  /**
+   * Recover the LOCAL-space (actor-relative) coordinates of a resolved
+   * source-surface pick, so the annotation can be re-anchored later if the
+   * data actor's transform changes (VR two-hand twist). Only possible for a
+   * 'source'-role pick with a resolved (non -1/null) pointId — a glyph/
+   * threshold/isosurface pick's pointId doesn't index into the source
+   * dataset's own points (see the pointId doc above), so there is no local
+   * point to recover for those. Mirrors the same
+   * polydata.getPoints().getData() lookup raycastVR/_raycastExactPoint
+   * already use internally.
+   * @param {{actorRole?:string|null, pointId?:number|null, actor?:object}} hit
+   * @returns {{x:number,y:number,z:number}|null}
+   * @private
+   */
+  _resolveLocalPosition(hit) {
+    if (hit?.actorRole !== 'source') return null;
+    if (hit?.pointId == null || hit.pointId === -1) return null;
+    try {
+      const polyData = hit.actor?.getMapper?.()?.getInputData?.();
+      const coords = polyData?.getPoints?.()?.getData?.();
+      if (!coords || hit.pointId * 3 + 2 >= coords.length) return null;
+      return {
+        x: coords[hit.pointId * 3],
+        y: coords[hit.pointId * 3 + 1],
+        z: coords[hit.pointId * 3 + 2],
+      };
+    } catch {
+      return null; // graceful degradation to world-space-only anchoring
+    }
   }
 
   /**
@@ -638,6 +689,7 @@ export class VRAnnotationTool extends VRToolInterface {
       // is a separate feature, not a mode flag.
       type: 'marker',
       position: draft.position,
+      localPosition: draft.localPosition ?? null,
       normal: draft.normal,
       timestamp: draft.timestamp,
       text,
@@ -647,6 +699,9 @@ export class VRAnnotationTool extends VRToolInterface {
       authorName: getUserName(),
       color: draft.color,
       size: draft.size,
+      pointId: draft.pointId ?? null,
+      cellId: draft.cellId ?? null,
+      pickActorRole: draft.pickActorRole ?? null,
     };
   }
 

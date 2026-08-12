@@ -5,6 +5,7 @@ import { Dataset } from "@Core/data/models/Dataset.js";
 import { Annotation } from "@Core/data/models/Annotation.js";
 import { config } from "@Core/config/clientConfig.js";
 import { apiClient, ApiError } from "@Services/apiClient.js";
+import { resolveBuiltInDatasetId } from "@Services/builtInDatasets.js";
 import {
   dataset as log,
   logInfo,
@@ -60,6 +61,7 @@ export class DatasetManager extends BaseManager {
 
     this.storageProvider = storageProvider;
     this._datasets = new Map();
+    this._builtInAliases = new Map(); // serverUUID -> local "builtin-*" key
     this.parsedDataCache = new Map();
     this._dbName = config.dbName || "CIA_Datasets";
     this._dbVersion = config.dbVersion || 1;
@@ -382,7 +384,35 @@ export class DatasetManager extends BaseManager {
     this._datasets.set(dataset.id, dataset);
     this._emit('datasetAdded', dataset);
     log.debug(`Built-in dataset registered: ${dataset.id}`);
+
+    // Annotation persistence resolves this local key to the dataset's real
+    // server UUID before sending requests (see VRExplorationManager
+    // _getPersistenceScope), and remote broadcasts echo that UUID back.
+    // Register the alias eagerly here (not lazily on first use) so a client
+    // that never itself authors an annotation still recognizes remote
+    // broadcasts for this dataset.
+    resolveBuiltInDatasetId(dataset.id)
+      .then((uuid) => {
+        if (uuid) this.registerBuiltInDatasetAlias(dataset.id, uuid);
+      })
+      .catch((err) => {
+        log.debug(`addBuiltInDataset: alias resolution deferred for ${dataset.id}: ${err?.message}`);
+      });
+
     return dataset;
+  }
+
+  /**
+   * Register a built-in dataset's server-resolved UUID so getDataset() can
+   * find it by either id. See addBuiltInDataset's alias-resolution comment.
+   * @param {string} localKey - e.g. "builtin-lungs"
+   * @param {string} serverUuid
+   */
+  registerBuiltInDatasetAlias(localKey, serverUuid) {
+    if (!localKey || !serverUuid) return;
+    this._builtInAliases.set(serverUuid, localKey);
+    const dataset = this._datasets.get(localKey);
+    if (dataset) dataset.serverId = serverUuid;
   }
 
   /**
@@ -564,7 +594,10 @@ export class DatasetManager extends BaseManager {
   }
 
   getDataset(datasetId) {
-    return this._datasets.get(datasetId) || null;
+    const direct = this._datasets.get(datasetId);
+    if (direct) return direct;
+    const localKey = this._builtInAliases.get(datasetId);
+    return (localKey && this._datasets.get(localKey)) || null;
   }
 
   getAllDatasets() {

@@ -18,7 +18,7 @@ import { VRManipulationLock } from '@Core/vr/VRManipulationLock.js';
 import { VRNavigationController } from '@Core/vr/navigation/VRNavigationController.js';
 import { workspaceManager } from '@Core/instances/workspaceManager.js';
 import { resolveViewSyncKey } from '@Core/instances/viewSyncKey.js';
-import { getViewConfigurationManager } from '@Init/appInitializer.js';
+import { getViewConfigurationManager, getDatasetManager } from '@Init/appInitializer.js';
 // getParticipantId(), NOT getUserId(), is the identity every peer-facing check
 // below uses: two headsets on one account share a getUserId(), so "is this me?"
 // answered yes on both and each device claimed the other's host role, lock and
@@ -191,6 +191,14 @@ class VRExplorationManager extends BaseManager {
     // vrManager.getYawOffset() snapshot, compared each frame in _onFrame to
     // force vrSpatialUI.forceReanchor() after a snap-turn (see there).
     this._lastMenuYawOffset = 0;
+
+    // Which hand's controller is treated as "active" this frame for menu
+    // hit-testing, tool input (e.g. annotation placement), and the aiming
+    // reticle — see _resolveActivePointerHand. Sticky across frames while a
+    // trigger stays held; defaults to 'right' when neither is pressed, so
+    // idle frames behave exactly as before this existed.
+    this._lastTriggerPressed = { left: false, right: false };
+    this._lastActivePointerHand = 'right';
 
     // Per-frame error dedupe — a throw inside the XR loop repeats at headset
     // frame rate, so each distinct "<step>:<message>" is logged once. Cleared
@@ -1736,10 +1744,15 @@ class VRExplorationManager extends BaseManager {
   // TOOL MANAGEMENT (delegated to VRToolManager)
   // ===========================================================================
 
-  activateTool(toolId) {
+  async activateTool(toolId) {
     if (!this._toolManager) return;
-    this._toolManager.activateTool(toolId);
-    this._emit('toolActivated', { toolId });
+    try {
+      await this._toolManager.activateTool(toolId);
+      this._emit('toolActivated', { toolId });
+    } catch (error) {
+      log.warn(`VR tool activation failed for "${toolId}": ${error?.message}`);
+      this._emit('toolActivationFailed', { toolId, error: error?.message || String(error) });
+    }
   }
 
   deactivateTool() {
@@ -3390,6 +3403,13 @@ class VRExplorationManager extends BaseManager {
       // Get input state
       const inputState = this._gatherInputState(frame);
 
+      // Resolve which hand is "active" this frame BEFORE menu hit-testing
+      // (below) or any tool/reticle consumer runs — see
+      // _resolveActivePointerHand. Mutates inputState in place (adds a top-
+      // level field), so every clone taken from it later this frame
+      // (_gateInputState's navInput/toolInput) carries it for free.
+      this._resolveActivePointerHand(inputState);
+
       // A snap-turn (or any other reference-space offset) rotates the frame
       // every subsequent pose is reported in, but is deliberately built to
       // leave head POSITION nearly unchanged (see VRManager.applySnapTurn) —
@@ -3923,8 +3943,14 @@ class VRExplorationManager extends BaseManager {
       // data space.
       const result = handler.raycastVR(vrContext, controller.targetRay);
       if (result?.hit && result.position) {
+        // The aiming reticle/dot should track the raw ray-surface
+        // intersection (surfacePosition) so it slides smoothly across the
+        // mesh, not jump between vertices — vertex-snapped `position` is for
+        // callers persisting/rendering something BY pointId (annotations),
+        // not this general-purpose cursor.
+        const cursorPosition = result.surfacePosition || result.position;
         pick = {
-          position: { x: result.position.x, y: result.position.y, z: result.position.z },
+          position: { x: cursorPosition.x, y: cursorPosition.y, z: cursorPosition.z },
           pointId: result.pointId ?? -1,
           cellId: result.cellId ?? -1,
           datasetId: result.datasetId ?? null,
@@ -3959,6 +3985,48 @@ class VRExplorationManager extends BaseManager {
     } catch {
       // pointer broadcast is cosmetic — never break the frame loop
     }
+  }
+
+  /**
+   * Resolve which hand's controller should be treated as "active" this
+   * frame — the single source of truth menu hit-testing, tool input (e.g.
+   * VRAnnotationTool), and the aiming reticle all read, instead of each
+   * independently hardcoding a right-hand-first preference (the cause of
+   * left-handed/left-only interaction silently failing to route triggers).
+   *
+   * Rule: prefer whichever hand produced a trigger RISING EDGE this frame;
+   * if neither did, hold the previously-resolved hand while its trigger is
+   * still held; if neither hand's trigger is held, fall back to 'right'
+   * (today's long-standing default), so idle frames render identically to
+   * before this existed.
+   *
+   * Mutates `inputState` in place (adds `activePointerHand`) rather than
+   * returning a value the caller must thread through — _gateInputState's
+   * clone (`{ ...inputState, controllers: {...} }`) is a shallow spread of
+   * all top-level keys, so the field survives into navInput/toolInput for
+   * free.
+   * @private
+   */
+  _resolveActivePointerHand(inputState) {
+    const leftPressed = !!inputState.controllers?.left?.triggerPressed;
+    const rightPressed = !!inputState.controllers?.right?.triggerPressed;
+    const leftRising = leftPressed && !this._lastTriggerPressed.left;
+    const rightRising = rightPressed && !this._lastTriggerPressed.right;
+    this._lastTriggerPressed.left = leftPressed;
+    this._lastTriggerPressed.right = rightPressed;
+
+    let hand;
+    if (leftRising && !rightRising) hand = 'left';
+    else if (rightRising && !leftRising) hand = 'right';
+    else if (leftRising && rightRising) hand = this._lastActivePointerHand; // simultaneous — keep sticky
+    else if (leftPressed && !rightPressed) hand = 'left';
+    else if (rightPressed && !leftPressed) hand = 'right';
+    else if (leftPressed && rightPressed) hand = this._lastActivePointerHand;
+    else hand = 'right'; // neither pressed — stable default
+
+    this._lastActivePointerHand = hand;
+    inputState.activePointerHand = hand;
+    return hand;
   }
 
   _gatherInputState(frame) {
@@ -4284,7 +4352,14 @@ class VRExplorationManager extends BaseManager {
       instance?.instanceData?.dataset?.id || instance?.datasetId || null;
     const projectId = instance?.instanceData?.projectId || null;
     if (datasetId && isBuiltInDatasetId(datasetId)) {
-      datasetId = await resolveBuiltInDatasetId(datasetId);
+      const localKey = datasetId;
+      datasetId = await resolveBuiltInDatasetId(localKey);
+      // Safety net alongside DatasetManager's own eager resolution at
+      // registration time — covers a boot-time resolve that failed or
+      // hadn't completed yet.
+      if (datasetId) {
+        getDatasetManager()?.registerBuiltInDatasetAlias?.(localKey, datasetId);
+      }
     }
     return { datasetId, projectId };
   }
@@ -4337,6 +4412,13 @@ class VRExplorationManager extends BaseManager {
               pointId: data.pointId ?? null,
               cellId: data.cellId ?? null,
               pickActorRole: data.pickActorRole ?? null,
+              // Actor-relative point, so VTKAnnotationLinesFeature can
+              // re-anchor the marker if the data actor's transform changes
+              // later (VR two-hand twist) — null when not recoverable (see
+              // VRAnnotationTool._resolveLocalPosition).
+              localPosition: data.localPosition
+                ? [data.localPosition.x, data.localPosition.y, data.localPosition.z]
+                : null,
             },
           },
           { projectId }

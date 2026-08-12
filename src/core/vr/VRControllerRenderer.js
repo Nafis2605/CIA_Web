@@ -56,16 +56,19 @@ export class VRControllerRenderer {
     };
 
     // Ray settings
-    this._rayLength = 5.0; // meters in VR
+    this._rayLength = 5.0; // meters in VR — fallback/max length on a MISS
     this._rayWidth = 0.002;
 
-    // Gaze reticle (Vision Pro transient-pointer): gripless gaze+pinch input
-    // gives no persistent hand ray, so a small dot at the raycast hit is the
-    // only "where will my pinch land" feedback. options.raycast is an injected
-    // picker (handler.raycastVR-bound); without it the reticle stays off.
+    // Gaze reticle (Vision Pro transient-pointer, and also the tracked-
+    // controller hit dot): gripless gaze+pinch input gives no persistent hand
+    // ray, so a small dot at the raycast hit is the only "where will my pinch
+    // land" feedback. options.raycast is an injected picker
+    // (handler.raycastVR-bound); without it the reticle stays off. Per-hand
+    // so both controllers get their OWN dot from their OWN hit, rather than
+    // only whichever hand used to win the old right-then-left preference.
     this._raycast = options.raycast || null;
-    this._reticle = null;
-    this._reticleSource = null;
+    this._reticles = { left: null, right: null };
+    this._reticleSources = { left: null, right: null };
 
     // Initialize controllers
     this._initializeControllers();
@@ -212,78 +215,76 @@ export class VRControllerRenderer {
           controller.triggerPressed || controller.squeezePressed
         );
 
-        // Update pointer ray
+        // Update pointer ray + this hand's own reticle dot, both driven by
+        // ONE raycast against THIS hand's own ray — see _updateReticleForHand
+        // for why every ray gets its own hit rather than only whichever hand
+        // used to win the old right-then-left reticle preference.
         if (controller.targetRay) {
           rayActor.setVisibility(true);
-          this._updatePointerRay(rayActor, this._raySources[hand], controller.targetRay);
+          let hit = null;
+          if (this._raycast) {
+            try {
+              hit = this._raycast(controller.targetRay);
+            } catch {
+              // picking must never break the frame loop
+            }
+          }
+          this._updatePointerRay(rayActor, this._raySources[hand], controller.targetRay, hand, hit);
+          this._updateReticleForHand(hand, hit);
         } else {
           rayActor.setVisibility(false);
+          this._reticles[hand]?.setVisibility(false);
         }
       } else {
         // Hide controller
         controllerActor.setVisibility(false);
         rayActor.setVisibility(false);
+        this._reticles[hand]?.setVisibility(false);
       }
     }
 
     // Update hand tracking if available
     this._updateHandTracking(inputState.hands);
-
-    // Gaze reticle for transient-pointer (Vision Pro) input
-    this._updateReticle(inputState);
   }
 
   /**
-   * Show a small dot where the controller's ray currently hits the data, on
-   * either input type. This used to be Vision Pro-only, on the assumption
-   * that a tracked controller's persistent ray line was "feedback enough" —
-   * it isn't: the ray line (_rayLength, below) is drawn at a fixed length
-   * regardless of whether raycastVR is actually hitting anything, so a Quest
-   * user had no way to tell "will my trigger register here" before pulling
-   * it, and no way to distinguish a genuine miss from a broken picker. Hidden
-   * on miss for both input types.
+   * Show a small dot where this hand's ray currently hits the data. This
+   * used to be Vision Pro-only, on the assumption that a tracked
+   * controller's persistent ray line was "feedback enough" — it isn't: the
+   * ray line used to be drawn at a fixed length regardless of whether
+   * raycastVR was actually hitting anything (see _updatePointerRay), so a
+   * Quest user had no way to tell "will my trigger register here" before
+   * pulling it. Now driven per-hand from the SAME raycast `update()` already
+   * ran for that hand's ray length, rather than a second, hand-biased
+   * raycast — hidden on miss.
    */
-  _updateReticle(inputState) {
-    const ctrl =
-      inputState.controllers?.right || inputState.controllers?.left;
-
-    if (!ctrl?.targetRay || !this._raycast) {
-      this._reticle?.setVisibility(false);
-      return;
-    }
-
-    let hit = null;
-    try {
-      hit = this._raycast(ctrl.targetRay);
-    } catch {
-      // picking must never break the frame loop
-    }
-
+  _updateReticleForHand(hand, hit) {
     if (!hit?.position) {
-      this._reticle?.setVisibility(false);
+      this._reticles[hand]?.setVisibility(false);
       return;
     }
 
-    this._ensureReticle();
+    this._ensureReticle(hand);
     // raycast picks against the scene renderer, so the hit is already in
     // scene/data space — no vrToScenePosition transform.
-    this._reticle.setPosition(hit.position.x, hit.position.y, hit.position.z);
+    const reticle = this._reticles[hand];
+    reticle.setPosition(hit.position.x, hit.position.y, hit.position.z);
     const s = 0.01 / this._vrScale; // ~1cm apparent size regardless of zoom
-    this._reticle.setScale(s, s, s);
-    this._reticle.setVisibility(true);
+    reticle.setScale(s, s, s);
+    reticle.setVisibility(true);
   }
 
-  _ensureReticle() {
-    if (this._reticle) return;
+  _ensureReticle(hand) {
+    if (this._reticles[hand]) return;
 
-    this._reticleSource = vtkSphereSource.newInstance({
+    const reticleSource = vtkSphereSource.newInstance({
       radius: 1.0, // scaled per-frame
       phiResolution: 12,
       thetaResolution: 12,
     });
 
     const mapper = vtkMapper.newInstance();
-    mapper.setInputConnection(this._reticleSource.getOutputPort());
+    mapper.setInputConnection(reticleSource.getOutputPort());
 
     const actor = vtkActor.newInstance();
     actor.setMapper(mapper);
@@ -294,7 +295,8 @@ export class VRControllerRenderer {
     actor.setVisibility(false);
 
     this._renderer.addActor(actor);
-    this._reticle = actor;
+    this._reticleSources[hand] = reticleSource;
+    this._reticles[hand] = actor;
   }
 
   /**
@@ -350,9 +352,20 @@ export class VRControllerRenderer {
   }
 
   /**
-   * Update pointer ray position and direction
+   * Update pointer ray position and direction. Terminates AT the raycast hit
+   * (when one is supplied) instead of always drawing the fixed max length —
+   * previously the ray was always _rayLength regardless of what it actually
+   * hit, so a ray visibly passing through the model didn't mean the picker
+   * missed; there was no way to tell "will my trigger register here" before
+   * pulling it. Also tints the ray so hit/miss are visually distinguishable.
+   * @param {vtkActor} rayActor
+   * @param {vtkLineSource} lineSource
+   * @param {{position:{x,y,z}, matrix:number[]}} targetRay
+   * @param {'left'|'right'} hand
+   * @param {{distance:number}|null} hit - this hand's own raycast result, or
+   *   null on a miss/no picker configured.
    */
-  _updatePointerRay(rayActor, lineSource, targetRay) {
+  _updatePointerRay(rayActor, lineSource, targetRay, hand, hit) {
     if (!lineSource) return;
     const origin = targetRay.position;
     const sceneOrigin = this._vrToScenePosition(origin);
@@ -367,8 +380,16 @@ export class VRControllerRenderer {
         -matrix[10],
       ];
 
-      // Calculate end point
-      const rayLengthScene = this._rayLength / this._vrScale;
+      // hit.distance (from raycastVR) is already scene/data-space; the max
+      // fallback (_rayLength, metres) is converted to scene units the same
+      // way it always was. On a hit, clamp the (already scene-space) hit
+      // distance against that converted max — do NOT divide hit.distance by
+      // vrScale again, it's not a metres value.
+      const maxLengthScene = this._rayLength / this._vrScale;
+      const rayLengthScene =
+        hit && Number.isFinite(hit.distance)
+          ? Math.min(hit.distance, maxLengthScene)
+          : maxLengthScene;
       const endPoint = [
         sceneOrigin[0] + direction[0] * rayLengthScene,
         sceneOrigin[1] + direction[1] * rayLengthScene,
@@ -381,6 +402,13 @@ export class VRControllerRenderer {
     }
 
     rayActor.setPosition(0, 0, 0); // Reset position since we set absolute points
+
+    // Hit/miss tint: reuse the existing per-hand highlight color for a hit
+    // (the same color already used for "trigger/grip pressed") and the base
+    // color for a miss — no third color set needed.
+    const isHit = !!(hit && Number.isFinite(hit.distance));
+    const color = this._colors[isHit ? `${hand}Highlight` : hand];
+    rayActor.getProperty().setColor(...color);
   }
 
   /**
@@ -495,12 +523,14 @@ export class VRControllerRenderer {
       }
     }
 
-    // Remove gaze reticle
-    if (this._reticle) {
-      this._renderer.removeActor(this._reticle);
-      this._reticle = null;
-      this._reticleSource = null;
+    // Remove gaze/hit reticles (both hands)
+    for (const hand of ["left", "right"]) {
+      if (this._reticles[hand]) {
+        this._renderer.removeActor(this._reticles[hand]);
+      }
     }
+    this._reticles = { left: null, right: null };
+    this._reticleSources = { left: null, right: null };
 
     this._controllers = { left: null, right: null };
     this._pointerRays = { left: null, right: null };

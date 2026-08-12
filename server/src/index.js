@@ -303,8 +303,8 @@ app.use("/api/annotations", optionalAuth, annotationsRouter);
 app.use("/api/views", optionalAuth, viewsRouter);
 app.use("/api/viewgroups", optionalAuth, viewgroupsRouter);
 app.use("/api/workspaces/:workspaceId/viewgroups", optionalAuth, viewgroupsRouter);
-app.use("/api/links", optionalAuth, viewgroupsRouter); // Link endpoints (/api/links/view, /api/links/viewgroup)
-app.use("/api/views", optionalAuth, viewgroupsRouter); // View reconciliation endpoints (/api/views/:viewId/reconciliation-status, etc.)
+app.use("/api/links", optionalAuth, viewgroupsRouter.viewLinksRouter); // Link endpoints (/api/links/view, /api/links/viewgroup)
+app.use("/api/views", optionalAuth, viewgroupsRouter.reconciliationRouter); // View reconciliation endpoints (/api/views/:viewId/reconciliation-status, etc.)
 app.use("/api/views", optionalAuth, thumbnailsRouter);
 // Thumbnail callback - mounted at /api/thumbnails for worker callbacks
 // Note: This is separate from thumbnailsRouter which is mounted at /api/views

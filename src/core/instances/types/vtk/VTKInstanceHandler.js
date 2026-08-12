@@ -4997,6 +4997,11 @@ console.log('Tools:', tools);
       dataActor.setUserMatrix(vrContext.originalActorUserMatrix);
     }
 
+    // Snap locally-anchored annotation markers back in sync with the
+    // actor's just-restored pose — otherwise they'd stay glued to the last
+    // VR-rotated pose while the actor resets, producing a fresh mismatch.
+    vtkAnnotationLinesFeature.syncActorTransforms(instanceId);
+
     // Derived (glyph/threshold/isosurface) actors have no "original" matrix
     // snapshot to restore — they're recreated fresh (no UserMatrix) whenever
     // a feature is (re)enabled — so any yaw applied to them during VR
@@ -5198,6 +5203,7 @@ console.log('Tools:', tools);
     // 'surface' mode skips this deliberately — it wants the raw interpolated
     // intersection with no vertex commitment.
     let pointId = -1;
+    let vertexWorldPosition = null;
     if (selectionMode !== "surface") {
       try {
         const polyData =
@@ -5211,13 +5217,23 @@ console.log('Tools:', tools);
         const candidateIds = cellInfo?.cellPointIds;
         if (candidateIds && candidateIds.length) {
           const coords = polyData.getPoints().getData();
+          // `position` is WORLD-space (picker.getPickPosition(), already
+          // transformed by prop.getMatrix() inside pick3DInternal) but
+          // `coords` is the polydata's raw LOCAL-space point data — map
+          // `position` into the actor's local frame once (same WORLD->LOCAL
+          // convention probeDataVR uses) so distances are compared in a
+          // single consistent space regardless of the actor's
+          // Position/Orientation/Scale/UserMatrix (e.g. VR-yaw).
+          const localPosition = this._transformPointByActorMatrix(actor, position, {
+            invert: true,
+          });
           let bestId = -1;
           let bestDistSq = Infinity;
           for (let i = 0; i < candidateIds.length; i++) {
             const pid = candidateIds[i];
-            const dx = coords[pid * 3] - position[0];
-            const dy = coords[pid * 3 + 1] - position[1];
-            const dz = coords[pid * 3 + 2] - position[2];
+            const dx = coords[pid * 3] - localPosition[0];
+            const dy = coords[pid * 3 + 1] - localPosition[1];
+            const dz = coords[pid * 3 + 2] - localPosition[2];
             const distSq = dx * dx + dy * dy + dz * dz;
             if (distSq < bestDistSq) {
               bestDistSq = distSq;
@@ -5225,15 +5241,36 @@ console.log('Tools:', tools);
             }
           }
           pointId = bestId;
+          if (bestId !== -1) {
+            // Snap position to the resolved vertex's own coordinates so
+            // pointId and position agree (pointId names a specific mesh
+            // vertex; the raw interpolated surface intersection generally
+            // isn't AT that vertex). Same forward LOCAL->WORLD transform
+            // _raycastExactPoint uses for its resolved point.
+            const localVertexPoint = [
+              coords[bestId * 3],
+              coords[bestId * 3 + 1],
+              coords[bestId * 3 + 2],
+            ];
+            vertexWorldPosition = this._transformPointByActorMatrix(actor, localVertexPoint);
+          }
         }
       } catch (err) {
         log.debug(`raycastVR: point-id resolution failed (${err?.message}) — leaving pointId=-1`);
       }
     }
 
+    // position is the vertex-snapped point when pointId was resolved (so
+    // callers persisting/rendering by pointId stay consistent with where the
+    // marker actually sits); surfacePosition is always the raw, un-snapped
+    // cell-picker intersection, for callers that want the exact ray hit
+    // (e.g. the VR aiming reticle) rather than a vertex-identity-consistent one.
+    const finalPosition = vertexWorldPosition || position;
+
     return {
       hit: true,
-      position: { x: position[0], y: position[1], z: position[2] },
+      position: { x: finalPosition[0], y: finalPosition[1], z: finalPosition[2] },
+      surfacePosition: { x: position[0], y: position[1], z: position[2] },
       normal: { x: normal[0], y: normal[1], z: normal[2] },
       distance: Math.sqrt(
         Math.pow(position[0] - p1[0], 2) +
@@ -5340,6 +5377,36 @@ console.log('Tools:', tools);
   }
 
   /**
+   * Transform a point between an actor's LOCAL data frame and the WORLD/
+   * data-render frame pickers operate in, via the actor's full composed
+   * matrix (Position/Origin/Orientation/Scale plus any UserMatrix, e.g. the
+   * VR-yaw twist from _applyVRDataRotation). Same transpose-then-apply
+   * convention as probeDataVR (below) — Prop3D.computeMatrix() transposes
+   * its result, so actor.getMatrix() must be transposed back to
+   * column-major before vtkMatrixBuilder can use it. Falls back to
+   * returning the point unchanged when the actor has no getMatrix (e.g. a
+   * test double), matching identity-transform behavior.
+   * @private
+   */
+  _transformPointByActorMatrix(actor, point, { invert = false } = {}) {
+    if (typeof actor?.getMatrix !== "function") {
+      return [point[0], point[1], point[2]];
+    }
+    const m = actor.getMatrix();
+    const columnMajor = [
+      m[0], m[4], m[8], m[12],
+      m[1], m[5], m[9], m[13],
+      m[2], m[6], m[10], m[14],
+      m[3], m[7], m[11], m[15],
+    ];
+    const out = [point[0], point[1], point[2]];
+    const builder = vtkMatrixBuilder.buildFromRadian().setMatrix(columnMajor);
+    if (invert) builder.invert();
+    builder.apply(out);
+    return out;
+  }
+
+  /**
    * 'exactPoint' selection mode: find the nearest ACTUAL DATA POINT along the
    * ray via vtkPointPicker, bypassing cell/surface intersection entirely.
    * Works on point-cloud datasets with zero cells, where vtkCellPicker can
@@ -5373,8 +5440,31 @@ console.log('Tools:', tools);
     if (!actors || actors.length === 0) return null;
 
     const pointId = picker.getPointId();
-    const position = picker.getPickPosition();
     const actor = actors[0];
+
+    // vtkPointPicker never populates the singular getPickPosition() on a
+    // pick3DPoint() hit (confirmed against the installed vtk.js source:
+    // intersectActorWithLine only ever writes model.pointId, not
+    // model.pickPosition/mapperPosition — that singular getter is only set
+    // by publicAPI.pick(), the 2D/display-coordinate method, which this path
+    // never calls). Resolve the real position ourselves: look up pointId in
+    // the hit actor's own mapper polydata (LOCAL space) and transform it
+    // forward through the actor's full composed matrix into WORLD/data-render
+    // space, mirroring probeDataVR's already-verified WORLD<->LOCAL
+    // convention (see _transformPointByActorMatrix).
+    const polyData =
+      typeof actor?.getMapper === "function" ? actor.getMapper()?.getInputData?.() : null;
+    const pointsObj = typeof polyData?.getPoints === "function" ? polyData.getPoints() : null;
+    const nPoints =
+      typeof pointsObj?.getNumberOfPoints === "function" ? pointsObj.getNumberOfPoints() : 0;
+    const coords = typeof pointsObj?.getData === "function" ? pointsObj.getData() : null;
+
+    if (pointId == null || pointId < 0 || !coords || pointId >= nPoints) {
+      return null;
+    }
+
+    const localPoint = [coords[pointId * 3], coords[pointId * 3 + 1], coords[pointId * 3 + 2]];
+    const position = this._transformPointByActorMatrix(actor, localPoint);
 
     return {
       hit: true,
@@ -5833,6 +5923,11 @@ console.log('Tools:', tools);
         actor.setUserMatrix(matrix);
       }
     }
+
+    // Keep locally-anchored annotation markers glued to the mesh through the
+    // same twist — see VTKAnnotationLinesFeature.syncActorTransforms. Inside
+    // the dirty-check above, so this only runs on an actual rotation change.
+    vtkAnnotationLinesFeature.syncActorTransforms(vrContext.instanceId);
   }
 
   // ===========================================================================

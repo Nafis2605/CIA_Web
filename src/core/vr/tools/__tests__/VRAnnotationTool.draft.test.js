@@ -131,6 +131,33 @@ describe("VRAnnotationTool — draft state machine", () => {
     expect(tool._draft).toBeNull();
   });
 
+  it("confirmDraft() carries pointId/cellId/pickActorRole through from the resolved hit", () => {
+    tool._context.handler.raycastVR = vi.fn(() => ({
+      position: { x: 1, y: 2, z: 3 },
+      normal: { x: 0, y: 1, z: 0 },
+      pointId: 42,
+      cellId: 7,
+      actorRole: "source",
+    }));
+
+    pull();
+    const action = tool.confirmDraft();
+
+    expect(action.data.pointId).toBe(42);
+    expect(action.data.cellId).toBe(7);
+    expect(action.data.pickActorRole).toBe("source");
+  });
+
+  it("confirmDraft() defaults pointId/cellId/pickActorRole to null when the hit carried none", () => {
+    // The default beforeEach mock's hit has no pointId/cellId/actorRole.
+    pull();
+    const action = tool.confirmDraft();
+
+    expect(action.data.pointId).toBeNull();
+    expect(action.data.cellId).toBeNull();
+    expect(action.data.pickActorRole).toBeNull();
+  });
+
   it("confirmDraft() with an empty buffer falls back to the preset selected at placement time", () => {
     tool.cycleLabel(); // -> ANNOTATION_LABEL_PRESETS[1] ("Anomaly")
     pull();
@@ -210,5 +237,92 @@ describe("VRAnnotationTool — draft state machine", () => {
       expect(tool._markerActors.has(annotation.id)).toBe(false);
       expect(renderer.actors.length).toBe(0);
     });
+  });
+});
+
+// Regression coverage for the right-hand-hardcoding bug: handleInput used to
+// always read controllers.right, so a LEFT-hand-only trigger pull was
+// silently ignored. It now reads inputState.activePointerHand (set by
+// VRExplorationManager._resolveActivePointerHand), defaulting to 'right' when
+// absent (e.g. these older makeInputState fixtures, matching legacy behavior).
+describe("VRAnnotationTool — active-hand arbitration", () => {
+  let tool;
+
+  function makeTwoHandInputState({
+    leftTriggerPressed = false,
+    rightTriggerPressed = false,
+    activePointerHand,
+  } = {}) {
+    return {
+      activePointerHand,
+      controllers: {
+        left: {
+          targetRay: { position: { x: -1, y: 0, z: 0 }, matrix: new Array(16).fill(0) },
+          triggerPressed: leftTriggerPressed,
+          thumbstick: { x: 0, y: 0 },
+          buttons: { a: false },
+        },
+        right: {
+          targetRay: { position: { x: 1, y: 0, z: 0 }, matrix: new Array(16).fill(0) },
+          triggerPressed: rightTriggerPressed,
+          thumbstick: { x: 0, y: 0 },
+          buttons: { a: false },
+        },
+      },
+    };
+  }
+
+  beforeEach(async () => {
+    tool = new VRAnnotationTool();
+    await tool.activate({
+      handler: {
+        raycastVR: vi.fn(() => ({ position: { x: 1, y: 2, z: 3 }, normal: { x: 0, y: 1, z: 0 } })),
+      },
+      vrContext: { vrScale: 1 },
+    });
+  });
+
+  it("places an annotation on a LEFT trigger rising edge when activePointerHand is 'left'", () => {
+    const action = tool.handleInput(
+      makeTwoHandInputState({ leftTriggerPressed: true, activePointerHand: "left" }),
+      {}
+    );
+    expect(action).toMatchObject({ type: "annotation-pending" });
+  });
+
+  it("does NOT place on a right trigger pull when activePointerHand is 'left' (right isn't read)", () => {
+    const action = tool.handleInput(
+      makeTwoHandInputState({ rightTriggerPressed: true, activePointerHand: "left" }),
+      {}
+    );
+    expect(action).toBeNull();
+  });
+
+  it("recognizes a hand switch as a fresh rising edge: right already latched held, left pulled for the first time", () => {
+    // Simulate the right trigger already being down from a prior frame (per-
+    // hand latch, set directly rather than by routing a whole extra
+    // handleInput frame — same pattern the marker-rendering test above uses).
+    // With the OLD single-scalar _lastTriggerState, this would have made
+    // `triggerPressed && !this._lastTriggerState` false for EVERY hand once
+    // any hand's press latched it true — corrupting left's own edge detection.
+    tool._lastTriggerState.right = true;
+
+    const leftAction = tool.handleInput(
+      makeTwoHandInputState({
+        rightTriggerPressed: true,
+        leftTriggerPressed: true,
+        activePointerHand: "left",
+      }),
+      {}
+    );
+    expect(leftAction).toMatchObject({ type: "annotation-pending" });
+  });
+
+  it("defaults to 'right' when activePointerHand is absent (back-compat with older callers/tests)", () => {
+    const action = tool.handleInput(
+      makeTwoHandInputState({ rightTriggerPressed: true, activePointerHand: undefined }),
+      {}
+    );
+    expect(action).toMatchObject({ type: "annotation-pending" });
   });
 });

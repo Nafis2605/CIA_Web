@@ -39,7 +39,13 @@ vi.mock('@Services/apiClient.js', () => ({
   ApiError: class ApiError extends Error {},
 }));
 
+vi.mock('@Services/builtInDatasets.js', () => ({
+  isBuiltInDatasetId: (id) => typeof id === 'string' && id.startsWith('builtin-'),
+  resolveBuiltInDatasetId: vi.fn(),
+}));
+
 import { DatasetManager, isBuiltInDataset } from '../DatasetManager.js';
+import { resolveBuiltInDatasetId } from '@Services/builtInDatasets.js';
 
 /**
  * Build a DatasetManager whose IndexedDB-backed methods are stubbed so the
@@ -142,5 +148,80 @@ describe('DatasetManager.reconcileWithServer — built-in exemption', () => {
     expect(result.orphansRemoved).toBe(1);
     expect(mgr._deleteDataset).toHaveBeenCalledWith('orphan-1');
     expect(mgr._datasets.has('orphan-1')).toBe(false);
+  });
+});
+
+describe('DatasetManager — built-in dataset id alias', () => {
+  beforeEach(() => {
+    resolveBuiltInDatasetId.mockReset();
+  });
+
+  test('addBuiltInDataset eagerly resolves and registers the alias, so getDataset finds it by either id', async () => {
+    const mgr = makeManager([]);
+    let resolveFn;
+    resolveBuiltInDatasetId.mockReturnValue(
+      new Promise((resolve) => {
+        resolveFn = resolve;
+      })
+    );
+
+    const dataset = mgr.addBuiltInDataset({
+      id: 'builtin-lungs',
+      name: 'Lungs',
+      path: '/vtp_files/Lungs.vtp',
+    });
+
+    // Resolution hasn't completed yet — only the local key hits.
+    expect(mgr.getDataset('builtin-lungs')).toBe(dataset);
+    expect(mgr.getDataset('server-uuid-lungs')).toBeNull();
+
+    resolveFn('server-uuid-lungs');
+    await Promise.resolve();
+    await Promise.resolve(); // let addBuiltInDataset's .then() run after the resolve
+
+    expect(mgr.getDataset('server-uuid-lungs')).toBe(dataset);
+    expect(mgr.getDataset('builtin-lungs')).toBe(dataset);
+    expect(dataset.serverId).toBe('server-uuid-lungs');
+  });
+
+  test('a failed alias resolution does not throw and leaves local-key lookup working', async () => {
+    const mgr = makeManager([]);
+    resolveBuiltInDatasetId.mockRejectedValue(new Error('network down'));
+
+    let dataset;
+    expect(() => {
+      dataset = mgr.addBuiltInDataset({
+        id: 'builtin-bones',
+        name: 'Bones',
+        path: '/vtp_files/Bones.vtp',
+      });
+    }).not.toThrow();
+
+    await new Promise((resolve) => setTimeout(resolve, 0)); // flush the rejected chain
+
+    expect(mgr.getDataset('builtin-bones')).toBe(dataset);
+  });
+
+  test('registerBuiltInDatasetAlias is idempotent', () => {
+    const mgr = makeManager([]);
+    resolveBuiltInDatasetId.mockReturnValue(new Promise(() => {})); // never resolves — isolate from addBuiltInDataset's own resolution
+    const dataset = mgr.addBuiltInDataset({
+      id: 'builtin-heart',
+      name: 'Heart',
+      path: '/vtp_files/Heart.vtp',
+    });
+
+    mgr.registerBuiltInDatasetAlias('builtin-heart', 'uuid-heart');
+    mgr.registerBuiltInDatasetAlias('builtin-heart', 'uuid-heart');
+
+    expect(mgr.getDataset('uuid-heart')).toBe(dataset);
+    expect(dataset.serverId).toBe('uuid-heart');
+  });
+
+  test('registerBuiltInDatasetAlias is a no-op when either id is missing', () => {
+    const mgr = makeManager([]);
+    expect(() => mgr.registerBuiltInDatasetAlias(null, 'uuid-x')).not.toThrow();
+    expect(() => mgr.registerBuiltInDatasetAlias('builtin-x', null)).not.toThrow();
+    expect(mgr.getDataset('uuid-x')).toBeNull();
   });
 });

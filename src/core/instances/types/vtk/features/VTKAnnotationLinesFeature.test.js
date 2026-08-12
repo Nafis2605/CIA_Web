@@ -3,6 +3,7 @@
 // via AnnotationManager events, malformed content handling, and cleanup.
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createFakeCtx } from "@/test/fakeCanvas.js";
+import vtkActor from "@kitware/vtk.js/Rendering/Core/Actor";
 
 vi.mock("@Utils/logger.js", () => {
   const mkLog = () => ({ info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() });
@@ -19,6 +20,12 @@ vi.mock("@Services/apiClient.js", () => ({
 let mockAnnotationManager = null;
 vi.mock("@Init/appInitializer.js", () => ({
   getAnnotationManager: vi.fn(() => mockAnnotationManager),
+}));
+
+const mockResolveBuiltInDatasetId = vi.fn();
+vi.mock("@Services/builtInDatasets.js", () => ({
+  isBuiltInDatasetId: (id) => typeof id === "string" && id.startsWith("builtin-"),
+  resolveBuiltInDatasetId: (id) => mockResolveBuiltInDatasetId(id),
 }));
 
 import {
@@ -101,6 +108,7 @@ let getContextSpy;
 beforeEach(() => {
   mockAnnotationManager = null;
   mockApiClient.get.mockReset().mockResolvedValue({ annotations: [] });
+  mockResolveBuiltInDatasetId.mockReset();
 
   // Labels are now VRTextBillboards (canvas2D -> vtkTexture), and jsdom has
   // no real <canvas> 2D context -- stub it the same way
@@ -196,6 +204,10 @@ describe("parsePointAnnotation", () => {
     expect(parsed).toEqual({
       id: "pt-1",
       position: [1, 2, 3],
+      localPosition: null,
+      pointId: null,
+      cellId: null,
+      pickActorRole: null,
       text: "VR marker",
       color: [1, 0, 0],
       authorName: null,
@@ -842,5 +854,220 @@ describe("VTKAnnotationLinesFeature _computePointRadius", () => {
     };
 
     expect(() => feature._computePointRadius(state)).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Built-in dataset id resolution: instanceData.datasetId carries the local
+// manifest key (e.g. "builtin-lungs") for built-in datasets, but
+// AnnotationManager's events and the /annotations REST endpoint key on the
+// dataset's real server UUID. Without resolving up front, live events never
+// match state.datasetId and the initial fetch sends the wrong id.
+// ---------------------------------------------------------------------------
+
+describe("VTKAnnotationLinesFeature built-in dataset id resolution", () => {
+  it("resolves a built-in datasetId to its server UUID before the initial fetch", async () => {
+    mockResolveBuiltInDatasetId.mockResolvedValue("server-uuid-lungs");
+    mockApiClient.get.mockResolvedValue({ annotations: [] });
+
+    const feature = new VTKAnnotationLinesFeature();
+    const sceneObjects = makeMockSceneObjects();
+    await feature.initialize("inst-1", { sceneObjects, datasetId: "builtin-lungs" });
+
+    expect(mockResolveBuiltInDatasetId).toHaveBeenCalledWith("builtin-lungs");
+    expect(mockApiClient.get).toHaveBeenCalledWith("/annotations?fileId=server-uuid-lungs");
+    expect(feature.getState("inst-1").datasetId).toBe("server-uuid-lungs");
+
+    await feature.cleanup("inst-1");
+  });
+
+  it("does not filter out a live event carrying the resolved UUID as datasetId", async () => {
+    mockResolveBuiltInDatasetId.mockResolvedValue("server-uuid-lungs");
+    mockAnnotationManager = makeFakeAnnotationManager();
+
+    const feature = new VTKAnnotationLinesFeature();
+    const sceneObjects = makeMockSceneObjects();
+    await feature.initialize("inst-1", { sceneObjects, datasetId: "builtin-lungs" });
+
+    mockAnnotationManager._emit("annotationAdded", {
+      datasetId: "server-uuid-lungs",
+      annotation: makeMeasurementAnnotation(),
+    });
+
+    expect(feature.getState("inst-1").measurementCount).toBe(1);
+
+    await feature.cleanup("inst-1");
+  });
+
+  it("falls back to the raw local key when resolution fails, rather than nulling the scope out", async () => {
+    mockResolveBuiltInDatasetId.mockResolvedValue(null);
+    mockApiClient.get.mockResolvedValue({ annotations: [] });
+
+    const feature = new VTKAnnotationLinesFeature();
+    const sceneObjects = makeMockSceneObjects();
+    await feature.initialize("inst-1", { sceneObjects, datasetId: "builtin-lungs" });
+
+    expect(feature.getState("inst-1").datasetId).toBe("builtin-lungs");
+    expect(mockApiClient.get).toHaveBeenCalledWith("/annotations?fileId=builtin-lungs");
+
+    await feature.cleanup("inst-1");
+  });
+
+  it("resolves a built-in datasetId in setDatasetId too", async () => {
+    mockResolveBuiltInDatasetId.mockResolvedValue("server-uuid-bones");
+    mockApiClient.get.mockResolvedValue({ annotations: [] });
+
+    const feature = new VTKAnnotationLinesFeature();
+    const sceneObjects = makeMockSceneObjects();
+    await feature.initialize("inst-1", { sceneObjects, datasetId: "ds-1" });
+
+    await feature.setDatasetId("inst-1", "builtin-bones");
+
+    expect(mockResolveBuiltInDatasetId).toHaveBeenCalledWith("builtin-bones");
+    expect(feature.getState("inst-1").datasetId).toBe("server-uuid-bones");
+
+    await feature.cleanup("inst-1");
+  });
+
+  it("does not resolve (and does not call the service) for a non-built-in datasetId", async () => {
+    const feature = new VTKAnnotationLinesFeature();
+    const sceneObjects = makeMockSceneObjects();
+    await feature.initialize("inst-1", { sceneObjects, datasetId: "ds-1" });
+
+    expect(mockResolveBuiltInDatasetId).not.toHaveBeenCalled();
+    expect(feature.getState("inst-1").datasetId).toBe("ds-1");
+
+    await feature.cleanup("inst-1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Actor-parenting: a point annotation with a recoverable local-space point
+// (metadata.localPosition) gets its marker actor's UserMatrix set to the
+// data actor's CURRENT matrix, so it stays glued to the mesh when that actor
+// is later rotated/translated/scaled (VR two-hand twist) instead of staying
+// pinned at a world position baked in at pick time. Annotations without a
+// recoverable local point (glyph/derived-actor picks, legacy annotations)
+// render exactly as before — world-space center, never re-anchored.
+// ---------------------------------------------------------------------------
+
+describe("VTKAnnotationLinesFeature actor-parenting", () => {
+  function makeMockSceneObjectsWithActor(matrix) {
+    const sceneObjects = makeMockSceneObjects();
+    const dataActor = vtkActor.newInstance();
+    dataActor.setUserMatrix(matrix);
+    sceneObjects.actor = dataActor;
+    return sceneObjects;
+  }
+
+  const MATRIX_A = [1, 0, 0, 5, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]; // translate +5 X
+  const MATRIX_B = [1, 0, 0, 0, 0, 1, 0, 9, 0, 0, 1, 0, 0, 0, 0, 1]; // translate +9 Y
+
+  function makeAnchoredPointAnnotation(overrides = {}) {
+    return makePointAnnotation({
+      id: "pt-anchored",
+      metadata: {
+        source: "vr",
+        color: [1, 0, 0],
+        pointId: 3,
+        cellId: 7,
+        pickActorRole: "source",
+        localPosition: [0.1, 0.2, 0.3],
+      },
+      ...overrides,
+    });
+  }
+
+  it("sets the marker actor's UserMatrix to the data actor's current matrix at creation", async () => {
+    mockAnnotationManager = makeFakeAnnotationManager();
+
+    const feature = new VTKAnnotationLinesFeature();
+    const sceneObjects = makeMockSceneObjectsWithActor(MATRIX_A);
+    await feature.initialize("inst-1", { sceneObjects, datasetId: "ds-1" });
+
+    mockAnnotationManager._emit("annotationAdded", {
+      datasetId: "ds-1",
+      annotation: makeAnchoredPointAnnotation(),
+    });
+
+    const entry = feature.instanceStates.get("inst-1").points.get("pt-anchored");
+    expect(entry.anchored).toBe(true);
+    expect(entry.actor.getMatrix()).toEqual(sceneObjects.actor.getMatrix());
+
+    await feature.cleanup("inst-1");
+  });
+
+  it("syncActorTransforms re-applies a NEW data-actor matrix to anchored markers only", async () => {
+    mockAnnotationManager = makeFakeAnnotationManager();
+
+    const feature = new VTKAnnotationLinesFeature();
+    const sceneObjects = makeMockSceneObjectsWithActor(MATRIX_A);
+    await feature.initialize("inst-1", { sceneObjects, datasetId: "ds-1" });
+
+    mockAnnotationManager._emit("annotationAdded", {
+      datasetId: "ds-1",
+      annotation: makeAnchoredPointAnnotation(),
+    });
+    // A non-anchored marker (no localPosition) — must be left untouched.
+    mockAnnotationManager._emit("annotationAdded", {
+      datasetId: "ds-1",
+      annotation: makePointAnnotation({ id: "pt-unanchored" }),
+    });
+
+    // getMatrix() returns a live internal array that vtk.js mutates in
+    // place on the next recompute — snapshot a COPY, or "before" would
+    // silently become "after" once the actor's matrix changes underneath it.
+    const anchoredBefore = Array.from(
+      feature.instanceStates.get("inst-1").points.get("pt-anchored").actor.getMatrix()
+    );
+    const unanchoredBefore = Array.from(
+      feature.instanceStates.get("inst-1").points.get("pt-unanchored").actor.getMatrix()
+    );
+
+    sceneObjects.actor.setUserMatrix(MATRIX_B);
+    feature.syncActorTransforms("inst-1");
+
+    const anchoredEntry = feature.instanceStates.get("inst-1").points.get("pt-anchored");
+    const unanchoredEntry = feature.instanceStates.get("inst-1").points.get("pt-unanchored");
+    expect(Array.from(anchoredEntry.actor.getMatrix())).toEqual(Array.from(sceneObjects.actor.getMatrix()));
+    expect(Array.from(anchoredEntry.actor.getMatrix())).not.toEqual(anchoredBefore);
+    // Non-anchored marker's transform is untouched by the sync call.
+    expect(Array.from(unanchoredEntry.actor.getMatrix())).toEqual(unanchoredBefore);
+
+    await feature.cleanup("inst-1");
+  });
+
+  it("syncActorTransforms is a no-op (no throw) for an unknown instance or a data actor with no getMatrix", async () => {
+    const feature = new VTKAnnotationLinesFeature();
+    expect(() => feature.syncActorTransforms("no-such-instance")).not.toThrow();
+
+    mockAnnotationManager = makeFakeAnnotationManager();
+    const sceneObjects = makeMockSceneObjects(); // no `actor` at all
+    await feature.initialize("inst-1", { sceneObjects, datasetId: "ds-1" });
+    expect(() => feature.syncActorTransforms("inst-1")).not.toThrow();
+
+    await feature.cleanup("inst-1");
+  });
+
+  it("renders exactly as before (world-space center, never anchored) for an annotation with no recoverable local position", async () => {
+    mockAnnotationManager = makeFakeAnnotationManager();
+
+    const feature = new VTKAnnotationLinesFeature();
+    const sceneObjects = makeMockSceneObjectsWithActor(MATRIX_A);
+    await feature.initialize("inst-1", { sceneObjects, datasetId: "ds-1" });
+
+    mockAnnotationManager._emit("annotationAdded", {
+      datasetId: "ds-1",
+      annotation: makePointAnnotation({ id: "pt-legacy" }), // no metadata.localPosition
+    });
+
+    const entry = feature.instanceStates.get("inst-1").points.get("pt-legacy");
+    expect(entry.anchored).toBe(false);
+    expect(entry.sphereSource.getCenter()).toEqual([1, 2, 3]); // world position, per makePointAnnotation
+    // Regression guard: setUserMatrix was never called on this actor, so its
+    // matrix stays plain identity, NOT the data actor's matrix.
+    expect(entry.actor.getMatrix()).not.toEqual(sceneObjects.actor.getMatrix());
+
+    await feature.cleanup("inst-1");
   });
 });

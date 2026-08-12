@@ -88,6 +88,67 @@ describe("VRAnnotationTool — preset label", () => {
     expect(pending.data.pickActorRole).toBeNull();
   });
 
+  it("resolves localPosition from the hit actor's polydata for a resolvable source-role pick", () => {
+    const fakeActor = {
+      getMapper: () => ({
+        getInputData: () => ({
+          getPoints: () => ({
+            getData: () => new Float64Array([0, 0, 0, 0.1, 0.2, 0.3, 9, 9, 9]),
+          }),
+        }),
+      }),
+    };
+    tool._context.handler.raycastVR = vi.fn(() => ({
+      position: { x: 1, y: 2, z: 3 },
+      normal: { x: 0, y: 1, z: 0 },
+      pointId: 1,
+      cellId: 7,
+      actorRole: "source",
+      actor: fakeActor,
+    }));
+
+    const pending = tool.handleInput(makeInputState({ triggerPressed: true }), {});
+
+    expect(pending.data.localPosition).toEqual({ x: 0.1, y: 0.2, z: 0.3 });
+  });
+
+  it("does not resolve localPosition for a glyph/threshold/isosurface (derived-actor) pick", () => {
+    const fakeActor = {
+      getMapper: () => ({
+        getInputData: () => ({
+          getPoints: () => ({ getData: () => new Float32Array([0.1, 0.2, 0.3]) }),
+        }),
+      }),
+    };
+    tool._context.handler.raycastVR = vi.fn(() => ({
+      position: { x: 1, y: 2, z: 3 },
+      normal: { x: 0, y: 1, z: 0 },
+      pointId: 0,
+      cellId: 7,
+      actorRole: "glyph",
+      actor: fakeActor,
+    }));
+
+    const pending = tool.handleInput(makeInputState({ triggerPressed: true }), {});
+
+    expect(pending.data.localPosition).toBeNull();
+  });
+
+  it("does not resolve localPosition when pointId is unresolved (-1 or null)", () => {
+    tool._context.handler.raycastVR = vi.fn(() => ({
+      position: { x: 1, y: 2, z: 3 },
+      normal: { x: 0, y: 1, z: 0 },
+      pointId: -1,
+      cellId: -1,
+      actorRole: "source",
+      actor: { getMapper: () => ({ getInputData: () => ({ getPoints: () => ({ getData: () => [] }) }) }) },
+    }));
+
+    const pending = tool.handleInput(makeInputState({ triggerPressed: true }), {});
+
+    expect(pending.data.localPosition).toBeNull();
+  });
+
   it("placing an annotation carries the currently-selected label, not a hardcoded placeholder", () => {
     tool.cycleLabel(); // -> ANNOTATION_LABEL_PRESETS[1] ("Anomaly")
     const pending = tool.handleInput(makeInputState({ triggerPressed: true }), {});
@@ -287,7 +348,10 @@ describe("VRAnnotationTool — marker rendering", () => {
     // _suppressUntilRelease, which (by design) requires an observed trigger
     // release before the next rising edge is honoured — simulate that
     // release directly rather than routing a whole extra handleInput frame.
-    tool._lastTriggerState = false;
+    // _lastTriggerState is now keyed per-hand (see VRAnnotationTool.js);
+    // these tests default to the right hand (makeInputState only sets
+    // controllers.right).
+    tool._lastTriggerState.right = false;
     tool._suppressUntilRelease = false;
     place();
 
