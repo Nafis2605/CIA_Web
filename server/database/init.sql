@@ -600,9 +600,21 @@ CREATE TABLE vr_exploration_sessions (
     dataset_id UUID REFERENCES datasets(id) ON DELETE SET NULL,
     project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
 
+    -- Room scope (021_vr_session_room_scope.sql). Nullable: a legacy/
+    -- unattributed session may have no resolvable room (null project_id, or
+    -- a project with no main room) — the wsManager.vr* broadcast helpers
+    -- treat a null room_id as "no audience" rather than blocking. New
+    -- sessions are required to supply a roomId at the route layer.
+    room_id UUID REFERENCES rooms(id) ON DELETE CASCADE,
+
     -- Owner information
     owner_user_id VARCHAR(255) NOT NULL,
     owner_user_name VARCHAR(255),
+    -- Account+device composite (buildParticipantId() in
+    -- server/src/routes/vr.js) for the session creator. owner_user_id alone
+    -- is account-level, so the same account signed in on two devices would
+    -- both read as "host" via VRManipulationLock.isHost() without this.
+    owner_participant_id VARCHAR(255),
 
     -- Session scope
     selection_type VARCHAR(20) DEFAULT 'full' CHECK (selection_type IN ('full', 'region', 'selection')),
@@ -623,22 +635,65 @@ CREATE TABLE vr_exploration_sessions (
 
     -- Client-generated stable collaboration id (see _tryRegisterSession in
     -- VRExplorationManager.js), separate from this row's own PK so a late
-    -- server response can always be reconciled unambiguously.
+    -- server response can always be reconciled unambiguously. Uniqueness is
+    -- scoped to (room_id, client_session_key) below, not global — two rooms
+    -- exploring the same dataset would otherwise mint the same key and the
+    -- second room's POST /vr/sessions would 500 on a global unique clash.
+    -- NOTE (023_vr_session_lifecycle.sql): despite what this column's name
+    -- suggests, it carries NO dataset identity — it's session.id, a fresh
+    -- per-VR-entry-ATTEMPT random string. dataset_sync_key below is the real
+    -- per-dataset identity; see 023's header for the full correction.
     client_session_key VARCHAR(64),
+
+    -- Session lifecycle (023_vr_session_lifecycle.sql). dataset_sync_key
+    -- carries resolveViewSyncKey()'s value (dataset id first, viewConfigId
+    -- fallback) — VARCHAR, not the UUID dataset_id column above, because
+    -- built-in demo datasets are nulled out of dataset_id by asUuidOrNull()
+    -- (server/src/routes/vr.js) and need a non-UUID-safe identity column.
+    -- Enforces one active (non-'ended') session per (room, dataset) via
+    -- ux_vr_sessions_room_dataset_active below — a losing POST /sessions
+    -- adopts the winner's row instead of erroring (see vr.js). last_heartbeat_at
+    -- feeds reapStaleVrSessions()'s lazy expiry (no sweeper job, same house
+    -- style as the manipulation lease's stale reclaim) — fed by
+    -- POST /sessions/:id/heartbeat, distinct from the manipulation lease's own
+    -- POST .../lease/heartbeat.
+    dataset_sync_key VARCHAR(255),
+    last_heartbeat_at TIMESTAMPTZ,
+
+    -- Manipulation lease (022_vr_manipulation_lease.sql). Strictly 1:1 with
+    -- this row, so it lives as columns rather than a separate table — an
+    -- atomic UPDATE...WHERE (server/src/routes/vr.js's POST .../lease) is
+    -- the compare-and-swap. lease_epoch is the fencing token: it increments
+    -- on every acquire/grant, and the heartbeat route requires it to match
+    -- so a preempted holder can never extend a lease that is no longer
+    -- theirs. Stale-lease reclaim is lazy (evaluated only in the acquire
+    -- WHERE clause via lease_expires_at < NOW()) — no sweeper job.
+    revision BIGINT NOT NULL DEFAULT 0,
+    lease_participant_id VARCHAR(255),
+    lease_user_name VARCHAR(255),
+    lease_expires_at TIMESTAMPTZ,
+    lease_epoch BIGINT NOT NULL DEFAULT 0,
 
     -- Timestamps
     created_at TIMESTAMPTZ DEFAULT NOW(),
     started_at TIMESTAMPTZ,
     ended_at TIMESTAMPTZ,
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-
-    CONSTRAINT vr_sessions_client_key_unique UNIQUE (client_session_key)
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE INDEX idx_vr_sessions_project ON vr_exploration_sessions(project_id);
 CREATE INDEX idx_vr_sessions_owner ON vr_exploration_sessions(owner_user_id);
 CREATE INDEX idx_vr_sessions_status ON vr_exploration_sessions(status);
 CREATE INDEX idx_vr_sessions_dataset ON vr_exploration_sessions(dataset_id);
+CREATE UNIQUE INDEX ux_vr_sessions_room_client_key
+    ON vr_exploration_sessions(room_id, client_session_key) WHERE client_session_key IS NOT NULL;
+CREATE INDEX idx_vr_sessions_room_active
+    ON vr_exploration_sessions(room_id, status) WHERE status <> 'ended';
+CREATE UNIQUE INDEX ux_vr_sessions_room_dataset_active
+    ON vr_exploration_sessions(room_id, dataset_sync_key)
+    WHERE dataset_sync_key IS NOT NULL AND room_id IS NOT NULL AND status <> 'ended';
+CREATE INDEX idx_vr_sessions_liveness
+    ON vr_exploration_sessions(last_heartbeat_at) WHERE status <> 'ended';
 
 CREATE TABLE vr_session_participants (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -1356,6 +1411,30 @@ VALUES
     ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000004', 'member'),
     ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000005', 'viewer')
 ON CONFLICT (project_id, user_id) DO UPDATE SET role = EXCLUDED.role;
+
+-- Add all project members to every PUBLIC room in the project.
+--
+-- Not cosmetic. room_members used to be seeded nowhere at all, and two guards
+-- read it directly with no DEV_BYPASS_AUTH short-circuit:
+-- resolveRoomAccess() (server/src/routes/vr.js) and
+-- wsManager._checkRoomAccess() (server/src/services/websocket.js). With the
+-- table empty, both fell back to the "is_public AND project_members" branch,
+-- which passes for these five seeded UUIDs but fails for any real headset --
+-- those use a per-device UUID (src/core/identity/deviceIdentity.js) that is
+-- in no project. The WS denial left wsManager.roomChannels empty, so every
+-- room-scoped VR broadcast reached zero sockets and two headsets in one room
+-- could never see each other.
+--
+-- Device identities are now provisioned on first API call by
+-- grantDevMemberships() in server/src/middleware/auth.js; this seeds the
+-- fixed dev users so a fresh database starts consistent, and
+-- 024_backfill_public_room_members.sql does the same for existing volumes.
+INSERT INTO room_members (room_id, user_id, role)
+SELECT r.id, pm.user_id, 'member'
+  FROM rooms r
+  JOIN project_members pm ON pm.project_id = r.project_id
+ WHERE r.is_public = true
+ON CONFLICT (room_id, user_id) DO NOTHING;
 
 -- Add all test users as organization members
 INSERT INTO organization_members (organization_id, user_id, role)

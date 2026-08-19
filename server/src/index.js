@@ -18,6 +18,7 @@ const { server: log, db, http: httpLog } = require("./utils/logger");
 
 const { createRecordingService } = require("./services/recordingService");
 const thumbnailService = require("./services/thumbnailService");
+const { runMigrations } = require("./services/migrationRunner");
 const { createMatrixBridge } = require("./services/matrixBridge");
 const { startPruningSchedule, PRUNING_ENABLED } = require("./services/syncEventPruning");
 const { startCleanupSchedule: startWorkspaceCleanup } = require("./services/workspaceCleanupService");
@@ -524,6 +525,20 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 // ============================================================================
 
 server.listen(PORT, async () => {
+  // Bring the schema up to date BEFORE anything serves a request. Postgres
+  // only runs init.sql on a brand-new data directory, so on any pre-existing
+  // volume a new migration would otherwise never be applied — and routes bind
+  // its columns unconditionally. An unmigrated database therefore fails as an
+  // opaque 500 that the VR client degrades past silently, rather than as
+  // anything a developer would recognise. Refusing to start is the honest
+  // outcome. See server/src/services/migrationRunner.js.
+  try {
+    await runMigrations(pool);
+  } catch (err) {
+    log.error(`FATAL: database migrations failed — refusing to serve: ${err.message}`);
+    process.exit(1);
+  }
+
   log.info(`CIA Web API server v2.0 running on port ${PORT}`);
   log.info(`Architecture: Server-Authority`);
   log.info(`Environment: ${process.env.NODE_ENV || "development"}`);

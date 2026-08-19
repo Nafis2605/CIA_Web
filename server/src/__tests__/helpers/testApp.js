@@ -32,7 +32,18 @@ function createTestApp(pool, options = {}) {
     viewUpdated: () => {},
     annotationUpdated: () => {},
     broadcastToProject: () => {},
+    broadcastToRoom: () => {},
     broadcast: () => {},
+    // vr.js calls these seven directly (not broadcastToProject/broadcastToRoom)
+    // — see server/src/services/websocket.js:771-862 (the original six) plus
+    // vrLeaseChanged (Phase D1/D2, added just below them in that file).
+    vrSessionCreated: () => {},
+    vrSessionUpdated: () => {},
+    vrSessionEnded: () => {},
+    vrParticipantJoined: () => {},
+    vrParticipantLeft: () => {},
+    vrSnapshotCreated: () => {},
+    vrLeaseChanged: () => {},
   };
 
   // Mount routes
@@ -41,6 +52,7 @@ function createTestApp(pool, options = {}) {
   const viewgroupsRouter = require('../../routes/viewgroups');
   const syncRouter = require('../../routes/sync');
   const workspacesRouter = require('../../routes/workspaces');
+  const vrRouter = require('../../routes/vr');
 
   // Auth middleware (reads x-user-id header in dev bypass mode)
   const { authenticate, optionalAuth } = require('../../middleware/auth');
@@ -50,6 +62,10 @@ function createTestApp(pool, options = {}) {
   app.use('/api/viewgroups', authenticate, viewgroupsRouter);
   app.use('/api/sync', authenticate, syncRouter);
   app.use('/api/workspaces', authenticate, workspacesRouter);
+  // Matches the real production mount (server/src/index.js) — optionalAuth,
+  // not authenticate, so an unauthenticated request correctly resolves
+  // req.user = null instead of always defaulting to a dev user.
+  app.use('/api/vr', optionalAuth, vrRouter);
 
   // Restore env
   if (devBypassAuth) {

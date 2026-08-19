@@ -18,6 +18,12 @@ export class VRToolInterface {
     this.name = config.name;
     this.icon = config.icon;
     this.category = config.category || 'general';
+    // When true, VRToolManager marks vrContext._exactSourcePickActive while
+    // this tool is active, so the VR reticle's raycast matches this tool's
+    // own (see raycastVR's excludeDerivedActors fallback in
+    // VTKInstanceHandler.js) instead of hitting derived geometry the tool
+    // itself can't select.
+    this.exactSourcePicking = !!config.exactSourcePicking;
 
     this._isActive = false;
     this._context = null;

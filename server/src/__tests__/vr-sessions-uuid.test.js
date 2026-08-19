@@ -53,11 +53,30 @@ describe('POST /vr/sessions — UUID column sanitization', () => {
     return app;
   }
 
-  function mockPool() {
+  // POST /vr/sessions now requires roomId and passes it through
+  // resolveRoomAccess() (021_vr_session_room_scope.sql / Phase A room
+  // scoping) before ever reaching the INSERT under test here — mock its
+  // "FROM rooms r" membership query too, granting access and echoing back
+  // whatever project_id the caller expects so the room-project-mismatch
+  // branch doesn't fire and these UUID-sanitization assertions still reach
+  // the INSERT unimpeded.
+  function mockPool(roomProjectId) {
     const calls = [];
     const pool = {
       query: jest.fn((sql, params) => {
         calls.push({ sql, params });
+        if (sql.includes('FROM rooms r')) {
+          return Promise.resolve({
+            rows: [{
+              id: params[0],
+              project_id: roomProjectId ?? null,
+              name: 'Mock Room',
+              is_room_member: true,
+              member_role: 'member',
+              via_public_room: false,
+            }],
+          });
+        }
         if (sql.includes('INSERT INTO vr_exploration_sessions')) {
           return Promise.resolve({
             rows: [{ id: params[0], dataset_id: params[2] }],
@@ -69,14 +88,17 @@ describe('POST /vr/sessions — UUID column sanitization', () => {
     return { pool, calls };
   }
 
+  const ROOM_ID = '55555555-5555-5555-5555-555555555555';
+
   test('non-UUID viewConfigurationId/datasetId are nulled; a real projectId UUID passes through', async () => {
-    const { pool, calls } = mockPool();
+    const { pool, calls } = mockPool('22222222-2222-2222-2222-222222222222');
     const app = buildApp(pool);
 
     const res = await request(app).post('/vr/sessions').send({
       viewConfigurationId: 'also-not-a-uuid',
       datasetId: 'builtin-lungs',
       projectId: '22222222-2222-2222-2222-222222222222',
+      roomId: ROOM_ID,
     });
 
     // Registration must succeed instead of raising the Postgres UUID error.
@@ -92,12 +114,12 @@ describe('POST /vr/sessions — UUID column sanitization', () => {
 
   test('a real UUID datasetId is passed through unchanged, not nulled', async () => {
     const realDatasetId = '33333333-3333-3333-3333-333333333333';
-    const { pool, calls } = mockPool();
+    const { pool, calls } = mockPool(null); // no projectId sent below -> no mismatch check
     const app = buildApp(pool);
 
     const res = await request(app)
       .post('/vr/sessions')
-      .send({ datasetId: realDatasetId });
+      .send({ datasetId: realDatasetId, roomId: ROOM_ID });
 
     expect(res.status).toBe(200);
     const sessionInsert = calls.find((c) =>

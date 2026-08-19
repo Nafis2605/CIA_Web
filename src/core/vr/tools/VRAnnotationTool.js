@@ -78,6 +78,7 @@ export class VRAnnotationTool extends VRToolInterface {
       name: 'Annotate',
       icon: 'message-circle',
       category: 'collaboration',
+      exactSourcePicking: true,
     });
 
     this._annotations = [];
@@ -422,6 +423,7 @@ export class VRAnnotationTool extends VRToolInterface {
       // this frame.
       const hit = this._performRaycast(activeCtrl, frame);
       if (hit) return this._openDraft(hit);
+      this._context?.flashNotice?.('No annotation target there — aim at a highlighted surface');
     }
 
     // The thumbstick used to cycle annotation "mode" here. That is gone: it

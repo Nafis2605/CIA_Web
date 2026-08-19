@@ -51,8 +51,16 @@ zero local media infra — you only tunnel the app.
    ngrok http https://localhost:8081
    # or: cloudflared tunnel --url https://localhost:8081
    ```
-5. Open the tunnel URL on each Quest 2 headset. Enter the **same session**
-   (share the session link), enter VR, then join voice from the voice bar.
+5. Open the tunnel URL on each Quest 2 headset, in the **same room** (share the
+   `/projects/:projectId/rooms/:roomId` link), and enter VR.
+
+   Voice connects automatically on VR entry, joined **muted** — the LiveKit room
+   is named after the room id, so both headsets land in the same one. Unmute
+   from the **Mic** button on the spatial menu's session row.
+
+   > Do not expect to use the desktop voice bar from inside a headset: it is DOM
+   > UI, and nothing DOM renders during an immersive WebXR session. Everything
+   > you need in-headset is on the spatial menu.
 
 ## Self-hosted alternative (no Cloud)
 

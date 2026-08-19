@@ -41,6 +41,19 @@ function makeRealActorWithPoints(points) {
   return actor;
 }
 
+/**
+ * As above, but with polys too — required for cell picking, which intersects
+ * triangles rather than consulting a picker.
+ *
+ * @param {number[]} points - flat xyz
+ * @param {number[]} polys - vtk connectivity [n, i0, i1, ..., n, ...]
+ */
+function makeRealActorWithTriangles(points, polys) {
+  const actor = makeRealActorWithPoints(points);
+  actor.getMapper().getInputData().getPolys().setData(Int32Array.from(polys));
+  return actor;
+}
+
 vi.mock("@kitware/vtk.js/Rendering/Core/CellPicker", () => {
   const newInstance = vi.fn(() => ({
     setTolerance: vi.fn(),
@@ -123,11 +136,69 @@ const RAY = { origin: { x: 0, y: 0, z: 0 }, direction: { x: 0, y: 0, z: -1 } };
 // silently kills every VR pick.
 const RAY_ORIGIN_IN_DATA_SPACE = [10, 20, 30, 1.0];
 
-/** Length of the ray handed to the picker, i.e. |p2 - p1|. */
-function pickRayLength(picker) {
-  const [p1, p2] = picker.pick3DPoint.mock.calls[0];
+/** Data-space z the geometry fixture's quad sits at. */
+const QUAD_Z = RAY_ORIGIN_IN_DATA_SPACE[2] - 5;
+
+/**
+ * A VR context whose pick target is a REAL quad with real polys, positioned so
+ * the default RAY hits it dead centre in data space.
+ *
+ * Real geometry rather than a mocked picker: picking is now a direct
+ * ray/triangle intersection (vr/vrRayPick.js), so a mock would assert nothing
+ * about whether a trigger pull actually lands on the mesh — which is precisely
+ * the failure that shipped.
+ */
+function makeGeometryVrContext(overrides = {}) {
+  const [cx, cy] = RAY_ORIGIN_IN_DATA_SPACE;
+  const actor = makeRealActorWithTriangles(
+    [
+      cx - 1, cy - 1, QUAD_Z,
+      cx + 1, cy - 1, QUAD_Z,
+      cx + 1, cy + 1, QUAD_Z,
+      cx - 1, cy + 1, QUAD_Z,
+    ],
+    [3, 0, 1, 2, 3, 0, 2, 3]
+  );
+  return {
+    dataBounds: [cx - 1, cx + 1, cy - 1, cy + 1, QUAD_Z, QUAD_Z],
+    vrScale: 2,
+    vrOrigin: [10, 20, 30],
+    sceneObjects: { renderer: { getActors: () => [actor] }, actor },
+    ...overrides,
+  };
+}
+
+/**
+ * Length of the ray raycastVR would cast for this context, i.e. |p2 - p1|.
+ *
+ * Read from _computeVRPickRayPoints directly. It used to be recovered from the
+ * picker mock's call args, but picking no longer goes through a picker — and
+ * the ray geometry is the part these tests are actually about.
+ */
+function pickRayLength(ctx, ray = RAY) {
+  const { p1, p2 } = handlerForRay._computeVRPickRayPoints(
+    ctx,
+    ray.origin,
+    ray.direction
+  );
   return Math.hypot(p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]);
 }
+
+/** Endpoints raycastVR would cast for this context. */
+function pickRayPoints(ctx, ray = RAY) {
+  const { p1, p2 } = handlerForRay._computeVRPickRayPoints(
+    ctx,
+    ray.origin,
+    ray.direction
+  );
+  return [p1, p2];
+}
+
+/**
+ * _computeVRPickRayPoints reads nothing off the instance, so one shared
+ * handler is enough for the ray-geometry helpers above.
+ */
+const handlerForRay = new VTKInstanceHandler();
 
 describe("VTKInstanceHandler.raycastVR", () => {
   let handler;
@@ -137,102 +208,90 @@ describe("VTKInstanceHandler.raycastVR", () => {
     handler = new VTKInstanceHandler();
   });
 
-  it("uses the world-space pick3DPoint API, not the display-space pick()", () => {
-    const ctx = makeVrContext();
-    handler.raycastVR(ctx, RAY);
-
-    const picker = ctx._vrPicker;
-    expect(picker.pick3DPoint).toHaveBeenCalledTimes(1);
-    expect(picker.pick).not.toHaveBeenCalled();
-
-    // (p1World, p2World, renderer) — the renderer must be the 3rd arg, not the
-    // 2nd (the old signature passed the far point where the renderer belonged).
-    const [p1, p2, renderer] = picker.pick3DPoint.mock.calls[0];
-    expect(p1).toEqual(RAY_ORIGIN_IN_DATA_SPACE);
-    expect(Array.isArray(p2)).toBe(true);
-    expect(renderer).toBe(ctx.sceneObjects.renderer);
-  });
-
-  it("returns null when the picker reports no cell", () => {
-    const ctx = makeVrContext();
-    handler.raycastVR(ctx, RAY); // prime the cached picker
-    ctx._vrPicker.getCellId.mockReturnValue(-1);
-
-    expect(handler.raycastVR(ctx, RAY)).toBeNull();
+  it("returns null when nothing is in the ray's path", () => {
+    // A pick target with no geometry cannot be hit.
+    expect(handler.raycastVR(makeVrContext(), RAY)).toBeNull();
   });
 
   it("returns a hit with data-space position and normal when a cell is picked", () => {
-    const result = handler.raycastVR(makeVrContext(), RAY);
+    const ctx = makeGeometryVrContext();
+    const result = handler.raycastVR(ctx, RAY, { selectionMode: "surface" });
 
-    expect(result).toMatchObject({
-      hit: true,
-      position: { x: 1, y: 2, z: 3 },
-      normal: { x: 0, y: 1, z: 0 },
-      cellId: 42,
-    });
+    expect(result).toMatchObject({ hit: true });
+    expect(result.cellId).toBeGreaterThanOrEqual(0);
+    // The quad sits at z = QUAD_Z in data space, centred on the ray.
+    expect(result.position.x).toBeCloseTo(RAY_ORIGIN_IN_DATA_SPACE[0], 6);
+    expect(result.position.y).toBeCloseTo(RAY_ORIGIN_IN_DATA_SPACE[1], 6);
+    expect(result.position.z).toBeCloseTo(QUAD_Z, 6);
+    // Facing back down +Z toward the controller.
+    expect(Math.abs(result.normal.z)).toBeCloseTo(1, 6);
+
     // Distance is measured from the ray origin to the hit IN DATA SPACE — both
     // endpoints must be in the same space or this number is meaningless.
     const [ox, oy, oz] = RAY_ORIGIN_IN_DATA_SPACE; // w is not part of the metric
-    expect(result.distance).toBeCloseTo(Math.hypot(1 - ox, 2 - oy, 3 - oz));
+    expect(result.distance).toBeCloseTo(
+      Math.hypot(result.position.x - ox, result.position.y - oy, result.position.z - oz)
+    );
   });
 
   it("includes the instance's datasetId in the hit, or null when the instance is unknown", () => {
-    const ctx = makeVrContext();
+    const ctx = makeGeometryVrContext();
     ctx.instanceId = "instance-with-dataset";
     handler.instances.set("instance-with-dataset", { datasetId: "ds-42" });
 
-    const result = handler.raycastVR(ctx, RAY);
-    expect(result.datasetId).toBe("ds-42");
-
-    const ctxNoInstance = makeVrContext();
-    expect(handler.raycastVR(ctxNoInstance, RAY).datasetId).toBeNull();
+    expect(handler.raycastVR(ctx, RAY).datasetId).toBe("ds-42");
+    expect(handler.raycastVR(makeGeometryVrContext(), RAY).datasetId).toBeNull();
   });
 
-  it("does not branch on pick3DPoint's return value (it always returns undefined)", () => {
-    const ctx = makeVrContext();
-    handler.raycastVR(ctx, RAY);
-    ctx._vrPicker.pick3DPoint.mockReturnValue(undefined);
-
-    // getCellId() still reports a hit, so a hit must still come back.
+  it("reports a MISS after a HIT rather than repeating the previous cell", () => {
+    // The old picker-based path needed an explicit picker.initialize() for
+    // this, because pick3DPoint skipped the reset that publicAPI.pick does and
+    // a miss then reported the PREVIOUS pick's cellId — markers stuck to a
+    // stale point. The intersector is stateless, so this holds structurally,
+    // but the behaviour is still worth pinning.
+    const ctx = makeGeometryVrContext();
     expect(handler.raycastVR(ctx, RAY)).not.toBeNull();
+    expect(
+      handler.raycastVR(ctx, {
+        origin: RAY.origin,
+        direction: { x: 0, y: 0, z: 1 }, // now pointing away
+      })
+    ).toBeNull();
   });
 
-  it("reuses one cached picker per VR context instead of allocating per call", () => {
-    const ctx = makeVrContext();
+  it("reuses one cached acceleration structure per polydata instead of rebuilding per call", () => {
+    const ctx = makeGeometryVrContext();
+    const spy = vi.spyOn(handler, "_getPickAccel");
+
     handler.raycastVR(ctx, RAY);
     handler.raycastVR(ctx, RAY);
     handler.raycastVR(ctx, RAY);
 
-    // raycastVR runs at least once per XR frame (~90 Hz) — a fresh picker each
-    // call would be steady allocation churn.
-    expect(vtkCellPicker.newInstance).toHaveBeenCalledTimes(1);
+    // raycastVR runs at least once per XR frame (~90 Hz) — rebuilding the
+    // triangle grid every call would be steady allocation churn.
+    expect(spy).toHaveBeenCalledTimes(3);
+    const results = spy.mock.results.map((r) => r.value);
+    expect(results[0]).not.toBeNull();
+    expect(results[1]).toBe(results[0]);
+    expect(results[2]).toBe(results[0]);
   });
 
   describe("ray length", () => {
     it("scales with dataBounds rather than using a fixed magic number", () => {
-      // CellPicker compares candidates with `t <= tMin + tolerance`, where t is
-      // parametric along p1->p2. A fixed 1000-unit ray over a small dataset
-      // collapses the real hit spread toward t=0 and picks the WRONG cell.
+      // A ray must comfortably cross the dataset it is aimed at; a fixed
+      // 1000-unit ray over a small dataset is mostly empty space, and one
+      // shorter than a large dataset cannot reach the far side of it.
       const small = makeVrContext({ dataBounds: [0, 0.01, 0, 0.01, 0, 0.01] });
       const large = makeVrContext({ dataBounds: [0, 100, 0, 100, 0, 100] });
 
-      handler.raycastVR(small, RAY);
-      handler.raycastVR(large, RAY);
-
-      // Measured as |p2 - p1| rather than a raw coordinate: the ray no longer
-      // starts at the origin (it starts at the data-space image of the
-      // controller), so a bare component is a position, not a length.
-      expect(pickRayLength(large._vrPicker)).toBeGreaterThan(
-        pickRayLength(small._vrPicker)
-      );
-      expect(pickRayLength(small._vrPicker)).not.toBe(1000);
+      expect(pickRayLength(large)).toBeGreaterThan(pickRayLength(small));
+      expect(pickRayLength(small)).not.toBe(1000);
     });
 
     it("clamps to a usable minimum for degenerate (point-like) bounds", () => {
-      const ctx = makeVrContext({ dataBounds: [0, 0, 0, 0, 0, 0] });
-      handler.raycastVR(ctx, RAY);
-
-      expect(pickRayLength(ctx._vrPicker)).toBeGreaterThanOrEqual(1);
+      expect(
+        pickRayLength(makeVrContext({ dataBounds: [0, 0, 0, 0, 0, 0] }))
+      ).toBeGreaterThanOrEqual(1);
     });
   });
 
@@ -271,14 +330,18 @@ describe("VTKInstanceHandler.raycastVR", () => {
       expect(handler._getVRPickTargets(ctx)).toEqual([ctx.sceneObjects.actor]);
     });
 
-    it("scopes the picker to those targets", () => {
-      const ctx = makeVrContext();
-      handler.raycastVR(ctx, RAY);
+    it("intersects only those targets", () => {
+      // Scoping used to be expressed as picker.setPickList(); picking is now a
+      // direct intersection, so the equivalent guarantee is that the resolved
+      // target list is the only geometry consulted.
+      const ctx = makeGeometryVrContext();
+      const spy = vi.spyOn(handler, "_pickCellByRayVR");
 
-      expect(ctx._vrPicker.setPickFromList).toHaveBeenCalledWith(true);
-      expect(ctx._vrPicker.setPickList).toHaveBeenCalledWith([
-        ctx.sceneObjects.actor,
-      ]);
+      const result = handler.raycastVR(ctx, RAY);
+
+      expect(result).not.toBeNull();
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy.mock.calls[0][1]).toEqual([ctx.sceneObjects.actor]);
     });
   });
 
@@ -287,13 +350,16 @@ describe("VTKInstanceHandler.raycastVR", () => {
       const ctx = makeVrContext();
       // Column-major identity: -Z forward is (-m[8], -m[9], -m[10]) = (0,0,-1).
       const matrix = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
-      const result = handler.raycastVR(ctx, {
+      const result = handler.raycastVR(makeGeometryVrContext(), {
         position: { x: 0, y: 0, z: 0 },
         matrix,
       });
 
       expect(result).not.toBeNull();
-      const [near, far] = ctx._vrPicker.pick3DPoint.mock.calls[0];
+      const [near, far] = pickRayPoints(ctx, {
+        origin: { x: 0, y: 0, z: 0 },
+        direction: { x: -matrix[8], y: -matrix[9], z: -matrix[10] },
+      });
       expect(far[2]).toBeLessThan(near[2]); // travelled along -Z from the origin
     });
 
@@ -307,36 +373,25 @@ describe("VTKInstanceHandler.raycastVR", () => {
       // EVERY VR tool — annotate, measure, probe, and the pointer reticle —
       // silently does nothing, with no error to show for it.
       const ctx = makeVrContext({ vrScale: 2, vrOrigin: [10, 20, 30] });
-      handler.raycastVR(ctx, {
+      const [p1] = pickRayPoints(ctx, {
         origin: { x: 2, y: 4, z: -6 },
         direction: { x: 0, y: 0, z: -1 },
       });
-
-      const [p1] = ctx._vrPicker.pick3DPoint.mock.calls[0];
       expect(p1).toEqual([11, 22, 27, 1.0]); // NOT the raw [2, 4, -6]
     });
 
-    it("passes 4-component homogeneous endpoints (w = 1) to the picker", () => {
+    it("produces 4-component homogeneous endpoints (w = 1)", () => {
       // vtkPicker.pick3DPoint forwards these arrays to pick3DInternal WITHOUT
       // appending w (Picker.js:268-284), and pick3DInternal then does
       // vec4.transformMat4 followed by vec3.scale(p, p, 1 / p[3])
       // (Picker.js:103-106). A 3-element array makes w undefined -> NaN
       // everywhere -> getCellId() never leaves -1 -> raycastVR returns null on
       // every call. See the sibling integration test for the end-to-end proof.
-      const ctx = makeVrContext();
-      handler.raycastVR(ctx, RAY);
-
-      const [p1, p2] = ctx._vrPicker.pick3DPoint.mock.calls[0];
+      const [p1, p2] = pickRayPoints(makeVrContext());
       expect(p1).toHaveLength(4);
       expect(p2).toHaveLength(4);
       expect(p1[3]).toBe(1.0);
       expect(p2[3]).toBe(1.0);
-    });
-
-    it("resets picker state before each pick so a miss cannot report a stale cell", () => {
-      const ctx = makeVrContext();
-      handler.raycastVR(ctx, RAY);
-      expect(ctx._vrPicker.initialize).toHaveBeenCalled();
     });
 
     it("leaves the ray DIRECTION unscaled — only the origin is transformed", () => {
@@ -345,13 +400,9 @@ describe("VTKInstanceHandler.raycastVR", () => {
       // direction as well would be a plausible-looking over-correction that
       // silently shortens the ray by a factor of vrScale.
       const ctx = makeVrContext({ vrScale: 4, vrOrigin: [1, 2, 3] });
-      handler.raycastVR(ctx, {
-        origin: { x: 0, y: 0, z: 0 },
-        direction: { x: 0, y: 0, z: -1 },
-      });
-
-      const [p1, p2] = ctx._vrPicker.pick3DPoint.mock.calls[0];
-      const len = pickRayLength(ctx._vrPicker);
+      const ray = { origin: { x: 0, y: 0, z: 0 }, direction: { x: 0, y: 0, z: -1 } };
+      const [p1, p2] = pickRayPoints(ctx, ray);
+      const len = pickRayLength(ctx, ray);
       const unit = [
         (p2[0] - p1[0]) / len,
         (p2[1] - p1[1]) / len,
@@ -373,130 +424,133 @@ describe("VTKInstanceHandler.raycastVR", () => {
   });
 
   describe("pointId resolution", () => {
-    it("resolves the nearest candidate point within the hit cell, and classifies the source actor", () => {
-      const ctx = makeVrContext();
-      handler.raycastVR(ctx, RAY); // prime the cached picker
+    // Aim 0.8 off-centre so exactly one of the quad's four corners is nearest
+    // — dead centre is equidistant from all four and the expected id would be
+    // arbitrary.
+    const OFF = 0.8;
+    const OFFSET_RAY = {
+      origin: { x: OFF * 2, y: OFF * 2, z: 0 }, // XR metres; vrScale is 2
+      direction: { x: 0, y: 0, z: -1 },
+    };
 
-      // Three candidate points for the "hit" cell; (1,0,0) is nearest to the
-      // mocked pick position [1,2,3] (dist2=13 vs 14 and 194).
-      const fakePolyData = {
-        getCellPoints: () => ({ cellType: 5, cellPointIds: [0, 1, 2] }),
-        getPoints: () => ({
-          getData: () => new Float32Array([0, 0, 0, 1, 0, 0, 10, 10, 10]),
-        }),
-      };
-      const hitActor = ctx.sceneObjects.actor;
-      hitActor.getMapper = () => ({ getInputData: () => fakePolyData });
-      ctx._vrPicker.getActors.mockReturnValue([hitActor]);
+    it("resolves the nearest vertex of the hit triangle, and classifies the source actor", () => {
+      const ctx = makeGeometryVrContext();
+      const result = handler.raycastVR(ctx, OFFSET_RAY);
 
-      const result = handler.raycastVR(ctx, RAY);
-      expect(result.pointId).toBe(1);
+      // Corner index 2 is (cx+1, cy+1, QUAD_Z) — the nearest to the hit.
+      expect(result.pointId).toBe(2);
       expect(result.actorRole).toBe("source");
     });
 
     it("snaps position to the resolved vertex's own coordinates, preserving the raw hit as surfacePosition", () => {
       // Regression test for the bug where `position` stayed the raw,
-      // un-snapped cell-picker intersection even though `pointId` names a
-      // specific vertex — the two silently disagreed. Mocked pick position
-      // is [1,2,3] (CellPicker mock default); candidate id 1 at (1,2,2) is
-      // nearest (dist2=1) but is NOT the pick position itself, so a
-      // regression back to the raw surface point is distinguishable.
-      const ctx = makeVrContext();
-      handler.raycastVR(ctx, RAY); // prime the cached picker
+      // un-snapped intersection even though `pointId` names a specific
+      // vertex — the two silently disagreed.
+      const [cx, cy] = RAY_ORIGIN_IN_DATA_SPACE;
+      const result = handler.raycastVR(makeGeometryVrContext(), OFFSET_RAY);
 
-      const fakePolyData = {
-        getCellPoints: () => ({ cellType: 5, cellPointIds: [0, 1, 2] }),
-        getPoints: () => ({
-          getData: () => new Float32Array([0, 0, 0, 1, 2, 2, 10, 10, 10]),
-        }),
-      };
-      const hitActor = ctx.sceneObjects.actor; // no getMatrix -> identity transform
-      hitActor.getMapper = () => ({ getInputData: () => fakePolyData });
-      ctx._vrPicker.getActors.mockReturnValue([hitActor]);
+      expect(result.surfacePosition.x).toBeCloseTo(cx + OFF, 6);
+      expect(result.surfacePosition.y).toBeCloseTo(cy + OFF, 6);
+      expect(result.surfacePosition.z).toBeCloseTo(QUAD_Z, 6);
 
-      const result = handler.raycastVR(ctx, RAY);
-      expect(result.pointId).toBe(1);
-      expect(result.position).toEqual({ x: 1, y: 2, z: 2 });
-      expect(result.surfacePosition).toEqual({ x: 1, y: 2, z: 3 });
+      // ...and position is the corner, which is NOT the surface hit, so a
+      // regression back to the raw point is distinguishable.
+      expect(result.position.x).toBeCloseTo(cx + 1, 6);
+      expect(result.position.y).toBeCloseTo(cy + 1, 6);
+      expect(result.position.z).toBeCloseTo(QUAD_Z, 6);
     });
 
-    it("compares the WORLD-space pick position against candidates in a single consistent space (accounts for actor Position)", () => {
-      // Regression test: the pre-fix code compared `position` (WORLD-space,
-      // from vtkCellPicker.getPickPosition()) directly against the
-      // polydata's raw LOCAL-space point coordinates. Here the actor is
-      // translated +5 on X/Y/Z, so comparing un-transformed would pick the
-      // WRONG candidate (id 2, (10,10,10), dist2=66) instead of the true
-      // nearest (id 1, (1,0,0) + translation = (6,5,5), dist2=0).
-      const ctx = makeVrContext();
-      handler.raycastVR(ctx, RAY); // prime the cached picker
+    it("compares positions in a single consistent space (accounts for actor Position)", () => {
+      // Regression test: the pre-fix code compared a WORLD-space pick position
+      // directly against the polydata's raw LOCAL-space point coordinates.
+      // Here the actor is translated +5 on every axis, so the geometry is
+      // authored 5 short of where it renders — mixing the two spaces picks the
+      // wrong vertex, or misses the actor altogether.
+      const [cx, cy] = RAY_ORIGIN_IN_DATA_SPACE;
+      const T = 5;
+      const actor = makeRealActorWithTriangles(
+        [
+          cx - 1 - T, cy - 1 - T, QUAD_Z - T,
+          cx + 1 - T, cy - 1 - T, QUAD_Z - T,
+          cx + 1 - T, cy + 1 - T, QUAD_Z - T,
+          cx - 1 - T, cy + 1 - T, QUAD_Z - T,
+        ],
+        [3, 0, 1, 2, 3, 0, 2, 3]
+      );
+      actor.setPosition(T, T, T);
 
-      const fakePolyData = {
-        getCellPoints: () => ({ cellType: 5, cellPointIds: [0, 1, 2] }),
-        getPoints: () => ({
-          getData: () => new Float32Array([0, 0, 0, 1, 0, 0, 10, 10, 10]),
-        }),
+      const ctx = {
+        dataBounds: [cx - 1, cx + 1, cy - 1, cy + 1, QUAD_Z, QUAD_Z],
+        vrScale: 2,
+        vrOrigin: [10, 20, 30],
+        sceneObjects: { renderer: { getActors: () => [actor] }, actor },
       };
-      const actor = vtkActor.newInstance();
-      actor.setPosition(5, 5, 5);
-      actor.setMapper({ getInputData: () => fakePolyData });
-      ctx._vrPicker.getActors.mockReturnValue([actor]);
-      ctx._vrPicker.getPickPosition.mockReturnValue([6, 5, 5]);
 
-      const result = handler.raycastVR(ctx, RAY);
-      expect(result.pointId).toBe(1);
-      // Forward transform of the resolved vertex (1,0,0) through the same
-      // +5/+5/+5 actor translation used above.
-      expect(result.position).toEqual({ x: 6, y: 5, z: 5 });
+      const result = handler.raycastVR(ctx, OFFSET_RAY);
+
+      expect(result).not.toBeNull();
+      expect(result.pointId).toBe(2);
+      // Reported in WORLD space — the local corner plus the actor translation.
+      expect(result.position.x).toBeCloseTo(cx + 1, 6);
+      expect(result.position.y).toBeCloseTo(cy + 1, 6);
+      expect(result.position.z).toBeCloseTo(QUAD_Z, 6);
     });
 
-    it("returns pointId -1 when the actor's polydata can't be resolved, and position falls back to the raw surface hit", () => {
-      const ctx = makeVrContext();
-      const result = handler.raycastVR(ctx, RAY);
+    it("returns pointId -1 with position falling back to the raw surface hit when vertex snapping is skipped", () => {
+      const result = handler.raycastVR(makeGeometryVrContext(), OFFSET_RAY, {
+        selectionMode: "surface",
+      });
       expect(result.pointId).toBe(-1);
       expect(result.position).toEqual(result.surfacePosition);
     });
 
-    it("returns pointId -1 (not a throw) when getCellPoints itself throws", () => {
-      const ctx = makeVrContext();
-      handler.raycastVR(ctx, RAY);
-
-      const throwingPolyData = {
-        getCellPoints: () => {
-          throw new Error("boom");
-        },
-        getPoints: () => ({ getData: () => new Float32Array() }),
+    it("returns null (not a throw) when the geometry can't be read at all", () => {
+      // raycastVR runs inside the XR frame loop's blanket try/catch, so a
+      // throw here is invisible except as tools that "do nothing" — the same
+      // silent-failure shape this whole file exists to prevent.
+      const brokenActor = {
+        getPickable: () => true,
+        getVisibility: () => true,
+        getMapper: () => ({
+          getInputData: () => ({
+            getPoints: () => {
+              throw new Error("boom");
+            },
+            getPolys: () => ({ getData: () => Int32Array.from([3, 0, 1, 2]) }),
+          }),
+        }),
       };
-      const hitActor = ctx.sceneObjects.actor;
-      hitActor.getMapper = () => ({ getInputData: () => throwingPolyData });
-      ctx._vrPicker.getActors.mockReturnValue([hitActor]);
+      const ctx = {
+        dataBounds: [0, 1, 0, 1, 0, 1],
+        vrScale: 2,
+        vrOrigin: [10, 20, 30],
+        sceneObjects: {
+          renderer: { getActors: () => [brokenActor] },
+          actor: brokenActor,
+        },
+      };
 
-      const result = handler.raycastVR(ctx, RAY);
-      expect(result.pointId).toBe(-1);
+      expect(() => handler.raycastVR(ctx, OFFSET_RAY)).not.toThrow();
+      expect(handler.raycastVR(ctx, OFFSET_RAY)).toBeNull();
     });
   });
 
   describe("selection modes", () => {
     it("'surface' mode returns the raw hit with pointId -1, skipping vertex-snapping entirely", () => {
-      const ctx = makeVrContext();
-      handler.raycastVR(ctx, RAY); // prime the cached picker
-
-      // A polydata that WOULD resolve a real pointId in 'nearestVertex' mode
+      // Geometry that WOULD resolve a real pointId in 'nearestVertex' mode
       // (see the "pointId resolution" tests above) — proves 'surface' mode
-      // deliberately skips this, not that it merely failed to resolve one.
-      const fakePolyData = {
-        getCellPoints: () => ({ cellType: 5, cellPointIds: [0, 1, 2] }),
-        getPoints: () => ({
-          getData: () => new Float32Array([0, 0, 0, 1, 0, 0, 10, 10, 10]),
-        }),
+      // deliberately skips snapping, not that it merely failed to resolve one.
+      const ctx = makeGeometryVrContext();
+      const offsetRay = {
+        origin: { x: 1.6, y: 1.6, z: 0 },
+        direction: { x: 0, y: 0, z: -1 },
       };
-      const hitActor = ctx.sceneObjects.actor;
-      hitActor.getMapper = () => ({ getInputData: () => fakePolyData });
-      ctx._vrPicker.getActors.mockReturnValue([hitActor]);
+      expect(handler.raycastVR(ctx, offsetRay).pointId).toBeGreaterThanOrEqual(0);
 
-      const result = handler.raycastVR(ctx, RAY, { selectionMode: "surface" });
+      const result = handler.raycastVR(ctx, offsetRay, { selectionMode: "surface" });
       expect(result.hit).toBe(true);
       expect(result.pointId).toBe(-1);
-      expect(result.cellId).toBe(42);
+      expect(result.cellId).toBeGreaterThanOrEqual(0);
       // No vertex was resolved (pointId -1), so position must NOT be
       // snapped — it stays the raw surface intersection, same as surfacePosition.
       expect(result.position).toEqual(result.surfacePosition);
@@ -552,23 +606,18 @@ describe("VTKInstanceHandler.raycastVR", () => {
     });
 
     it("automatically falls back to exactPoint when the cell picker misses against a cell-less (point-cloud) target", () => {
-      const ctx = makeVrContext();
-      const hitActor = ctx.sceneObjects.actor;
-      // Zero cells (so raycastVR's zero-cell fallback triggers) but real
-      // points, so _raycastExactPoint's polydata-based position resolution
-      // has something to resolve pointId 3 -> [4,5,6] against.
-      hitActor.getMapper = () => ({
-        getInputData: () => ({
-          getNumberOfCells: () => 0,
-          getPoints: () => ({
-            getNumberOfPoints: () => 4,
-            getData: () => new Float32Array([0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 5, 6]),
-          }),
-        }),
-      });
-
-      handler.raycastVR(ctx, RAY); // creates _vrPicker (default mock: cellId=42, a hit)
-      ctx._vrPicker.getCellId.mockReturnValue(-1); // now force a miss
+      // Real points but NO polys: a point cloud has nothing to intersect, so
+      // cell picking necessarily misses and the zero-cell fallback must take
+      // over. _raycastExactPoint then resolves pointId 3 -> [4,5,6].
+      const hitActor = makeRealActorWithPoints([
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 5, 6,
+      ]);
+      const ctx = {
+        dataBounds: [0, 1, 0, 1, 0, 1],
+        vrScale: 2,
+        vrOrigin: [10, 20, 30],
+        sceneObjects: { renderer: { getActors: () => [hitActor] }, actor: hitActor },
+      };
 
       // This call takes the miss -> zero-cell -> exactPoint fallback branch,
       // which lazily creates _vrPointPicker for the first time.
@@ -623,13 +672,16 @@ describe("VTKInstanceHandler.raycastVR", () => {
     });
 
     it("does NOT fall back to exactPoint in 'surface' mode", () => {
-      const ctx = makeVrContext();
-      const pointCloudPolyData = { getNumberOfCells: () => 0 };
-      const hitActor = ctx.sceneObjects.actor;
-      hitActor.getMapper = () => ({ getInputData: () => pointCloudPolyData });
-
-      handler.raycastVR(ctx, RAY); // creates _vrPicker
-      ctx._vrPicker.getCellId.mockReturnValue(-1);
+      // Same point cloud as the test above, which DOES fall back — the only
+      // difference is the mode, so this pins the exclusion rather than a
+      // coincidental miss.
+      const hitActor = makeRealActorWithPoints([0, 0, 0, 4, 5, 6]);
+      const ctx = {
+        dataBounds: [0, 1, 0, 1, 0, 1],
+        vrScale: 2,
+        vrOrigin: [10, 20, 30],
+        sceneObjects: { renderer: { getActors: () => [hitActor] }, actor: hitActor },
+      };
 
       expect(handler.raycastVR(ctx, RAY, { selectionMode: "surface" })).toBeNull();
     });
@@ -694,8 +746,11 @@ describe("VTKInstanceHandler.raycastVR", () => {
       vtkGlyphFeature.instanceStates.set(instanceId, { glyphActor });
       ctx.sceneObjects.renderer.getActors = () => [ctx.sceneObjects.actor, glyphActor];
 
+      const spy = vi.spyOn(handler, "_getVRPickTargets");
       handler.raycastVR(ctx, RAY, { excludeDerivedActors: true });
-      expect(ctx._vrPicker.setPickList).toHaveBeenCalledWith([ctx.sceneObjects.actor]);
+
+      expect(spy).toHaveBeenCalledWith(ctx, { excludeDerived: true });
+      expect(spy.mock.results[0].value).toEqual([ctx.sceneObjects.actor]);
     });
   });
 });

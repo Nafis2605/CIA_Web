@@ -95,7 +95,7 @@ function _replayPendingPatches(workspaceId) {
 const YJS_SEND_THROTTLE_MS = 50;
 
 function createViewPatchThrottle(sendFn, throttleMs = YJS_SEND_THROTTLE_MS) {
-  const state = new Map(); // viewId -> { lastSent, timer, pending, userId, syncKey }
+  const state = new Map(); // viewId -> { lastSent, timer, pending, userId, syncKey, revision }
 
   const flush = (viewId) => {
     const e = state.get(viewId);
@@ -107,13 +107,28 @@ function createViewPatchThrottle(sendFn, throttleMs = YJS_SEND_THROTTLE_MS) {
       clearTimeout(e.timer);
       e.timer = null;
     }
-    if (e.userId) sendFn(viewId, e.userId, patch, e.syncKey);
+    // 5th arg (collaborationViewId) stays null here — nothing in this
+    // throttle resolves one yet (see syncVisualizationToYjs's docstring).
+    // 6th arg is the writer's last-known ViewConfiguration.revision, only
+    // meaningful to syncVisualizationToYjs; syncCameraToYjs (the other
+    // sendFn this throttle wraps) simply ignores the extra argument.
+    // 7th arg (meta) is appended ONLY when present, so every existing
+    // caller that never supplies one keeps calling sendFn with exactly the
+    // same argument count as before (see e.g.
+    // visualizationSyncService.test.js's exact toHaveBeenCalledWith checks).
+    if (e.userId) {
+      if (e.meta) {
+        sendFn(viewId, e.userId, patch, e.syncKey, null, e.revision ?? null, e.meta);
+      } else {
+        sendFn(viewId, e.userId, patch, e.syncKey, null, e.revision ?? null);
+      }
+    }
   };
 
-  const send = (viewId, userId, patch, syncKey = null) => {
+  const send = (viewId, userId, patch, syncKey = null, revision = null, meta = null) => {
     let e = state.get(viewId);
     if (!e) {
-      e = { lastSent: 0, timer: null, pending: null, userId, syncKey };
+      e = { lastSent: 0, timer: null, pending: null, userId, syncKey, revision, meta: null };
       state.set(viewId, e);
     }
     e.userId = userId;
@@ -121,6 +136,15 @@ function createViewPatchThrottle(sendFn, throttleMs = YJS_SEND_THROTTLE_MS) {
     // already have — a mid-drag patch from a path that doesn't resolve it
     // would otherwise make the trailing flush unroutable for peers.
     if (syncKey) e.syncKey = syncKey;
+    // Same reasoning as syncKey: a later, more current revision read always
+    // wins; a caller that didn't resolve one (e.g. camera pushes, which
+    // never pass revision) must not blank out one already queued.
+    if (revision != null) e.revision = revision;
+    // Phase D6 mutation envelope (sessionRevision/actorId/opId) — see
+    // pushSharedVisualizationUpdate. Only ever supplied by the visualization
+    // send path (VR); camera pushes never pass one. Latest wins, same as
+    // revision — never blanked out by a caller that didn't resolve one.
+    if (meta) e.meta = meta;
     e.pending = { ...(e.pending || {}), ...patch };
 
     const elapsed = Date.now() - e.lastSent;
@@ -269,8 +293,13 @@ export function flushSharedCameraUpdate(viewId) {
  * @param {string|null} [syncKey] - cross-client sync key (see viewSyncKey.js).
  *   Without it the patch only reaches peers that happen to share this exact
  *   viewId, which ad-hoc-opened views never do.
+ * @param {{sessionRevision: number|null, actorId: string, opId: string|null}|null} [meta]
+ *   Phase D6 mutation envelope (VR only, currently) — written into the Y.js
+ *   entry and forwarded to the view PUT. Optional and additive: omitted
+ *   entirely (not even as an extra `null` argument) downstream when not
+ *   supplied, so no existing caller's call shape changes.
  */
-export function pushSharedVisualizationUpdate(viewId, patch, syncKey = null) {
+export function pushSharedVisualizationUpdate(viewId, patch, syncKey = null, meta = null) {
   if (!viewId) return NO_VIEW;
 
   const workspaceId = resolveActiveWorkspaceId();
@@ -284,12 +313,27 @@ export function pushSharedVisualizationUpdate(viewId, patch, syncKey = null) {
   }
 
   const userId = getUserId();
-  if (userId) _throttledVizSend(viewId, userId, patch, syncKey);
+  if (userId) {
+    // The view's last-known server revision, if any — see
+    // syncVisualizationToYjs's `revision` param and yjsObservers.js's
+    // replayVisualizationState for why a late-join replay needs this
+    // stamped on the entry. Reads whatever ViewConfigurationManager has
+    // cached locally; it lags the server by one round trip for the patch
+    // being sent right now (the REST persist below hasn't resolved yet),
+    // which is fine — it's a floor ("written no earlier than revision N"),
+    // not a claim about this exact patch's own revision.
+    const revision = getViewConfigurationManager()?.getView(viewId)?.revision ?? null;
+    _throttledVizSend(viewId, userId, patch, syncKey, revision, meta);
+  }
 
   // No workspace: the peer still sees the change, but there is no
   // ViewConfiguration to write it to, so it does not survive a reload.
   if (mode === SHARE_EPHEMERAL) return TRANSMITTED_ONLY;
-  getViewConfigurationManager()?.updateVisualization(viewId, patch);
+  if (meta) {
+    getViewConfigurationManager()?.updateVisualization(viewId, patch, meta);
+  } else {
+    getViewConfigurationManager()?.updateVisualization(viewId, patch);
+  }
 
   return { persisted: true };
 }

@@ -13,8 +13,94 @@ import { useState, useEffect, useCallback, useMemo } from "react";
 import { vrManager } from "@Core/vr/VRManager.js";
 import { vrExplorationManager } from "@Core/vr/VRExplorationManager.js";
 import { apiClient } from "@Services/apiClient.js";
+import { sessionManager } from "@Core/session/sessionManager.js";
 import { isSelfIdentity } from "@Collaboration/presence/userManagement.js";
 import { toast } from "@UI/react/store/toastStore.js";
+
+/**
+ * Does this raw vr_exploration_sessions row belong to `datasetId`?
+ *
+ * Checks dataset_sync_key FIRST. That column (023_vr_session_lifecycle.sql)
+ * carries resolveViewSyncKey()'s value and is the server's real per-dataset
+ * identity. dataset_id cannot be: it is a UUID FK, so asUuidOrNull() in
+ * server/src/routes/vr.js nulls it at INSERT time for every built-in demo
+ * dataset ("builtin-lungs" and friends are client-side keys, not UUIDs).
+ * Matching on dataset_id alone — which both call sites used to do — therefore
+ * could never match a builtin-hosted session, because the column is null on
+ * exactly those rows.
+ *
+ * dataset_id stays as a fallback for legacy rows written before
+ * dataset_sync_key existed.
+ *
+ * @param {{dataset_id?: string|null, dataset_sync_key?: string|null, status?: string}} session
+ * @param {string|null|undefined} datasetId
+ * @returns {boolean}
+ */
+export function sessionMatchesDataset(session, datasetId) {
+  if (!session || !datasetId || session.status === "ended") return false;
+  if (session.dataset_sync_key) return session.dataset_sync_key === datasetId;
+  return session.dataset_id === datasetId;
+}
+
+/** How often to retry resolving the room id while it is still unresolved. */
+const ROOM_RESOLVE_INTERVAL_MS = 250;
+
+/** Give up re-resolving the room after this many attempts (~5s). */
+const ROOM_RESOLVE_MAX_ATTEMPTS = 20;
+
+/**
+ * Read the current room id without throwing.
+ *
+ * sessionManager.getRoomId() throws until initializeFromURLAsync() has
+ * resolved (sessionManager.js), which can happen after this hook first
+ * mounts. Mirrors serverSync.js's own _safeRoomId().
+ *
+ * @returns {string|null}
+ */
+function safeRoomId() {
+  try {
+    return sessionManager.getRoomId() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Turn a VR join/session-lookup failure's short error code into user-facing
+ * copy. Two call sites need the same mapping (Phase B of the room-scoping/
+ * join-correctness plan):
+ *  - vrExplorationManager.joinSession()'s hard-fail return, `{ error, detail }`
+ *    (see VRExplorationManager.js's joinSession — always a 4xx response)
+ *  - an ApiError thrown by apiClient.get(`/vr/sessions/:id`), which can now
+ *    403/409 too now that Phase A added room scoping to that route.
+ * Both shapes carry the same `{ error, roomId, roomName, ... }` body — the
+ * ApiError's `.details` *is* the parsed JSON body, and joinSession's
+ * `detail` is that same body passed straight through.
+ *
+ * @param {string|null|undefined} code - short error code (e.g. 'cross-room')
+ * @param {object|null|undefined} detail - the raw response body
+ * @returns {string|null} user-facing message, or null for an unmapped code
+ */
+function describeVRJoinError(code, detail) {
+  switch (code) {
+    case "cross-room":
+      return detail?.roomName
+        ? `This session is in room "${detail.roomName}" — switch rooms to join`
+        : "This session belongs to a different room — switch rooms to join";
+    case "not-a-room-member":
+      return "You don't have access to this session's room";
+    case "join-disabled":
+      return "This session isn't accepting new participants right now";
+    case "desktop-not-allowed":
+      return "This session doesn't allow desktop participants";
+    case "session-not-found":
+      return "This VR session no longer exists";
+    case "auth-required":
+      return "You need to be signed in to join a VR session";
+    default:
+      return null;
+  }
+}
 
 /**
  * Hook for VR session state management
@@ -43,6 +129,10 @@ export function useVRSession(projectId) {
   // Loading states
   const [loadingSessions, setLoadingSessions] = useState(false);
   const [joiningSession, setJoiningSession] = useState(false);
+  // Structured join failure — { code, message } — set on a hard 4xx from
+  // either the session lookup or the join itself; null on success or a
+  // degraded-but-continuing join. See describeVRJoinError().
+  const [joinError, setJoinError] = useState(null);
 
   // Check VR support on mount
   useEffect(() => {
@@ -162,17 +252,51 @@ export function useVRSession(projectId) {
     return vrExplorationManager.releaseManipulationControl();
   }, []);
 
-  // Fetch active sessions for project. These are raw vr_exploration_sessions
+  // The room this hook is scoped to. Resolved from sessionManager rather than
+  // taken as a prop, because GET /vr/sessions is room-scoped server-side and
+  // no caller had a roomId to pass. getRoomId() throws while the session is
+  // still initializing (sessionManager.js), and there is no room-changed
+  // event to subscribe to, so retry briefly instead of giving up for the
+  // lifetime of the hook — the previous code returned early and never
+  // refetched, which is one reason activeSessions was always empty.
+  const [roomId, setRoomId] = useState(() => safeRoomId());
+
+  useEffect(() => {
+    if (roomId) return undefined;
+    let cancelled = false;
+    let attempts = 0;
+    const timer = setInterval(() => {
+      const resolved = safeRoomId();
+      if (resolved && !cancelled) {
+        setRoomId(resolved);
+        clearInterval(timer);
+      } else if (++attempts >= ROOM_RESOLVE_MAX_ATTEMPTS) {
+        clearInterval(timer);
+      }
+    }, ROOM_RESOLVE_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [roomId]);
+
+  // Fetch active sessions for the room. These are raw vr_exploration_sessions
   // rows (snake_case: dataset_id, owner_user_name, participant_count) — a
   // different shape from currentSession's client-side VRExplorationSession
   // model (camelCase). See getSessionsForDataset.
   const fetchActiveSessions = useCallback(async () => {
-    if (!projectId) return;
+    // Room, not project: GET /vr/sessions is room-scoped server-side
+    // (resolveRoomAccess() in server/src/routes/vr.js reads roomId from the
+    // query string and 400s without one — projectId is not read by that
+    // route at all). Gating this on projectId, which no caller ever passed,
+    // is what kept activeSessions permanently empty and the "Join in VR"
+    // popover permanently unrenderable.
+    if (!roomId) return;
 
     setLoadingSessions(true);
     try {
       const sessions = await apiClient.get(
-        `/vr/sessions?projectId=${encodeURIComponent(projectId)}`
+        `/vr/sessions?roomId=${encodeURIComponent(roomId)}`
       );
       setActiveSessions(sessions || []);
     } catch (err) {
@@ -180,7 +304,7 @@ export function useVRSession(projectId) {
     } finally {
       setLoadingSessions(false);
     }
-  }, [projectId]);
+  }, [roomId]);
 
   // Fetch sessions on mount and project change
   useEffect(() => {
@@ -221,13 +345,35 @@ export function useVRSession(projectId) {
             : s
         )
       );
+
+      // Also feed the ROSTER, not just the count. The roster used to be built
+      // exclusively from vrExplorationManager.getActiveSession(), which is
+      // null until this browser has itself entered VR — so a user who opened
+      // the room link and was deciding whether to join could never see who was
+      // already in there. Keyed by participant_id (accountUserId#deviceId), so
+      // the same account on two headsets shows as two people.
+      if (participant?.participantId || participant?.participant_id) {
+        setParticipants((prev) => {
+          const id = participant.participantId || participant.participant_id;
+          const next = prev.filter(
+            (x) => (x.participantId || x.participant_id) !== id
+          );
+          next.push(participant);
+          return next;
+        });
+      }
+
       if (sessionId && sessionId !== currentSession?.id) {
         toast.info(`${participant?.userName || "Someone"} joined a VR session`);
       }
     };
 
     const handleParticipantLeft = (event) => {
+      // `userId` is the legacy key for the same value — see
+      // wsManager.vrParticipantLeft, which broadcasts a PARTICIPANT id
+      // (accountUserId#deviceId) under both names.
       const { sessionId } = event.detail || {};
+      const participantId = event.detail?.participantId || event.detail?.userId;
       setActiveSessions((prev) =>
         prev.map((s) =>
           s.id === sessionId
@@ -235,6 +381,11 @@ export function useVRSession(projectId) {
             : s
         )
       );
+      if (participantId) {
+        setParticipants((prev) =>
+          prev.filter((x) => (x.participantId || x.participant_id) !== participantId)
+        );
+      }
     };
 
     const handleSnapshotCreated = (event) => {
@@ -269,26 +420,67 @@ export function useVRSession(projectId) {
   const joinSession = useCallback(
     async (sessionId, mode = "desktop-observer") => {
       setJoiningSession(true);
+      setJoinError(null);
+      // Local flag, not the joinError STATE — setJoinError() below doesn't
+      // read back synchronously (React batches it), so the outer catch
+      // needs its own signal to avoid double-toasting a failure this
+      // function already classified and reported.
+      let handledError = null;
       try {
         // Reuse the row from the already-fetched list when available (avoid
         // a redundant refetch); vrExplorationManager.joinSession expects the
         // raw vr_exploration_sessions row shape either way.
         let record = activeSessions.find((s) => s.id === sessionId);
         if (!record) {
-          record = await apiClient.get(`/vr/sessions/${sessionId}`);
+          try {
+            record = await apiClient.get(`/vr/sessions/${sessionId}`);
+          } catch (err) {
+            // GET /vr/sessions/:id can now 403/409 too, post-Phase A room
+            // scoping — run it through the same classifier as the join POST
+            // below instead of surfacing the raw error code as a message.
+            const code = err?.details?.error;
+            const message = describeVRJoinError(code, err?.details) || err.message;
+            handledError = { code: code || null, message };
+            setJoinError(handledError);
+            toast.error(`Failed to join session: ${message}`);
+            throw err;
+          }
         }
 
         const result = await vrExplorationManager.joinSession(record, mode);
+
         if (!result.joined) {
-          throw new Error(result.reason || "Failed to join session");
+          // result.error is a hard 4xx (see joinSession's contract) —
+          // result.reason (e.g. 'join-unavailable') is everything else that
+          // still isn't a successful join. Both need to surface, neither is
+          // "joined as an observer".
+          const code = result.error || result.reason || null;
+          const message = result.error
+            ? describeVRJoinError(result.error, result.detail) || result.error
+            : result.reason || "Failed to join session";
+          handledError = { code, message };
+          setJoinError(handledError);
+          toast.error(`Failed to join session: ${message}`);
+          throw new Error(message);
         }
 
-        toast.success(
-          result.vrEntered ? "Joined VR session" : "Joined VR session as an observer"
-        );
+        if (result.reason === "ready-press-enter") {
+          // Auto-load succeeded but deliberately did not enter VR (WebXR
+          // user-activation — see VRExplorationManager
+          // ._resolveOrLoadInstanceForSession's docstring). This is
+          // success-with-a-follow-up-gesture, not an observer join.
+          toast.success("Dataset loaded — press Enter VR to continue");
+        } else {
+          toast.success(
+            result.vrEntered ? "Joined VR session" : "Joined VR session as an observer"
+          );
+        }
         return result;
       } catch (err) {
-        toast.error(`Failed to join session: ${err.message}`);
+        if (!handledError) {
+          toast.error(`Failed to join session: ${err.message}`);
+          setJoinError({ code: null, message: err.message });
+        }
         throw err;
       } finally {
         setJoiningSession(false);
@@ -327,7 +519,19 @@ export function useVRSession(projectId) {
       // Locally-generated ids (registration never reached the server) have
       // nothing to delete server-side.
       if (sessionId && !String(sessionId).startsWith("vrsession_")) {
-        await apiClient.delete(`/vr/sessions/${sessionId}`);
+        try {
+          await apiClient.delete(`/vr/sessions/${sessionId}`);
+        } catch (err) {
+          // Issue 6: leaveSession() above (or another device) may already
+          // have ended this row as the session's last participant — DELETE
+          // now 404s an already-'ended' session (see server/src/routes/vr.js)
+          // rather than silently re-stamping ended_at. That's a successful
+          // outcome from this caller's point of view (the session IS
+          // ended), not a failure to report.
+          if (err?.status !== 404) {
+            throw err;
+          }
+        }
       }
       setActiveSessions((prev) => prev.filter((s) => s.id !== sessionId));
       toast.success("VR session ended");
@@ -374,9 +578,7 @@ export function useVRSession(projectId) {
   // vr_exploration_sessions rows (snake_case) — see fetchActiveSessions.
   const getSessionsForDataset = useCallback(
     (datasetId) => {
-      return activeSessions.filter(
-        (s) => s.dataset_id === datasetId && s.status !== "ended"
-      );
+      return activeSessions.filter((s) => sessionMatchesDataset(s, datasetId));
     },
     [activeSessions]
   );
@@ -402,6 +604,7 @@ export function useVRSession(projectId) {
     // Loading states
     loadingSessions,
     joiningSession,
+    joinError,
 
     // Actions
     fetchActiveSessions,

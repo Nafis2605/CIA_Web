@@ -779,12 +779,21 @@ export class ViewConfigurationManager extends BaseManager {
    * colormap, slice, windowLevel, pointSize, lineWidth, activeArray, glyph).
    * Persists to ViewConfiguration.visualization and queues a server sync.
    * Safe to call on every change — throttled by _syncToServer (100ms).
+   * @param {string} viewId
+   * @param {object} patch
+   * @param {{sessionRevision: number|null, actorId: string, opId: string|null}|null} [meta]
+   *   Phase D6 mutation envelope (VR gestures only) — see
+   *   visualizationSyncService.pushSharedVisualizationUpdate. Stashed on the
+   *   view and consumed (then cleared) by the next _runSync PUT; a later
+   *   call before that flush overwrites it, same "latest wins" rule the Y.js
+   *   throttle uses.
    */
-  updateVisualization(viewId, patch) {
+  updateVisualization(viewId, patch, meta = null) {
     const view = this._viewConfigs.get(viewId);
     if (!view) return;
 
     view.updateVisualization(patch);
+    if (meta) view._pendingMutationMeta = meta;
     this._syncToServer(view);
 
     this._emit("visualizationChanged", { viewId, visualization: patch });
@@ -1634,6 +1643,13 @@ export class ViewConfigurationManager extends BaseManager {
     // mutated by the time this one's response comes back.
     const baseRevision = view.revision != null ? view.revision : null;
 
+    // Phase D6 mutation envelope, if one is pending — consumed (and
+    // cleared) here rather than read again below, so a mutation queued
+    // WHILE this request is in flight (re-run via _syncQueued) gets its own
+    // fresh meta rather than resending this one twice.
+    const pendingMeta = view._pendingMutationMeta || null;
+    view._pendingMutationMeta = null;
+
     try {
       const updateData = this._clientToServerFormat(view);
 
@@ -1643,6 +1659,20 @@ export class ViewConfigurationManager extends BaseManager {
         // Include the base revision for optimistic concurrency control.
         // The server will reject stale writes with 409 Conflict.
         updateData.base_revision = baseRevision;
+      }
+
+      // Phase D6 mutation envelope — advisory only (see
+      // VRExplorationManager._buildMutationMeta's docstring): conflict
+      // detection stays on base_revision above, not these fields. The
+      // server ignores unknown body fields (see views.js's `allowedFields`
+      // whitelist), so this is forward-compatible even before anything
+      // server-side reads them.
+      if (pendingMeta) {
+        if (pendingMeta.actorId != null) updateData.actor_id = pendingMeta.actorId;
+        if (pendingMeta.opId != null) updateData.op_id = pendingMeta.opId;
+        if (pendingMeta.sessionRevision != null) {
+          updateData.session_revision = pendingMeta.sessionRevision;
+        }
       }
 
       const { view: serverView } = await apiClient.put(

@@ -120,8 +120,11 @@ describe('visualizationSyncService', () => {
     test('visualization transmits over Y.js but skips the durable persist', () => {
       const result = pushSharedVisualizationUpdate('view-eph-viz', { opacity: 0.5 }, 'dataset-1');
 
+      // Trailing null, null: collaborationViewId (nothing resolves one here)
+      // and revision (no ViewConfigurationManager to read one from in
+      // ephemeral mode) — see createViewPatchThrottle's flush().
       expect(syncVisualizationToYjs).toHaveBeenCalledWith(
-        'view-eph-viz', 'user-1', { opacity: 0.5 }, 'dataset-1'
+        'view-eph-viz', 'user-1', { opacity: 0.5 }, 'dataset-1', null, null
       );
       expect(mockManager.updateVisualization).not.toHaveBeenCalled();
       // transmitted:true is what stops callers reporting a working sync as a
@@ -137,7 +140,7 @@ describe('visualizationSyncService', () => {
       const result = pushSharedCameraUpdate('view-eph-cam', { position: [0, 0, 5] }, 'dataset-1');
 
       expect(syncCameraToYjs).toHaveBeenCalledWith(
-        'view-eph-cam', 'user-1', { position: [0, 0, 5] }, 'dataset-1'
+        'view-eph-cam', 'user-1', { position: [0, 0, 5] }, 'dataset-1', null, null
       );
       expect(mockManager.updateCamera).not.toHaveBeenCalled();
       expect(result.transmitted).toBe(true);
@@ -173,7 +176,7 @@ describe('visualizationSyncService', () => {
 
       const result = pushSharedCameraUpdate('view-1', { position: [0, 0, 5] });
 
-      expect(syncCameraToYjs).toHaveBeenCalledWith('view-1', 'user-1', { position: [0, 0, 5] }, null);
+      expect(syncCameraToYjs).toHaveBeenCalledWith('view-1', 'user-1', { position: [0, 0, 5] }, null, null, null);
       expect(mockManager.updateCamera).toHaveBeenCalledWith('view-1', { position: [0, 0, 5] });
       expect(result).toEqual({ persisted: true });
     });
@@ -205,7 +208,7 @@ describe('visualizationSyncService', () => {
 
       const result = pushSharedVisualizationUpdate('view-1', { opacity: 0.5 });
 
-      expect(syncVisualizationToYjs).toHaveBeenCalledWith('view-1', 'user-1', { opacity: 0.5 }, null);
+      expect(syncVisualizationToYjs).toHaveBeenCalledWith('view-1', 'user-1', { opacity: 0.5 }, null, null, null);
       expect(mockManager.updateVisualization).toHaveBeenCalledWith('view-1', { opacity: 0.5 });
       expect(result).toEqual({ persisted: true });
     });
@@ -242,7 +245,7 @@ describe('visualizationSyncService', () => {
       flushSharedCameraUpdate('view-flush-1');
 
       expect(syncCameraToYjs).toHaveBeenCalledWith(
-        'view-flush-1', 'user-1', { position: [0, 0, 2] }, null
+        'view-flush-1', 'user-1', { position: [0, 0, 2] }, null, null, null
       );
     });
 
@@ -280,7 +283,7 @@ describe('visualizationSyncService', () => {
       await Promise.resolve();
 
       expect(syncCameraToYjs).toHaveBeenCalledWith(
-        'view-warmup', 'user-1', { position: [1, 1, 1] }, null
+        'view-warmup', 'user-1', { position: [1, 1, 1] }, null, null, null
       );
       expect(mockManager.updateCamera).toHaveBeenCalledWith('view-warmup', { position: [1, 1, 1] });
     });

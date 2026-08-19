@@ -22,6 +22,7 @@ import {
 } from "@Collaboration/presence/userManagement.js";
 import { setDeviceName } from "@Core/identity/deviceIdentity.js";
 import { toast } from "@UI/react/store/toastStore.js";
+import { useVRSession, sessionMatchesDataset } from "@UI/react/hooks/useVRSession";
 import "./VRExploreButton.scss";
 
 /**
@@ -33,7 +34,8 @@ import "./VRExploreButton.scss";
  * @param {Object} props.viewConfig - Current view configuration
  * @param {string} props.projectId - Project ID
  * @param {Object} props.selection - Current selection (optional)
- * @param {Object[]} props.activeSessions - Active VR sessions in this project
+ * @param {Object[]} [props.activeSessions] - Active VR sessions. Optional —
+ *   when omitted the button fetches them itself (see below).
  * @param {string} props.size - Button size: 'sm' | 'md' | 'lg'
  * @param {boolean} props.showLabel - Whether to show text label
  * @param {string} props.variant - Visual variant: 'default' | 'primary' | 'minimal'
@@ -45,7 +47,7 @@ export function VRExploreButton({
   viewConfig,
   projectId,
   selection,
-  activeSessions = [],
+  activeSessions,
   size = "sm",
   showLabel = false,
   variant = "default",
@@ -116,16 +118,24 @@ export function VRExploreButton({
     };
   }, []);
 
+  // Sessions are fetched here rather than passed down. The `activeSessions`
+  // prop existed and was threaded through ViewHeader and InstanceToolbar, but
+  // NO parent ever supplied it — so it was always the default empty array,
+  // `relevantSessions` was always empty, the "Active VR Sessions" popover
+  // below could never render, and vrExplorationManager.joinSession() had no
+  // reachable caller anywhere in the app. Owning the fetch removes that whole
+  // class of failure; the prop is still honoured when a caller does pass one.
+  const { activeSessions: fetchedSessions } = useVRSession();
+  const sessions = activeSessions ?? fetchedSessions;
+
   // Relevant active sessions for this dataset. Session rows come straight
   // from the server (SELECT * FROM vr_exploration_sessions), so fields are
   // snake_case (dataset_id, owner_user_name, participant_count) — not the
   // camelCase VRExplorationSession model shape used client-side.
   const relevantSessions = useMemo(() => {
     if (!dataset) return [];
-    return activeSessions.filter(
-      (s) => s.dataset_id === dataset.id && s.status !== "ended"
-    );
-  }, [activeSessions, dataset]);
+    return sessions.filter((s) => sessionMatchesDataset(s, dataset.id));
+  }, [sessions, dataset]);
 
   /**
    * Handle the display-name prompt being submitted.

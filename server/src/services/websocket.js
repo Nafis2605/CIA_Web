@@ -4,7 +4,12 @@
 
 const WebSocket = require("ws");
 const { createLogger } = require("../utils/logger");
-const { DEV_BYPASS_AUTH, verifyJwtToken, checkWorkspaceAccess } = require("../middleware/auth");
+const {
+  DEV_BYPASS_AUTH,
+  verifyJwtToken,
+  checkWorkspaceAccess,
+  ensureDevPublicRoomMembership,
+} = require("../middleware/auth");
 
 const ws = createLogger("ws");
 const auth = createLogger("auth");
@@ -369,7 +374,14 @@ class WebSocketManager {
          WHERE r.id = $1 AND pm.user_id = $2 AND r.is_public = true`,
         [roomId, userId]
       );
-      return result.rows.length > 0;
+      if (result.rows.length > 0) return true;
+
+      // Mirrors resolveRoomAccess in routes/vr.js: in dev bypass a per-device
+      // identity may self-join a PUBLIC room. Without it a headset is denied
+      // here, never enters this.roomChannels, and every broadcastToRoom() VR
+      // event is dropped at its `if (!channel) return;` — the quiet half of
+      // why two headsets could not see each other.
+      return await ensureDevPublicRoomMembership(this.pool, roomId, userId);
     } catch (error) {
       ws.error('Failed to check room access:', error);
       return false;
@@ -764,17 +776,34 @@ class WebSocketManager {
   // ============================================================================
   // VR SESSION EVENTS
   // ============================================================================
+  // Room-scoped, not project-scoped (Phase A room-scoping plan): a VR
+  // session's Y.js doc (yjsSetup.js binds ydoc to
+  // sessionManager.getRoomId()) is room-scoped, so broadcasting these to the
+  // whole project reached every room in the project, not just the one the
+  // session actually lives in — a room-B client would learn about (and,
+  // pre-A2, be able to join) a room-A session. broadcastToRoom only reaches
+  // sockets that sent "join:room" (see serverSync.js's auth:success
+  // handler), so a null roomId (a legacy pre-room-scoping session — see
+  // 021_vr_session_room_scope.sql) has no room channel to broadcast to;
+  // rather than fall back to the old project-wide behavior for those rows,
+  // they simply broadcast to nobody.
 
   /**
    * Broadcast VR session created event
    */
-  vrSessionCreated(projectId, session) {
-    this.broadcastToProject(projectId, {
+  vrSessionCreated(roomId, session) {
+    if (!roomId) return;
+    this.broadcastToRoom(roomId, {
       type: "vr:session-created",
-      projectId,
+      roomId,
       session: {
         id: session.id,
         ownerUserId: session.owner_user_id,
+        // Device-grained (accountUserId#deviceId — migration 021), null on a
+        // legacy pre-021 row. Authoritative for host identity; see
+        // src/core/vr/vrSessionOwner.js on the client, which prefers this
+        // over the bare ownerUserId above.
+        ownerParticipantId: session.owner_participant_id,
         ownerUserName: session.owner_user_name,
         datasetId: session.dataset_id,
         viewConfigurationId: session.view_configuration_id,
@@ -789,10 +818,11 @@ class WebSocketManager {
   /**
    * Broadcast VR session updated event
    */
-  vrSessionUpdated(projectId, sessionId, updates) {
-    this.broadcastToProject(projectId, {
+  vrSessionUpdated(roomId, sessionId, updates) {
+    if (!roomId) return;
+    this.broadcastToRoom(roomId, {
       type: "vr:session-updated",
-      projectId,
+      roomId,
       sessionId,
       updates,
       timestamp: new Date().toISOString(),
@@ -802,10 +832,11 @@ class WebSocketManager {
   /**
    * Broadcast VR session ended event
    */
-  vrSessionEnded(projectId, sessionId) {
-    this.broadcastToProject(projectId, {
+  vrSessionEnded(roomId, sessionId) {
+    if (!roomId) return;
+    this.broadcastToRoom(roomId, {
       type: "vr:session-ended",
-      projectId,
+      roomId,
       sessionId,
       timestamp: new Date().toISOString(),
     });
@@ -814,13 +845,22 @@ class WebSocketManager {
   /**
    * Broadcast VR participant joined event
    */
-  vrParticipantJoined(projectId, sessionId, participant) {
-    this.broadcastToProject(projectId, {
+  vrParticipantJoined(roomId, sessionId, participant) {
+    if (!roomId) return;
+    this.broadcastToRoom(roomId, {
       type: "vr:participant-joined",
-      projectId,
+      roomId,
       sessionId,
       participant: {
-        odUserId: participant.od_user_id,
+        // participant_id/account_user_id replaced od_user_id in
+        // 019_vr_participant_device_identity.sql — od_user_id has been
+        // undefined on this payload ever since. odUserId is kept as a
+        // deprecated alias (mapped to account_user_id, which is what it
+        // always actually meant) for one release: VRExplorationManager.js's
+        // grantManipulationControlTo still reads p.odUserId.
+        participantId: participant.participant_id,
+        accountUserId: participant.account_user_id,
+        odUserId: participant.account_user_id,
         userName: participant.user_name,
         mode: participant.mode,
         joinedAt: participant.joined_at,
@@ -832,12 +872,21 @@ class WebSocketManager {
   /**
    * Broadcast VR participant left event
    */
-  vrParticipantLeft(projectId, sessionId, userId) {
-    this.broadcastToProject(projectId, {
+  vrParticipantLeft(roomId, sessionId, participantId) {
+    if (!roomId) return;
+    this.broadcastToRoom(roomId, {
       type: "vr:participant-left",
-      projectId,
+      roomId,
       sessionId,
-      userId,
+      // The caller (POST /sessions/:id/leave in routes/vr.js) passes a
+      // PARTICIPANT id — accountUserId#deviceId — not an account id. This
+      // parameter was named `userId` and broadcast under that key, which is
+      // actively misleading: a client that matched it against an account id
+      // would drop the wrong person from the roster, or nobody, whenever one
+      // account was signed in on two headsets. Sent under the correct name,
+      // with `userId` retained so any existing consumer keeps working.
+      participantId,
+      userId: participantId,
       timestamp: new Date().toISOString(),
     });
   }
@@ -845,10 +894,11 @@ class WebSocketManager {
   /**
    * Broadcast VR snapshot created event
    */
-  vrSnapshotCreated(projectId, sessionId, snapshot) {
-    this.broadcastToProject(projectId, {
+  vrSnapshotCreated(roomId, sessionId, snapshot) {
+    if (!roomId) return;
+    this.broadcastToRoom(roomId, {
       type: "vr:snapshot-created",
-      projectId,
+      roomId,
       sessionId,
       snapshot: {
         id: snapshot.id,
@@ -857,6 +907,24 @@ class WebSocketManager {
         createdByName: snapshot.created_by_name,
         timestamp: snapshot.timestamp,
       },
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  /**
+   * Broadcast VR manipulation lease changed event (Phase D1/D2 of the
+   * room-scoping/join-correctness/manipulation-authority plan). Fired by
+   * all four lease routes in server/src/routes/vr.js (acquire, heartbeat,
+   * release, grant) — `lease` is buildLeaseDescriptor()'s snapshot, or null
+   * when the lease was just released.
+   */
+  vrLeaseChanged(roomId, payload) {
+    if (!roomId) return;
+    this.broadcastToRoom(roomId, {
+      type: "vr:lease-changed",
+      roomId,
+      sessionId: payload?.sessionId,
+      lease: payload?.lease ?? null,
       timestamp: new Date().toISOString(),
     });
   }

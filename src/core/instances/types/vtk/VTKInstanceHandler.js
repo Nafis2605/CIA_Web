@@ -37,6 +37,7 @@ import { vtkAnnotationLinesFeature } from "@VTK/features/VTKAnnotationLinesFeatu
 import { vtkImplicitPlaneFeature } from "@VTK/features/VTKImplicitPlaneFeature";
 import { vtkImageCroppingFeature } from "@VTK/features/VTKImageCroppingFeature";
 import { vtkCleanPolyDataFeature } from "@VTK/features/VTKCleanPolyDataFeature";
+import { aggregateVTKVisualizationState } from "@VTK/vtkStateAggregator.js";
 import { vtkOrientationWidget, ORIENTATION_STYLES } from "@VTK/widgets/orientation/VTKOrientationWidget";
 import { vtkInstanceCursors } from "@VTK/collaboration/VTKInstanceCursors.js";
 import { getViewConfigurationManager } from "@Init/appInitializer.js";
@@ -100,6 +101,18 @@ import vtkPointPicker from "@kitware/vtk.js/Rendering/Core/PointPicker";
 import vtkPointLocator from "@kitware/vtk.js/Common/DataModel/PointLocator";
 import vtkMatrixBuilder from "@kitware/vtk.js/Common/Core/MatrixBuilder";
 import "@kitware/vtk.js/Rendering/Profiles/Geometry";
+import { buildPickAccel, intersectRay } from "./vr/vrRayPick.js";
+
+/**
+ * Ray-pick acceleration structures, keyed by vtkPolyData.
+ *
+ * WeakMap, not an own property on the polydata: vtk.js instances are sealed,
+ * so assigning to one throws "object is not extensible". Weak keys also mean a
+ * discarded dataset's structure is collected with it.
+ *
+ * @type {WeakMap<object, {accel: object|null, mtime: number}>}
+ */
+const VR_PICK_ACCEL_CACHE = new WeakMap();
 
 // Ensure zip access is registered even when tree-shaken builds drop side effects.
 if (!DataAccessHelper.has("zip")) {
@@ -4267,6 +4280,11 @@ console.log('Tools:', tools);
       state.visualization = {
         opacity: property.getOpacity(),
         representation: property.getRepresentation(),
+        // Everything applySharedState() can apply beyond opacity/representation —
+        // pointSize, lineWidth, transform, slice, windowLevel, colormap/activeArray,
+        // and the glyph/threshold/slicePlane/clipBox feature configs. See
+        // vtkStateAggregator.js for exactly which keys this covers and why.
+        ...aggregateVTKVisualizationState(instanceData.instanceId, instanceData),
       };
     }
 
@@ -5100,8 +5118,17 @@ console.log('Tools:', tools);
     if (!origin || !dir) return null;
 
     const selectionMode = options.selectionMode || "nearestVertex";
+    // Explicit caller option wins outright (Annotate/Measure always pass
+    // true). An OMITTED option — both VR reticle call sites — falls back to
+    // whichever tool VRToolManager.activateTool most recently marked as
+    // wanting exact-source picking, so the reticle only restricts itself
+    // while Annotate/Measure is actually active (matching what a trigger
+    // pull will hit) rather than always, which would break Probe's
+    // intentionally-unrestricted glyph/derived-actor picking.
+    const excludeDerivedActors =
+      options.excludeDerivedActors ?? !!vrContext._exactSourcePickActive;
     const pickTargets = this._getVRPickTargets(vrContext, {
-      excludeDerived: !!options.excludeDerivedActors,
+      excludeDerived: excludeDerivedActors,
     });
 
     // exactPoint bypasses cell-based picking entirely — it wants the nearest
@@ -5111,36 +5138,24 @@ console.log('Tools:', tools);
       return this._raycastExactPoint(vrContext, pickTargets, origin, dir, renderer);
     }
 
-    // Cached, pick-list-scoped, world-space cell picker. See the three
-    // helpers below for why each of these matters.
-    const picker = this._getVRPicker(vrContext);
-    picker.setTolerance(VR_PICK_TOLERANCE);
-    picker.setPickFromList(true);
-    picker.setPickList(pickTargets);
-
     const { p1, p2, rayLength } = this._computeVRPickRayPoints(vrContext, origin, dir);
 
-    // pick3DPoint is the WORLD-space counterpart of pick() (which takes a
-    // 3-component DISPLAY/pixel coordinate — passing a world point there, as
-    // the old code did, corrupts renderer.getActiveCamera() downstream).
-    // Neither pick() nor pick3DPoint() returns a value; the hit test is done
-    // by reading back picker.getCellId() afterward, mirroring the proven
-    // desktop convention in vtkRaycaster.js (picker.pick + getCellId() < 0).
+    // Direct ray/triangle intersection, NOT vtkPicker.pick3DPoint.
     //
-    // No manual un-yaw needed here (unlike probeDataVR below): pick3DInternal
-    // intersects against prop.getMatrix(), which already includes the
-    // UserMatrix written by _applyVRDataRotation (:5222-ish), so the picker
-    // sees the actor exactly as rendered, twist and all.
-    // Reset pick state EXPLICITLY. pick3DPoint calls the module-local
-    // initialize() (Picker.js:272), not publicAPI.initialize — and
-    // vtkCellPicker only overrides the latter (CellPicker.js:113-116 ->
-    // resetPickInfo -> model.cellId = -1). publicAPI.pick calls it for us
-    // (CellPicker.js:137); pick3DPoint does not. Without this, a miss reports
-    // the PREVIOUS pick's cellId/position and markers stick to a stale point.
-    picker.initialize();
-    picker.pick3DPoint(p1, p2, renderer);
-
-    const cellId = picker.getCellId();
+    // pick3DPoint derives its pick tolerance from the DISPLAY projection
+    // (Picker.js:282 -> computeTolerance -> displayToNormalizedDisplay ->
+    // renderer.normalizedDisplayToWorld) while being handed p1[2] — a raw
+    // DATA-space Z. In VR the camera it inverts carries a force-installed XR
+    // projection matrix plus setPhysicalScale(1 / vrScale), so that round trip
+    // yields a NaN or wildly mis-scaled tolerance, which then inflates the
+    // prop bounds at Picker.js:115 until intersectBox rejects EVERY prop.
+    // That is the universal cellId === -1 that made annotate/measure/probe
+    // silently do nothing on both Quest and Vision Pro. vtk.js exposes no way
+    // to supply an explicit world-space tolerance (pick3DInternal is
+    // module-private) and ships no vtkCellLocator here, so we intersect
+    // ourselves — see vr/vrRayPick.js.
+    const pickResult = this._pickCellByRayVR(vrContext, pickTargets, p1, p2);
+    const cellId = pickResult ? pickResult.cellId : -1;
 
     // Diagnostic for on-headset debugging (remote console via chrome://inspect).
     // Logged only when the hit/miss state FLIPS, never per frame — raycastVR
@@ -5181,23 +5196,13 @@ console.log('Tools:', tools);
       return null;
     }
 
-    const position = picker.getPickPosition();
-    const normal = picker.getPickNormal() || [0, 1, 0];
-    // vtkCellPicker exposes the hit actor only via the plural getActors()
-    // list (no singular getActor()) — mirror vtkRaycaster.js's fallback.
-    let actor = null;
-    if (typeof picker.getActor === "function") {
-      actor = picker.getActor();
-    } else if (typeof picker.getActors === "function") {
-      const actors = picker.getActors();
-      actor = Array.isArray(actors) ? actors[0] : null;
-    }
+    const position = pickResult.position;
+    const normal = pickResult.normal || [0, 1, 0];
+    const actor = pickResult.actor;
 
     // Resolve the actual source POINT id, not just the triangle/cell that was
-    // hit. vtkCellPicker computes this internally (the closest point within
-    // the hit cell) but never exposes it publicly — recompute it from the
-    // cell's own point ids (getCellPoints, typically 3-4, at most a handful)
-    // plus the already-known pick position. -1 when it can't be resolved
+    // hit — the vertex of the hit triangle nearest the intersection, using
+    // the point ids the intersector reports plus the known hit position. -1 when it can't be resolved
     // (e.g. the actor's polydata isn't reachable), which callers must treat
     // as "no source point id available" rather than a real index.
     // 'surface' mode skips this deliberately — it wants the raw interpolated
@@ -5210,11 +5215,23 @@ console.log('Tools:', tools);
           typeof actor?.getMapper === "function"
             ? actor.getMapper()?.getInputData?.()
             : null;
-        const cellInfo =
-          typeof polyData?.getCellPoints === "function"
-            ? polyData.getCellPoints(cellId)
-            : null;
-        const candidateIds = cellInfo?.cellPointIds;
+        // Prefer the hit triangle's own vertex ids, which the
+        // intersector already knows exactly (vr/vrRayPick.js returns them
+        // alongside the cell id). getCellPoints() is the fallback: it needs
+        // buildCells() to have run, and on a polydata where it has not it
+        // returns null or throws — which silently left pointId at -1 and
+        // dropped annotations back to un-snapped surface positions.
+        // Narrowing to the triangle is also strictly better than the whole
+        // cell: for a fan-triangulated polygon it excludes vertices that
+        // belong to the polygon but not to the triangle actually hit.
+        let candidateIds = pickResult.pointIds;
+        if (!candidateIds || !candidateIds.length) {
+          const cellInfo =
+            typeof polyData?.getCellPoints === "function"
+              ? polyData.getCellPoints(cellId)
+              : null;
+          candidateIds = cellInfo?.cellPointIds;
+        }
         if (candidateIds && candidateIds.length) {
           const coords = polyData.getPoints().getData();
           // `position` is WORLD-space (picker.getPickPosition(), already
@@ -5283,6 +5300,115 @@ console.log('Tools:', tools);
       actor,
       datasetId: this._getVRInstanceDatasetId(vrContext),
     };
+  }
+
+  /**
+   * Nearest cell hit by a world-space segment, across every pick target.
+   *
+   * Replaces vtkPicker.pick3DPoint for VR — see the comment at the call site
+   * in raycastVR for why that function cannot work under an XR projection
+   * matrix. The intersection math lives in vr/vrRayPick.js and is pure
+   * geometry; this method only handles the vtk plumbing around it:
+   *
+   *  1. Map the segment into each actor's LOCAL frame, by pushing BOTH
+   *     endpoints through the inverse of prop.getMatrix(). Transforming both
+   *     endpoints (rather than an origin plus a rotated direction) maps the
+   *     segment correctly through the full affine transform, so actor
+   *     Position/Orientation/Scale AND the VR-yaw UserMatrix written by
+   *     _applyVRDataRotation are all honoured — the same "twist and all"
+   *     property pick3DInternal got from prop.getMatrix().
+   *  2. Intersect against that actor's polydata.
+   *  3. Map the hit point back to world space and keep the nearest across
+   *     actors, compared by parametric t so the comparison is meaningful
+   *     across actors with different scales.
+   *
+   * The acceleration structure is built once per polydata and cached on the
+   * actor's mapper input, keyed by mtime so an edited/recomputed dataset
+   * rebuilds rather than picking against stale geometry.
+   *
+   * @param {object} vrContext
+   * @param {object[]} pickTargets - candidate vtkActors
+   * @param {number[]} p1 - segment start, world/data space
+   * @param {number[]} p2 - segment end, world/data space
+   * @returns {{actor: object, cellId: number, position: number[],
+   *   normal: number[], pointIds: number[]}|null}
+   * @private
+   */
+  _pickCellByRayVR(vrContext, pickTargets, p1, p2) {
+    let best = null;
+    let bestT = Infinity;
+
+    for (const actor of pickTargets || []) {
+      const polyData =
+        typeof actor?.getMapper === "function"
+          ? actor.getMapper()?.getInputData?.()
+          : null;
+      if (!polyData) continue;
+
+      const accel = this._getPickAccel(polyData);
+      if (!accel) continue;
+
+      const localP1 = this._transformPointByActorMatrix(actor, p1, { invert: true });
+      const localP2 = this._transformPointByActorMatrix(actor, p2, { invert: true });
+      if (!localP1 || !localP2) continue;
+
+      const hit = intersectRay(accel, localP1, localP2);
+      if (!hit || hit.t >= bestT) continue;
+
+      bestT = hit.t;
+      best = {
+        actor,
+        cellId: hit.cellId,
+        position: this._transformPointByActorMatrix(actor, hit.point),
+        // The normal is a direction, not a point, so it cannot go through the
+        // point transform (that would add the translation). Callers use it
+        // only to orient a marker, so the local-space normal is close enough
+        // for every transform this app applies (rotation + uniform scale).
+        normal: hit.normal,
+        // Vertex ids of the triangle actually hit. raycastVR snaps its
+        // reported point to the nearest of these. Carrying them here is what
+        // lets it avoid polyData.getCellPoints(), which needs buildCells() to
+        // have run and throws "cannot read properties of undefined" on a
+        // polydata where it has not.
+        pointIds: hit.pointIds,
+      };
+    }
+
+    return best;
+  }
+
+  /**
+   * Build-once, cached ray-pick acceleration structure for a polydata.
+   *
+   * Keyed on the polydata in a WeakMap rather than on vrContext: the same
+   * dataset can be shown by several actors (source plus derived), and they
+   * should share one structure instead of building it per actor. A WeakMap
+   * rather than an own property because vtk.js objects are not extensible —
+   * assigning to one throws "object is not extensible" — and it also lets the
+   * structure be collected with the polydata instead of pinning it alive.
+   *
+   * @param {object} polyData - vtkPolyData
+   * @returns {object|null} PickAccel, or null when there is nothing to pick
+   * @private
+   */
+  _getPickAccel(polyData) {
+    const mtime = typeof polyData.getMTime === "function" ? polyData.getMTime() : 0;
+    const cached = VR_PICK_ACCEL_CACHE.get(polyData);
+    if (cached && cached.mtime === mtime) return cached.accel;
+
+    // Never let a malformed dataset throw out of here. raycastVR runs inside
+    // the XR frame loop's blanket try/catch, so a throw is invisible except as
+    // tools that "do nothing" — exactly the silent-failure shape this whole
+    // rewrite exists to remove. A null structure degrades to "nothing to pick
+    // on this actor", which the caller already handles.
+    let accel = null;
+    try {
+      accel = buildPickAccel(polyData);
+    } catch (err) {
+      log.debug(`VR pick: could not build pick structure (${err?.message})`);
+    }
+    VR_PICK_ACCEL_CACHE.set(polyData, { accel, mtime });
+    return accel;
   }
 
   /**

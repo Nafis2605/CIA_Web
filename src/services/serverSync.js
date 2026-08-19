@@ -41,6 +41,14 @@ class ServerSyncService {
     this.subsetManager = null;
     this.annotationManager = null;
     this.pendingProjectId = null;
+    // Room channel counterpart to pendingProjectId — populated from
+    // sessionManager on connect() and (re)sent as "join:room" every time
+    // auth:success fires, so a reconnect re-joins the room channel too.
+    // Unlike pendingProjectId this can legitimately stay null: VR is the
+    // only current consumer of room-scoped WS broadcasts, and a session
+    // that hasn't initialized a room yet (getRoomId() throws) has nothing
+    // to join.
+    this.pendingRoomId = null;
     this._authUnsubscribe = null;
     // DR1: workspace + user scope for watermark management
     this._workspaceId = null;
@@ -151,6 +159,33 @@ class ServerSyncService {
     this.annotationManager = annotationManager;
   }
 
+  /**
+   * Set the pending room id, mirroring how pendingProjectId is populated
+   * from sessionManager.getProjectId() in connect(). Exposed publicly so a
+   * caller that resolves the room after connect() has already fired (e.g.
+   * sessionManager finishing initialization) can still get it sent — the
+   * next auth:success (including a reconnect's) will pick it up.
+   */
+  setRoomId(roomId) {
+    this.pendingRoomId = roomId || null;
+  }
+
+  /**
+   * @private
+   * sessionManager.getRoomId() throws when the session hasn't been
+   * initialized yet (see sessionManager.js), unlike getProjectId() which
+   * falls back to a default. connect() runs on module init, well before
+   * that's guaranteed — this wrapper turns "not ready yet" into null
+   * instead of an uncaught throw out of the ws.onopen handler.
+   */
+  _safeRoomId() {
+    try {
+      return sessionManager.getRoomId();
+    } catch {
+      return null;
+    }
+  }
+
   connect() {
     // A fresh connect() (initial load, or a deliberate reconnect after a
     // prior disconnect()) means the app wants to be connected again —
@@ -177,6 +212,7 @@ class ServerSyncService {
         this.reconnectAttempts = 0;
 
         this.pendingProjectId = sessionManager.getProjectId();
+        this.pendingRoomId = this._safeRoomId();
         void this._authenticate();
       };
 
@@ -226,6 +262,15 @@ class ServerSyncService {
       if (this.pendingProjectId) {
         this._send({ type: "join:project", projectId: this.pendingProjectId });
       }
+      // Room channel join lives here rather than in connect(): connect()
+      // only runs once per socket, but auth:success fires on every
+      // (re)authentication including reconnects, so this is what makes a
+      // reconnect actually re-join the room channel. Without it,
+      // wsManager.roomChannels never gets a member and room-scoped
+      // broadcasts (VR) reach nobody — see serverSync.joinRoom.test.js.
+      if (this.pendingRoomId) {
+        this._send({ type: "join:room", roomId: this.pendingRoomId });
+      }
     });
     this.on("auth:error", (msg) => {
       log.warn(`Authentication failed: ${msg.error || "unknown error"}`);
@@ -235,6 +280,33 @@ class ServerSyncService {
     });
     this.on("project:joined", (msg) =>
       log.info(`Joined project ${msg.projectId}`)
+    );
+    this.on("room:join-error", (msg) => {
+      // Loud, and re-broadcast as a DOM event, because this single failure
+      // silently disables ALL room-scoped collaboration. A denied join means
+      // this socket is never added to wsManager.roomChannels, so every
+      // broadcastToRoom() message — the whole vr:session-created /
+      // vr:participant-joined / vr:lease-changed family — hits
+      // `if (!channel) return;` server-side and reaches nobody. Two headsets
+      // in one room then look perfectly healthy while being completely
+      // unable to see each other. This used to be a log.warn nobody would
+      // ever read on a headset.
+      const reason = msg.error || "unknown error";
+      log.error(
+        `Room join FAILED (${reason}) — room-scoped collaboration (VR sessions, participants, presence) is DISABLED for this session.`
+      );
+      try {
+        window.dispatchEvent(
+          new CustomEvent("cia:room-join-error", {
+            detail: { error: reason, roomId: msg.roomId },
+          })
+        );
+      } catch {
+        // Event dispatch is best-effort — never let it mask the log above.
+      }
+    });
+    this.on("room:joined", (msg) =>
+      log.info(`Joined room ${msg.roomId}`)
     );
 
     // File events
@@ -614,6 +686,19 @@ class ServerSyncService {
       log.info(`VR participant left: ${msg.userId}`);
       window.dispatchEvent(
         new CustomEvent("cia:vr-participant-left", {
+          detail: msg,
+        })
+      );
+    });
+
+    // Phase D3 (VRManipulationLock server lease): every acquire/heartbeat/
+    // release/grant on the manipulation lease broadcasts this so a peer's
+    // grant is visible to the grantee without waiting on its own network
+    // round trip — see VRManipulationLock._handleLeaseChangedEvent.
+    this.on("vr:lease-changed", (msg) => {
+      log.debug(`VR lease changed: session ${msg.sessionId}`);
+      window.dispatchEvent(
+        new CustomEvent("cia:vr-lease-changed", {
           detail: msg,
         })
       );

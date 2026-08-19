@@ -325,8 +325,22 @@ export function syncCameraToYjs(viewId, userId, cameraState, syncKey = null, col
  * @param {string|null} [collaborationViewId] - Additive per-view id (H5, see
  *   viewSyncKey.js's `mode: 'view'`). Currently inert — no consumer matches
  *   on it yet — carried along so it's available once one does.
+ * @param {number|null} [revision] - The writer's last-known
+ *   `view_configurations.revision` for this view (see
+ *   pushSharedVisualizationUpdate in visualizationSyncService.js, which
+ *   sources it from ViewConfigurationManager's cached view). Stamped onto
+ *   the entry so a late-join replay (yjsObservers.js's
+ *   replayVisualizationState) can tell a stale in-flight entry apart from
+ *   one newer than a server snapshot it's being compared against. Omitted
+ *   (left unset, not written as an explicit null) when the caller has no
+ *   revision to report — see replayVisualizationState's docstring for how
+ *   an unstamped entry is treated.
+ * @param {{sessionRevision: number|null, actorId: string, opId: string|null}|null} [meta]
+ *   Phase D6 mutation envelope (VR gestures only, currently) — see
+ *   VRExplorationManager._buildMutationMeta. Each present field is stamped
+ *   onto the entry individually; omitted entirely when not supplied.
  */
-export function syncVisualizationToYjs(viewId, userId, vizState, syncKey = null, collaborationViewId = null) {
+export function syncVisualizationToYjs(viewId, userId, vizState, syncKey = null, collaborationViewId = null, revision = null, meta = null) {
   try {
     // Each field is its own nested Y.Map entry (not a plain-object merge), so
     // two clients patching DIFFERENT fields concurrently (e.g. Alice changes
@@ -353,6 +367,14 @@ export function syncVisualizationToYjs(viewId, userId, vizState, syncKey = null,
       entry.set("collaborationViewId", collaborationViewId);
       entry.set("clientId", ydoc.clientID);
       entry.set("lastUpdate", Date.now());
+      if (revision != null) {
+        entry.set("revision", revision);
+      }
+      if (meta) {
+        if (meta.actorId != null) entry.set("actorId", meta.actorId);
+        if (meta.opId != null) entry.set("opId", meta.opId);
+        if (meta.sessionRevision != null) entry.set("sessionRevision", meta.sessionRevision);
+      }
     });
   } catch (error) {
     log.error("Failed to sync visualization to Y.js:", error);

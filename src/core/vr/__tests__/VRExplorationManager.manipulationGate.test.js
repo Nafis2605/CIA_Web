@@ -33,7 +33,14 @@ vi.mock("@Core/vr/VRParticipantSync.js", () => ({ VRParticipantSync: class {} })
 // inside startExploration(), which these tests never call.
 vi.mock("@Core/vr/VRSnapshotManager.js", () => ({ VRSnapshotManager: class {} }));
 vi.mock("@Core/vr/VRControlManager.js", () => ({ VRControlManager: class {} }));
-vi.mock("@Core/vr/VRManipulationLock.js", () => ({ VRManipulationLock: class {} }));
+vi.mock("@Core/vr/VRManipulationLock.js", () => ({
+  VRManipulationLock: class {},
+  // Real module also exports this (Phase D4) — not exercised by these tests
+  // (they wire _activeContext/_manipulationLock directly rather than going
+  // through startExploration/rekey), but a mock factory missing a named
+  // export the real module has is a landmine for the next test added here.
+  isServerSessionId: (id) => typeof id === "string" && /^[0-9a-f-]{36}$/i.test(id),
+}));
 vi.mock("@Core/vr/navigation/VRNavigationController.js", () => ({
   VRNavigationController: class {},
 }));
@@ -165,7 +172,15 @@ describe("VRExplorationManager â€” manipulation gate", () => {
 
     // Third arg is the cross-client sync key. This fixture has no datasetId,
     // so it falls back to viewConfigId (see @Core/instances/viewSyncKey.js).
-    expect(mockPush).toHaveBeenCalledWith("view-1", { representation: "wireframe" }, "view-1");
+    // Fourth arg is the Phase D6 mutation envelope — every _pushVisualizationPatch
+    // call attaches one now, so exact-match assertions accept any shape as
+    // long as actorId is the local participant (see _buildMutationMeta).
+    expect(mockPush).toHaveBeenCalledWith(
+      "view-1",
+      { representation: "wireframe" },
+      "view-1",
+      expect.objectContaining({ actorId: "peer-2" })
+    );
     // The EXISTING desktop manipulator-awareness channel, not new plumbing.
     expect(mockSyncManipulator).toHaveBeenCalledWith("peer-2", "Bob", "dataset", "manipulating");
   });
@@ -198,7 +213,12 @@ describe("VRExplorationManager â€” manipulation gate", () => {
 
     vrExplorationManager._pushVisualizationPatch({ representation: "points" });
 
-    expect(mockPush).toHaveBeenCalledWith("view-1", { representation: "points" }, "view-1");
+    expect(mockPush).toHaveBeenCalledWith(
+      "view-1",
+      { representation: "points" },
+      "view-1",
+      expect.objectContaining({ actorId: "peer-2" })
+    );
     expect(vrExplorationManager.getVRNotice()).toBeNull();
   });
 

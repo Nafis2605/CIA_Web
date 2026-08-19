@@ -76,6 +76,10 @@ describe("VRSpatialMenuModel — row 4 restructure invariants", () => {
 
   it("row 4 keeps only essential session controls plus the advanced drawer", () => {
     expect(VR_MENU_BUTTONS.filter((b) => b.row === 4).map((b) => b.id)).toEqual([
+      // Mic is on the default surface because voice auto-joins muted on VR
+      // entry — see VR_MENU_BUTTONS. Reaching it through the Advanced drawer
+      // made voice effectively unusable in-headset.
+      "voice-mute",
       "people",
       "isolation",
       "advanced",

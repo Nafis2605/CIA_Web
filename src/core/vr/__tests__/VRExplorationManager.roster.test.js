@@ -27,7 +27,12 @@ vi.mock("@Core/vr/VRParticipantSync.js", () => ({ VRParticipantSync: class {} })
 vi.mock("@Core/vr/tools/VRToolManager.js", () => ({ VRToolManager: class {} }));
 vi.mock("@Core/vr/VRSnapshotManager.js", () => ({ VRSnapshotManager: class {} }));
 vi.mock("@Core/vr/VRControlManager.js", () => ({ VRControlManager: class {} }));
-vi.mock("@Core/vr/VRManipulationLock.js", () => ({ VRManipulationLock: class {} }));
+vi.mock("@Core/vr/VRManipulationLock.js", () => ({
+  VRManipulationLock: class {},
+  // Real module also exports this (Phase D4) — see the identical comment in
+  // VRExplorationManager.manipulationGate.test.js.
+  isServerSessionId: (id) => typeof id === "string" && /^[0-9a-f-]{36}$/i.test(id),
+}));
 vi.mock("@Core/vr/navigation/VRNavigationController.js", () => ({ VRNavigationController: class {} }));
 vi.mock("@Core/instances/workspaceManager.js", () => ({
   workspaceManager: { getInstance: vi.fn(), getInstancesByType: vi.fn(() => []) },

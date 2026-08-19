@@ -18,6 +18,10 @@ export class VRToolManager {
    *   VRExplorationManager already imports this module — importing it back
    *   would be a cycle. Absent => everything is permitted, which is what keeps
    *   a bare `new VRToolManager(handler, ctx)` behaving as it always did.
+   * @param {(text: string) => void} [options.flashNotice] - in-headset status
+   *   line callback, injected the same way and for the same reason
+   *   (VRExplorationManager._flashVRNotice). Absent => tools calling
+   *   flashNotice() are silent no-ops.
    */
   constructor(handler, vrContext, options = {}) {
     this._handler = handler;
@@ -25,6 +29,9 @@ export class VRToolManager {
     this._activeTool = null;
     this._canManipulate = typeof options.canManipulate === 'function'
       ? options.canManipulate
+      : null;
+    this._flashNotice = typeof options.flashNotice === 'function'
+      ? options.flashNotice
       : null;
 
     // Register available tools
@@ -43,6 +50,7 @@ export class VRToolManager {
     // at COMMIT time, never cache it, so a token handed over mid-session takes
     // effect on the very next placement.
     const canManipulate = this._canManipulate;
+    const flashNotice = this._flashNotice;
     this._toolContext = {
       handler: this._handler,
       vrContext: this._vrContext,
@@ -56,6 +64,13 @@ export class VRToolManager {
        */
       canManipulate(label) {
         return canManipulate ? canManipulate(label) !== false : true;
+      },
+      /**
+       * @param {string} text - short, in-headset status-line message
+       * @param {number} [ms] - optional override for how long it stays up
+       */
+      flashNotice(text, ms) {
+        if (flashNotice) flashNotice(text, ms);
       },
     };
   }
@@ -78,6 +93,10 @@ export class VRToolManager {
 
     await tool.activate(this._toolContext);
     this._activeTool = tool;
+    // See raycastVR's excludeDerivedActors fallback in VTKInstanceHandler.js
+    // — the VR reticle reads this flag so it only restricts itself to
+    // source-actor picking while a tool that actually needs it is active.
+    if (this._vrContext) this._vrContext._exactSourcePickActive = !!tool.exactSourcePicking;
 
     log.debug(`Activated tool: ${toolId}`);
   }
@@ -89,6 +108,7 @@ export class VRToolManager {
     if (this._activeTool) {
       await this._activeTool.deactivate();
       this._activeTool = null;
+      if (this._vrContext) this._vrContext._exactSourcePickActive = false;
     }
   }
 

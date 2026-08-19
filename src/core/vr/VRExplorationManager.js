@@ -14,10 +14,15 @@ import { VRParticipantSync } from '@Core/vr/VRParticipantSync.js';
 import { VRToolManager } from '@Core/vr/tools/VRToolManager.js';
 import { VRSnapshotManager } from '@Core/vr/VRSnapshotManager.js';
 import { VRControlManager } from '@Core/vr/VRControlManager.js';
-import { VRManipulationLock } from '@Core/vr/VRManipulationLock.js';
+import { VRManipulationLock, isServerSessionId } from '@Core/vr/VRManipulationLock.js';
+// Phase D5 rollback snapshot source — see beginManipulationGesture. Reads the
+// full set of VTK visualization state applySharedState() knows how to apply
+// (Phase C3), not just camera/opacity/representation.
+import { aggregateVTKVisualizationState } from '@Core/instances/types/vtk/vtkStateAggregator.js';
 import { VRNavigationController } from '@Core/vr/navigation/VRNavigationController.js';
 import { workspaceManager } from '@Core/instances/workspaceManager.js';
-import { resolveViewSyncKey } from '@Core/instances/viewSyncKey.js';
+import { resolveViewSyncKey, instanceMatchesViewUpdate } from '@Core/instances/viewSyncKey.js';
+import { resolveServerSessionOwnerId, resolveServerSessionOwnerName } from '@Core/vr/vrSessionOwner.js';
 import { getViewConfigurationManager, getDatasetManager } from '@Init/appInitializer.js';
 // getParticipantId(), NOT getUserId(), is the identity every peer-facing check
 // below uses: two headsets on one account share a getUserId(), so "is this me?"
@@ -63,6 +68,7 @@ import {
   syncManipulatorToYjs,
   yManipulatorState,
 } from '@Collaboration/yjs/yjsSetup.js';
+import { hydrateFromYjs } from '@Collaboration/yjs/yjsObservers.js';
 import { presenceSystem } from '@Collaboration/presence/presenceSystem.js';
 import { mapXRPointToData, controllerForward } from '@Core/vr/tools/vrPlaneMath.js';
 import { vrEnvironment } from '@Core/vr/environment/VREnvironment.js';
@@ -121,6 +127,15 @@ const POINTER_PICK_MS = 100;
 // per-frame budget entirely.
 const VR_SESSION_HEARTBEAT_MS = 1000;
 
+// Floor between POST /vr/sessions/:id/heartbeat calls (Issue 6 — session
+// liveness, distinct from the manipulation LEASE's own heartbeat). Piggybacks
+// on the 1Hz vr-session-registry tick purely for scheduling convenience — it
+// runs at its own, much coarser cadence via this separate gate. 30s keeps it
+// well under the server's REAP_ACTIVE_STALE_MS (120s)/REAP_PREPARING_STALE_MS
+// (90s — server/src/routes/vr.js) with plenty of margin for a couple of
+// dropped ticks.
+const SERVER_SESSION_HEARTBEAT_MS = 30000;
+
 // How long an in-VR notice ("X has data control") stays on the spatial menu's
 // status line. Long enough to read at arm's length inside a headset, short
 // enough that it never masks the dataset/scale/mode line for a whole gesture.
@@ -147,6 +162,26 @@ const PATCH_LABELS = Object.freeze({
 // the desktop manipulator-awareness UI (see _signalManipulation).
 const FILTER_PATCH_KEYS = new Set(['clipBox', 'threshold', 'isosurface', 'glyph']);
 
+// Mirrors the server's UUID check (isValidUUID, server/src/middleware/
+// validateUUID.js) — used only to decide whether _checkVRPreprocessingReadiness
+// can even ask the DB about a dataset. Builtin/demo ids (e.g. "builtin-lungs")
+// and other client-only placeholder ids are never UUIDs and have no
+// preprocessing row to check, so they must short-circuit rather than hit the
+// server (which applies the identical guard — see asUuidOrNull in
+// server/src/routes/vr.js — so this is belt-and-suspenders, not load-bearing
+// on its own).
+const DATASET_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function isValidDatasetUUID(id) {
+  return typeof id === 'string' && DATASET_UUID_RE.test(id);
+}
+
+// Phase D5: how long after the last tick of a throttled value-drag (point
+// size / line width / threshold min-max — see _pushThrottledPatch) with no
+// further ticks before its manipulation gesture auto-ends. There is no
+// discrete "pointer up" reaching that method, only a stream of value
+// changes, so silence is the only end-of-gesture signal available.
+const THROTTLED_GESTURE_IDLE_MS = 500;
+
 class VRExplorationManager extends BaseManager {
   constructor() {
     super();
@@ -163,11 +198,32 @@ class VRExplorationManager extends BaseManager {
     this._navigationController = null;
 
     // Data-manipulation token (Phase 3). Null outside an active session — and
-    // EVERY gate below fails OPEN on null, so nothing that worked before this
-    // existed can be blocked by its absence (see _hasManipulationControl).
+    // EVERY gate below fails OPEN on null UNLESS _leaseRequired (Phase D4),
+    // so nothing that worked before this existed can be blocked by its
+    // absence (see _hasManipulationControl).
     /** @type {VRManipulationLock|null} */
     this._manipulationLock = null;
     this._offManipulationLock = null;
+    // Phase D4 fail-closed gate. True ONLY once the active session is
+    // confirmed against a real server row (isServerSessionId(session.id)) —
+    // set alongside every place session.id is finalized/rekeyed
+    // (startExploration, _reconcileLateRegistration,
+    // _watchVRSessionConvergence). See _hasManipulationControl for why
+    // unconditional fail-closed would break both offline/local VR and the
+    // existing tests that fabricate a lock-less _activeContext.
+    this._leaseRequired = false;
+    // Phase D5: gesture-scoped rollback bookkeeping. Exactly one gesture is
+    // ever in flight at a time (VR input is single-threaded per frame) — see
+    // beginManipulationGesture/endManipulationGesture.
+    /** @type {{kind:string, instanceId:string, state:object}|null} */
+    this._gestureSnapshot = null;
+    this._gestureOpId = null;
+    // Per-hook "is a gesture currently open" flags — see _pushObjectTransformPatch,
+    // _handleToolAction's clip-box-updated case, and _pushThrottledPatch.
+    this._transformGestureActive = false;
+    this._clipGestureActive = false;
+    this._throttledGestureActive = false;
+    this._throttledGestureTimer = null;
     // Transient in-headset message, { text, untilMs } — see _flashVRNotice.
     this._vrNotice = null;
     // Debounce handle for the "this user is manipulating" activity signal.
@@ -249,6 +305,18 @@ class VRExplorationManager extends BaseManager {
     this._offVRSessionObserver = null;
     this._lastVRSessionHeartbeat = 0;
 
+    // Issue 6 (session lifecycle): the server row id WE successfully
+    // registered via _tryRegisterSession/_reconcileLateRegistration — null
+    // when we joined (Path 1), adopted a live local record (Path 2), or lost
+    // the server's create race (serverRow.adopted). Lets the fast-path
+    // orphan cleanup in _watchVRSessionConvergence's rekey branch tell "a row
+    // WE created is now unreachable" (safe to delete) apart from "someone
+    // else's canonical row is unreachable" (never delete — see that
+    // method's comment). Also gates _sendServerSessionHeartbeat's own 30s
+    // throttle in the frame loop.
+    this._registeredServerSessionId = null;
+    this._lastServerSessionHeartbeat = 0;
+
     // Bind methods
     this._onFrame = this._onFrame.bind(this);
     this._onSessionEnd = this._onSessionEnd.bind(this);
@@ -284,18 +352,33 @@ class VRExplorationManager extends BaseManager {
       throw new Error('WebXR not supported');
     }
 
+    // Issue 7: refuse (or warn past, via config.skipPreprocessingCheck) entry
+    // onto a large dataset that still needs server-side LOD/octree prep. Must
+    // run BEFORE _resolveSessionKey/session registration below — a blocked
+    // entry must never create a server row, or it becomes an Issue-6 zombie
+    // the moment it's created.
+    await this._checkVRPreprocessingReadiness(instance, config);
+
     // Create session locally. If we're joining an existing server session
     // (config.serverSession from joinSession), reuse its id; otherwise the
     // session is registered with the server after VR entry succeeds.
-    const { serverSession = null, ...sessionConfig } = config;
+    // `state` is the Phase C buildSessionState() snapshot embedded in the
+    // join response (see joinSession below) — only present when this call
+    // originated from an actual join, not a fresh "Enter VR".
+    const { serverSession = null, state: sessionState = null, ...sessionConfig } = config;
     const session = new VRExplorationSession({
       id: serverSession?.id ||
         `vrsession_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
       viewConfigurationId: instance.viewConfigId,
       datasetId: instance.instanceData?.dataset?.id,
       projectId: instance.instanceData?.projectId,
-      ownerUserId: serverSession?.owner_user_id || getParticipantId(),
-      ownerUserName: serverSession?.owner_user_name || getParticipantName(),
+      // resolveServerSessionOwnerId prefers owner_participant_id (composite,
+      // accountUserId#deviceId — migration 021) over the bare owner_user_id,
+      // so a joiner reads the HOST'S DEVICE, not just their account. See
+      // src/core/vr/vrSessionOwner.js for why this single assignment point
+      // is enough to fix every downstream read of session.ownerUserId.
+      ownerUserId: resolveServerSessionOwnerId(serverSession) || getParticipantId(),
+      ownerUserName: resolveServerSessionOwnerName(serverSession) || getParticipantName(),
       ...sessionConfig,
     });
 
@@ -319,6 +402,11 @@ class VRExplorationManager extends BaseManager {
     //     still beat us to it (Y.js Map is last-writer-wins), so adopt
     //     whatever claimVRSession() returns rather than assuming we won it.
     const sessionKey = this._resolveSessionKey(instance);
+    // Issue 6: reset per-session bookkeeping from any PREVIOUS session this
+    // manager instance ran (it's a singleton) — otherwise a stale id from
+    // last time could make the fast-path orphan cleanup below think this
+    // brand-new session already registered a row it never actually created.
+    this._registeredServerSessionId = null;
     if (serverSession?.id) {
       // Path 1 — nothing to adopt, id is already canonical.
     } else {
@@ -330,20 +418,44 @@ class VRExplorationManager extends BaseManager {
         session.ownerUserName = liveRecord.hostUserName;
       } else {
         // Path 3
-        const serverRow = await this._tryRegisterSession(session);
+        const serverRow = await this._tryRegisterSession(session, undefined, sessionKey);
         if (serverRow?.id) {
           session.id = serverRow.id;
         }
-        const claimed = claimVRSession(sessionKey, {
-          sessionId: session.id,
-          hostUserId: getParticipantId(),
-          hostUserName: getParticipantName(),
-          datasetId: session.datasetId,
-          projectId: session.projectId,
-        });
-        session.id = claimed.sessionId;
-        session.ownerUserId = claimed.hostUserId;
-        session.ownerUserName = claimed.hostUserName;
+
+        if (serverRow?.adopted) {
+          // Issue 6 / THE load-bearing interaction with Issue 5: we lost the
+          // create race (one active session per room+dataset —
+          // ux_vr_sessions_room_dataset_active, 023_vr_session_lifecycle.sql).
+          // The server already folded us in as a participant on the
+          // WINNER's row — adopt ITS identity via resolveServerSessionOwnerId/
+          // -Name rather than falling into the claimVRSession call below with
+          // OURSELVES as hostUserId, which would write us into the Yjs
+          // registry as host for a session the server says someone else
+          // owns, re-introducing the two-hosts bug Issue 5 fixed — through
+          // the registry this time, instead of the manipulation lease.
+          session.ownerUserId = resolveServerSessionOwnerId(serverRow) || session.ownerUserId;
+          session.ownerUserName = resolveServerSessionOwnerName(serverRow) || session.ownerUserName;
+        } else {
+          const claimed = claimVRSession(sessionKey, {
+            sessionId: session.id,
+            hostUserId: getParticipantId(),
+            hostUserName: getParticipantName(),
+            datasetId: session.datasetId,
+            projectId: session.projectId,
+          });
+          session.id = claimed.sessionId;
+          session.ownerUserId = claimed.hostUserId;
+          session.ownerUserName = claimed.hostUserName;
+          // We successfully registered a row of our own with the server
+          // (not an adoption) — remember its id so the fast-path orphan
+          // cleanup in _watchVRSessionConvergence can tell "a row WE
+          // created is now unreachable" apart from "someone else's row is
+          // unreachable" (see that method's rekey branch).
+          if (serverRow?.id) {
+            this._registeredServerSessionId = serverRow.id;
+          }
+        }
       }
     }
 
@@ -363,17 +475,41 @@ class VRExplorationManager extends BaseManager {
     // desktop user puppeteering a VR user's viewpoint, which is orthogonal to
     // "who may push shared visualization patches". See VRManipulationLock.
     this._manipulationLock = new VRManipulationLock(session);
+    // Phase D4: session.id is fully settled by this point (all three
+    // convergence paths above already ran) — decide whether a lease is
+    // obtainable/enforceable for THIS session right now. Re-evaluated by
+    // _reconcileLateRegistration/_watchVRSessionConvergence if the id
+    // changes later.
+    this._leaseRequired = isServerSessionId(session.id);
 
     // Request XR session via VRManager — the sole owner of session lifecycle,
     // reference space and the XRWebGLLayer. This must be the only place that
     // ever calls navigator.xr.requestSession() for exploration; a competing
     // session here was the root cause of VR entry rendering nothing.
+    //
+    // A missing context here almost always means this view is currently
+    // SERVER-rendered (no local WebGL canvas exists to build an XRWebGLLayer
+    // from) — see docs/vr-rendering-architecture.md for why that's a hard
+    // architectural boundary, not a bug, and why VR cannot support it.
     const glContext = handler.getWebGLContext(instance.instanceId);
     if (!glContext) {
       throw new Error(
-        'Could not get a WebGL context for VR — is the dataset loaded and render mode set to local?'
+        'This view is currently server-rendered, and VR does not support server-rendered views. ' +
+        'Switch this view to local rendering and reload the dataset before entering VR. ' +
+        'VR always renders on the headset’s own GPU — the server only contributes preprocessing (LOD, octree, bounds), never frames.'
       );
     }
+
+    // Pre-warm microphone permission BEFORE going immersive. Once an
+    // immersive-vr session is running the browser has nowhere to render a
+    // permission prompt, so a getUserMedia() deferred until the user first
+    // unmutes inside VR either hangs or is denied outright. initialize()
+    // requests and immediately releases a track, which is enough to settle
+    // the permission while normal DOM UI is still on screen.
+    //
+    // Deliberately awaited but never fatal: a user who denies the mic should
+    // still get into VR, just without voice.
+    await this._prewarmVoicePermission();
 
     log.debug('Requesting XR session via VRManager...');
     await vrManager.enterVR(glContext, {
@@ -418,6 +554,7 @@ class VRExplorationManager extends BaseManager {
     // (which imports them — that would be a cycle).
     this._toolManager = new VRToolManager(handler, vrContext, {
       canManipulate: (label) => this._requireManipulationControl(label),
+      flashNotice: (text, ms) => this._flashVRNotice(text, ms),
     });
 
     // Initialize navigation controller. The onObjectMoved callback lets the
@@ -467,6 +604,15 @@ class VRExplorationManager extends BaseManager {
 
     // Start session
     session.start();
+
+    // Issue 6: fire the session-liveness heartbeat once, immediately, rather
+    // than waiting for the first 1Hz frame-loop tick below — piggybacking
+    // only on that tick would delay the server's 'preparing' -> 'active'
+    // transition by up to SERVER_SESSION_HEARTBEAT_MS (30s) after VR entry,
+    // a visibly slow status flip for no reason. Sets the throttle gate too,
+    // so the frame loop's own tick doesn't immediately re-fire it.
+    this._lastServerSessionHeartbeat = Date.now();
+    this._sendServerSessionHeartbeat();
 
     // Fresh session, fresh error budget: the per-step dedupe suppresses repeat
     // logs, so carrying signatures over from a previous session would silence a
@@ -528,6 +674,11 @@ class VRExplorationManager extends BaseManager {
       )
     );
 
+    // Voice, muted. Fire-and-forget: joining LiveKit is a network round trip
+    // and must not hold up the first rendered frame. See _autoJoinVoice for
+    // why this is automatic rather than menu-driven.
+    this._autoJoinVoice();
+
     // Print the room/session/view triple every peer must agree on. Cheap, once
     // per session, and it is the first thing to check when two headsets cannot
     // see each other.
@@ -564,12 +715,73 @@ class VRExplorationManager extends BaseManager {
       })
     );
 
+    // Late-joiner hydration (Phase C): apply the authoritative server
+    // snapshot embedded in the join response, then replay Y.js. Only
+    // meaningful for an actual join (serverSession + sessionState present)
+    // — a freshly host-started session has nothing to hydrate FROM, and
+    // instance/handler are already fully ready at this point (avatars,
+    // spatial UI and tool manager are all wired up above).
+    if (serverSession && sessionState) {
+      this._hydrateSessionState(instance, sessionState);
+    }
+
     // Emit event
     this._emit('explorationStarted', { session, instanceId });
 
     log.info('VR exploration started', { sessionId: session.id });
 
     return session;
+  }
+
+  /**
+   * Phase C late-joiner hydration. The live Y.js visualization/camera
+   * observers (yjsObservers.js) are delta-only — installed via
+   * .observeDeep()/.observe(), they only ever fire on a CHANGE — so anything
+   * written to Y.js before this client's observer attached is otherwise
+   * invisible to it. Without this, a peer joining an in-progress VR session
+   * sees the host's dataset but none of the host's opacity/representation/
+   * colormap/clip/threshold/... state until the host's next live edit.
+   *
+   * Ordering is deliberate and matters:
+   *  1. The server snapshot (`state`, from buildSessionState() on the join
+   *     response) is authoritative and carries `revision` — applied FIRST,
+   *     directly through the handler's rich applySharedState path (the same
+   *     path every Y.js visualization/camera update ultimately flows
+   *     through — see workspaceManager._handleYjsVisualizationUpdate /
+   *     _handleYjsCameraUpdate) — so there remains exactly one code path
+   *     that interprets a visualization/camera patch.
+   *  2. The Y.js replay runs SECOND. It may hold in-flight edits the server
+   *     hasn't persisted yet, so it must not be skipped — but a Y.js entry
+   *     older than the snapshot must not clobber it either. `minRevision:
+   *     state.revision` enforces that (see syncVisualizationToYjs's
+   *     `revision` stamp and yjsObservers.js's replayVisualizationState /
+   *     _emitVisualizationEntry for exactly how a stale-vs-unstamped entry
+   *     is told apart).
+   *
+   * @param {object} instance - workspaceManager instance (handler + instanceData)
+   * @param {object|null} state - buildSessionState() shape from the join response
+   * @private
+   */
+  _hydrateSessionState(instance, state) {
+    if (!state) return;
+
+    try {
+      const snapshotPatch = {};
+      if (state.visualization) snapshotPatch.visualization = state.visualization;
+      if (state.camera) snapshotPatch.camera = state.camera;
+      if (Object.keys(snapshotPatch).length > 0 && typeof instance.handler?.applySharedState === 'function') {
+        instance.handler.applySharedState(instance.instanceData, snapshotPatch, 'server-snapshot');
+      }
+    } catch (err) {
+      log.warn('Failed to apply server visualization snapshot during VR join hydration:', err?.message || err);
+    }
+
+    try {
+      const counts = hydrateFromYjs({ minRevision: state.revision ?? null });
+      log.debug('VR session state hydrated from Y.js', { snapshotRevision: state.revision, replayed: counts });
+    } catch (err) {
+      log.warn('Failed to replay Y.js state during VR join hydration:', err?.message || err);
+    }
   }
 
   /**
@@ -597,6 +809,76 @@ class VRExplorationManager extends BaseManager {
     }
 
     return this.startExploration(instance.instanceId, config);
+  }
+
+  /**
+   * Issue 7 (VR rendering architecture, Round 2): ask the server whether this
+   * dataset's LOD/octree/bounds preprocessing (vrPreprocessing.js) is done
+   * before letting a fresh "Enter VR" proceed on a huge unprocessed dataset
+   * with no warning. See docs/vr-rendering-architecture.md for the boundary
+   * this enforces — the server prepares data, it never renders VR frames, so
+   * a dataset that needs prep and hasn't received it is a real blocker, not
+   * a cosmetic one.
+   *
+   * Three cases skip the check entirely and resolve to `null` (proceed, no
+   * server round-trip):
+   *  - `config.serverSession` is set — this is a JOIN, not a fresh entry. The
+   *    host already passed (or bypassed) this gate; blocking the joiner here
+   *    would break joining a dataset the host is already inside.
+   *  - `config.skipPreprocessingCheck` is true — the user already saw a
+   *    refusal once and chose "Enter anyway" (VRLaunchModal.jsx).
+   *  - the dataset id is missing or not a UUID (builtin/demo datasets, e.g.
+   *    "builtin-lungs", have no row to check) — mirrors the server's own
+   *    `asUuidOrNull` short-circuit on GET /vr/preprocessing/:datasetId/ready
+   *    (server/src/routes/vr.js), so a bundled demo dataset never blocks VR
+   *    entry on either side of the wire.
+   *
+   * Fails OPEN on any network/parse error from the readiness fetch itself —
+   * deliberately the OPPOSITE of the Phase D manipulation lease's fail-CLOSED
+   * posture (see VRManipulationLock.js / the leaseGate tests). A stale/failed
+   * readiness check only costs frame rate on a possibly-unprocessed dataset;
+   * a stale/failed lease check risks silent data corruption between peers.
+   * Different risk, deliberately different default.
+   *
+   * @param {object} instance - workspaceManager instance (see startExploration)
+   * @param {object} config - the same config startExploration receives
+   * @returns {Promise<{ready:boolean, required:boolean, status:string, progress:number, estimatedTime:number}|null>}
+   *   null when the check was skipped (proceed silently).
+   * @private
+   */
+  async _checkVRPreprocessingReadiness(instance, config) {
+    if (config?.serverSession || config?.skipPreprocessingCheck) {
+      return null;
+    }
+
+    const datasetId = instance?.instanceData?.dataset?.id;
+    if (!isValidDatasetUUID(datasetId)) {
+      return null;
+    }
+
+    let readiness;
+    try {
+      readiness = await apiClient.get(`/vr/preprocessing/${datasetId}/ready`);
+    } catch (err) {
+      log.warn(`VR preprocessing readiness check failed for dataset ${datasetId} — proceeding (fail-open): ${err?.message}`, err);
+      return null;
+    }
+
+    if (readiness && readiness.required === true && readiness.ready === false) {
+      const progress = Number.isFinite(readiness.progress) ? readiness.progress : 0;
+      const minutes = Math.ceil((Number(readiness.estimatedTime) || 0) / 60);
+      // `.code` lets a caller (VRLaunchModal's "Enter anyway" affordance)
+      // distinguish this specific, bypassable refusal from any other
+      // startExploration failure without parsing the message string.
+      throw Object.assign(
+        new Error(
+          `VR preprocessing for this dataset is ${readiness.status} (${progress}%). Large datasets need LOD/octree generation before VR — this usually takes about ${minutes} min. Start it from the dataset panel, or retry once it completes.`
+        ),
+        { code: 'vr-preprocessing-required' }
+      );
+    }
+
+    return readiness || null;
   }
 
   /**
@@ -633,21 +915,66 @@ class VRExplorationManager extends BaseManager {
   }
 
   /**
+   * @private
+   * sessionManager.getRoomId() throws when the session hasn't been
+   * initialized yet (see sessionManager.js), unlike getProjectId() which
+   * falls back to a default. Mirrors serverSync.js's _safeRoomId() — turns
+   * "not ready yet" into null instead of an uncaught throw out of callers
+   * like _tryRegisterSession that run well before initialization is
+   * guaranteed.
+   * @returns {string|null}
+   */
+  _safeRoomId() {
+    try {
+      return sessionManager.getRoomId();
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Register a locally started session with the server, bounded by a short
    * timeout so a slow network never delays VR entry (WebXR requestSession
    * must run while user activation is still fresh). The server generates
    * the canonical id, which every client's Y.js participant map is keyed by
    * — so this must resolve before VRParticipantSync is constructed.
    *
-   * @returns {Promise<object|null>} Server session row, or null (offline/slow)
+   * @param {VRExplorationSession} session
+   * @param {number} [timeoutMs]
+   * @param {string} [sessionKey] - _resolveSessionKey()'s result for this
+   *   view (Issue 6) — sent as datasetSyncKey so the server can enforce one
+   *   active session per (room, dataset). Deliberately a 3rd POSITIONAL
+   *   param, not folded into an options object: several existing tests call
+   *   this positionally (session, timeoutMs) and would break otherwise.
+   * @returns {Promise<object|null>} Server session row, or null (offline/slow).
+   *   May carry `adopted: true` — see startExploration's Path 3 for the
+   *   load-bearing handling that requires.
    * @private
    */
-  async _tryRegisterSession(session, timeoutMs = 1500) {
+  async _tryRegisterSession(session, timeoutMs = 1500, sessionKey) {
+    // The server requires every VR session to belong to a room now
+    // (resolveRoomAccess() in server/src/routes/vr.js 400s on missing-room)
+    // — and a roomless client has nothing to converge on anyway, since
+    // yjsSetup.js binds the ydoc (and this session's participant/manipulation
+    // maps) to sessionManager.getRoomId(). getRoomId() throws when the
+    // session hasn't finished initializing yet (see sessionManager.js);
+    // resolve it defensively via the same pattern serverSync.js's
+    // _safeRoomId() uses, and skip the POST entirely rather than firing a
+    // request that is guaranteed to 400 and just burns this method's short
+    // registration timeout budget. The existing local-id fallback below
+    // (the timeout/catch paths) already handles "no server session" fine.
+    const roomId = this._safeRoomId();
+    if (!roomId) {
+      log.warn('VR session registration skipped — no room resolved yet (continuing locally)');
+      return null;
+    }
+
     const post = apiClient
       .post('/vr/sessions', {
         viewConfigurationId: session.viewConfigurationId,
         datasetId: session.datasetId,
         projectId: session.projectId,
+        roomId,
         explorationMode: session.explorationMode,
         vrScale: session.vrScale,
         allowJoin: session.allowJoin,
@@ -657,8 +984,17 @@ class VRExplorationManager extends BaseManager {
         // Stable, client-generated collaboration id (session.id, minted at
         // construction — see startExploration). Recorded on the row
         // separately from its own server-generated PK so a late response
-        // can always be reconciled unambiguously.
+        // can always be reconciled unambiguously. NOT the dataset identity
+        // (see datasetSyncKey below) — this is per-ATTEMPT, minted fresh
+        // every VR entry, and 023_vr_session_lifecycle.sql's header
+        // documents the correction to 021's comment that once conflated the
+        // two.
         clientSessionKey: session.id,
+        // Per-DATASET identity (Issue 6) — _resolveSessionKey()'s result
+        // (resolveViewSyncKey: dataset id first, viewConfigId fallback).
+        // Drives the server's ux_vr_sessions_room_dataset_active — one
+        // active session per (room, dataset).
+        datasetSyncKey: sessionKey || null,
       })
       .catch((err) => {
         log.warn('VR session server registration failed (continuing locally):', err.message);
@@ -713,18 +1049,45 @@ class VRExplorationManager extends BaseManager {
       this._activeSession === session && String(session.id).startsWith('vrsession_');
 
     if (!stillUsingLocalId) {
-      apiClient
-        .delete(`/vr/sessions/${serverRow.id}`)
-        .catch((err) => log.debug('Failed to clean up orphaned VR session row:', err.message));
+      // Issue 6: never delete an ADOPTED row here — if serverRow.adopted is
+      // true, serverRow.id is the WINNER's row (we lost the create race),
+      // not one we created. Deleting it would end the real host's session
+      // out from under them.
+      if (!serverRow.adopted) {
+        apiClient
+          .delete(`/vr/sessions/${serverRow.id}`)
+          .catch((err) => log.debug('Failed to clean up orphaned VR session row:', err.message));
+      }
       return;
     }
 
     log.info(`VR session registration completed late — adopting server id ${serverRow.id}`);
     session.id = serverRow.id;
+    this._leaseRequired = isServerSessionId(serverRow.id);
     this._participantSync?.rekey(serverRow.id);
     this._controlManager?.rekey(serverRow.id);
     this._manipulationLock?.rekey(serverRow.id);
     vrAvatarSystem.rekey?.(serverRow.id);
+
+    if (serverRow.adopted) {
+      // Same load-bearing branch as startExploration's Path 3 (Issue 6): a
+      // late-arriving response can ALSO report we lost the create race —
+      // adopt the winner's identity instead of leaving OUR OWN id (written
+      // by this manager's earlier local claimVRSession call, back when
+      // registration was still in flight) stamped on session.ownerUserId.
+      // Skipping the claimVRSession call below is deliberate, same reason as
+      // Path 3's: writing ourselves as hostUserId for a session the server
+      // says someone else owns re-introduces the two-hosts bug through the
+      // registry.
+      session.ownerUserId = resolveServerSessionOwnerId(serverRow) || session.ownerUserId;
+      session.ownerUserName = resolveServerSessionOwnerName(serverRow) || session.ownerUserName;
+      return;
+    }
+
+    // We successfully registered a row of our own with the server (not an
+    // adoption) — remember its id for the fast-path orphan cleanup in
+    // _watchVRSessionConvergence (see that method's rekey branch).
+    this._registeredServerSessionId = serverRow.id;
 
     const sessionKey = this._resolveSessionKey(this._activeContext?.instance);
     if (sessionKey) {
@@ -785,6 +1148,12 @@ class VRExplorationManager extends BaseManager {
       if (record.sessionId !== session.id) {
         log.info(`VR session claim race resolved against us — re-keying ${session.id} -> ${record.sessionId}`);
 
+        // Captured BEFORE session.id is mutated below — this is what "our own
+        // now-unreachable row" means for the fast-path orphan cleanup further
+        // down (Issue 6).
+        const orphanId = session.id;
+        const weRegisteredOrphan = orphanId === this._registeredServerSessionId;
+
         // ORDER MATTERS. Mutate the session FIRST: AvatarManager holds this same
         // object and reads `session.id` live (it used to cache a copy, which then
         // went stale here and made both headsets filter out each other's avatar
@@ -794,11 +1163,36 @@ class VRExplorationManager extends BaseManager {
         session.id = record.sessionId;
         session.ownerUserId = record.hostUserId;
         session.ownerUserName = record.hostUserName;
+        this._leaseRequired = isServerSessionId(record.sessionId);
 
         this._participantSync?.rekey(record.sessionId);
         this._controlManager?.rekey(record.sessionId);
         this._manipulationLock?.rekey(record.sessionId);
         vrAvatarSystem.rekey?.(record.sessionId);
+
+        // Fast-path orphan cleanup (Issue 6): we lost the create-race and our
+        // own now-unreachable server row would otherwise sit orphaned in
+        // 'preparing'/'active' until lazy-expiry reaping catches it, minutes
+        // later. Gated strictly on "did WE register this EXACT row"
+        // (weRegisteredOrphan) rather than just isServerSessionId(orphanId)
+        // — on the JOIN path (config.serverSession in startExploration),
+        // orphanId would be the REAL HOST's canonical session id, and
+        // deleting it would end their session out from under them.
+        if (weRegisteredOrphan) {
+          this._registeredServerSessionId = null;
+          // Promise.resolve()-wrapped for the same reason as
+          // _sendServerSessionHeartbeat: this fires from inside a Y.js
+          // observer callback, not a context with its own error boundary —
+          // it must never throw synchronously regardless of what
+          // apiClient.delete returns.
+          try {
+            Promise.resolve(apiClient.delete(`/vr/sessions/${orphanId}`)).catch((err) =>
+              log.debug('Failed to clean up orphaned VR session row:', err?.message)
+            );
+          } catch (err) {
+            log.debug('Failed to clean up orphaned VR session row:', err?.message);
+          }
+        }
 
         // The ids every peer must agree on just changed — re-dump them.
         this._logCollaborationDiagnostics('session-rekey');
@@ -819,6 +1213,38 @@ class VRExplorationManager extends BaseManager {
 
     yVRSessions.observe(observer);
     this._offVRSessionObserver = () => yVRSessions.unobserve(observer);
+  }
+
+  /**
+   * Session-liveness heartbeat (Issue 6) — POST /vr/sessions/:id/heartbeat.
+   * Distinct from the manipulation LEASE's own heartbeat
+   * (VRManipulationLock.heartbeat, which shares the same 1Hz frame-loop tick
+   * but has its own internal floor) — this one feeds
+   * vr_exploration_sessions.last_heartbeat_at (lazy-expiry reaping) and, on
+   * the owner device's first call, performs the session's ONE
+   * 'preparing' -> 'active' transition server-side.
+   *
+   * Fire-and-forget: must never throw into the frame loop (see the frame
+   * loop's _safeFrameStep wrapper) or block startExploration. A no-op for a
+   * local `vrsession_*` id — nothing server-side to heartbeat.
+   *
+   * Wrapped in Promise.resolve()/try-catch rather than assuming
+   * apiClient.post always returns a thenable: this is called synchronously
+   * from startExploration (right after session.start(), before any VR
+   * frame exists), so a test double or a genuinely synchronous rejection
+   * here must not throw INTO startExploration itself.
+   * @private
+   */
+  _sendServerSessionHeartbeat() {
+    const session = this._activeSession;
+    if (!session?.id || !isServerSessionId(session.id)) return;
+    try {
+      Promise.resolve(
+        apiClient.post(`/vr/sessions/${session.id}/heartbeat`, { deviceId: getDeviceId() })
+      ).catch((err) => log.debug('VR session heartbeat failed:', err?.message));
+    } catch (err) {
+      log.debug('VR session heartbeat failed:', err?.message);
+    }
   }
 
   /**
@@ -889,23 +1315,162 @@ class VRExplorationManager extends BaseManager {
   }
 
   /**
+   * Resolve the local VTK instance a session/join response corresponds to,
+   * in priority order (Phase B of the room-scoping/join-correctness plan):
+   *
+   *  1. Exact `view_configuration_id` match — the pre-existing behaviour,
+   *     and still correct for a client that genuinely shares one
+   *     ViewConfiguration with the host (a saved/linked view).
+   *  2. `instanceMatchesViewUpdate()` against every locally open VTK
+   *     instance, keyed on the join response's resolved dataset id. This is
+   *     the case that actually matters for a peer: every client mints its
+   *     OWN ViewConfiguration when it opens a dataset (see the big comment
+   *     on _resolveSessionKey above), so step 1 can never match one by
+   *     construction — only the dataset id is common between two headsets
+   *     looking at the same data.
+   *  3. Auto-load: register the dataset locally (if not already) and
+   *     create+place a view for it via viewLifecycleService, reusing the
+   *     EXACT pair workspaceManager._handleYjsActiveDatasetUpdate already
+   *     uses for the equivalent "remote client switched datasets" case — no
+   *     new load path. Needs `joinResponse.dataset`, so a call made before
+   *     the join POST has resolved (see joinSession's pre-check) can never
+   *     succeed past step 2 and bails out distinctly rather than pretending
+   *     "not found".
+   *
+   * Deliberately does NOT enter VR when it loads something (`loaded: true`
+   * on the return) — fetchDatasetById/createAndPlaceView spans many frames,
+   * which burns the WebXR user-activation gesture that triggered the join in
+   * the first place, so a requestSession() run immediately after would
+   * reject. The caller surfaces this as 'ready-press-enter' and waits for a
+   * second explicit gesture.
+   *
+   * @param {Object} sessionRecord - server session row (view_configuration_id, dataset_id, ...)
+   * @param {Object|null} joinResponse - POST /sessions/:id/join response body
+   *   (dataset, viewConfigurationId), or null to resolve steps 1-2 only
+   *   without touching the network.
+   * @returns {Promise<{instance: Object|null, loaded: boolean, reason?: string}>}
+   * @private
+   */
+  async _resolveOrLoadInstanceForSession(sessionRecord, joinResponse) {
+    const viewConfigId = joinResponse?.viewConfigurationId || sessionRecord?.view_configuration_id || null;
+
+    if (viewConfigId) {
+      const exact = workspaceManager.getInstanceByViewConfigId(viewConfigId);
+      if (exact) return { instance: exact, loaded: false };
+    }
+
+    const syncKey = joinResponse?.dataset?.id || sessionRecord?.dataset_id || null;
+    if (viewConfigId || syncKey) {
+      for (const candidate of workspaceManager.getInstancesByType('vtk')) {
+        if (instanceMatchesViewUpdate(candidate, viewConfigId, syncKey)) {
+          return { instance: candidate, loaded: false };
+        }
+      }
+    }
+
+    if (!joinResponse) {
+      return { instance: null, loaded: false, reason: 'awaiting-join-response' };
+    }
+
+    const dataset = joinResponse.dataset;
+    if (!dataset?.id) {
+      return { instance: null, loaded: false, reason: 'no-dataset' };
+    }
+
+    const dm = getDatasetManager();
+    if (!dm) {
+      return { instance: null, loaded: false, reason: 'dataset-manager-unavailable' };
+    }
+
+    let datasetId = dataset.id;
+    try {
+      if (!dm.getDataset(datasetId)) {
+        if (dataset.kind === 'builtin') {
+          // loadBuiltInDatasets() registers the whole manifest for every
+          // client at boot, so getDataset() missing it here is the unusual
+          // case — recover the dataset's stable server-side UUID
+          // (migrations/020_bundled_dataset_ids.sql) and load it the same
+          // way an uploaded dataset would be. addBuiltInDataset() needs a
+          // manifest `path` this join response doesn't carry, so it is not
+          // an option here — same reasoning as _getPersistenceScope above.
+          const resolvedId = await resolveBuiltInDatasetId(datasetId);
+          if (resolvedId) {
+            await dm.fetchDatasetById(resolvedId);
+            datasetId = resolvedId;
+          }
+        } else {
+          await dm.fetchDatasetById(datasetId);
+        }
+      }
+    } catch (err) {
+      log.warn(`Auto-load: failed to register dataset ${datasetId} for VR join:`, err.message);
+      return { instance: null, loaded: false, reason: 'dataset-load-failed' };
+    }
+
+    if (!dm.getDataset(datasetId)) {
+      return { instance: null, loaded: false, reason: 'dataset-load-failed' };
+    }
+
+    try {
+      // Lazy import, not a module-scope one: ViewLifecycleService.js pulls in
+      // ViewGroupManager.js and a wide manager dependency chain that most of
+      // this file's existing tests never touch and don't mock (they mock
+      // @Utils/logger.js partially, which that chain needs more of). Loading
+      // it only when auto-load actually runs — rather than for every test
+      // that merely imports this file — keeps those unaffected. vi.mock()
+      // intercepts dynamic imports the same as static ones, so
+      // VRExplorationManager.joinResolve.test.js's mock of this module still
+      // applies here.
+      const { viewLifecycleService } = await import('@Services/ViewLifecycleService.js');
+      const { view } = await viewLifecycleService.createAndPlaceView(datasetId);
+      const instance = workspaceManager.getInstanceByViewConfigId(view.id);
+      if (!instance) {
+        return { instance: null, loaded: false, reason: 'view-not-placed' };
+      }
+      // Hydrate now, not just on VR entry: auto-load deliberately does NOT
+      // enter VR here (burns the WebXR activation gesture — see this
+      // method's docstring), so the caller waits for a second explicit
+      // "Enter VR" press. Without hydrating here, the freshly-loaded
+      // instance would sit on desktop showing only camera/opacity/
+      // representation defaults until that second press reaches
+      // startExploration()'s own hydration call.
+      this._hydrateSessionState(instance, joinResponse.state);
+      return { instance, loaded: true };
+    } catch (err) {
+      log.warn(`Auto-load: failed to create/place a view for dataset ${datasetId}:`, err.message);
+      return { instance: null, loaded: false, reason: 'view-create-failed' };
+    }
+  }
+
+  /**
    * Join an existing VR exploration session, given the already-fetched
    * session record (callers listing sessions — e.g. VRExploreButton's
    * session popover — already have this row from their GET /vr/sessions;
    * avoid a redundant refetch here). Fields are the raw
    * vr_exploration_sessions row shape (snake_case) returned by the server.
    *
-   * The join notification POST is bounded by a short timeout so a slow
-   * network never delays entering VR while WebXR user-activation is still
-   * fresh — same pattern as _tryRegisterSession. If the session's view is
-   * open locally and a VR mode was requested, enters VR against that view
-   * using the shared startExploration path (with the server session's id,
-   * so avatar/participant Y.js state converges across clients).
+   * Error handling (Phase B — replaces a blanket try/catch that used to
+   * swallow every failure, 401/403/404 included, and left the join POST
+   * unawaited AND unhandled whenever the 1.5s timeout won):
+   *  - A 4xx response is authoritative — the server rejected the join for a
+   *    specific, actionable reason (wrong room, session ended, joining
+   *    disabled, ...). Fails hard and returns immediately; no fallthrough.
+   *  - A network error / 5xx / timeout-with-no-response degrades rather
+   *    than fails, but ONLY continues into VR entry if step 1 or 2 of
+   *    _resolveOrLoadInstanceForSession already resolved an instance
+   *    locally — auto-load is impossible without the join response's
+   *    dataset descriptor, so there is nothing to fall back to.
+   *  - The 1.5s race against the join POST — needed so a slow network never
+   *    delays VR entry while WebXR user-activation is still fresh — is kept
+   *    ONLY for that same already-resolvable case. When auto-load may be
+   *    needed, the POST is awaited in full. The raced promise always gets a
+   *    .catch so a late rejection can never become an unhandled rejection.
    *
    * @param {Object} sessionRecord - server session row (id, view_configuration_id,
    *   owner_user_name, default_exploration_mode, default_vr_scale, ...)
    * @param {string} mode - Participation mode (PARTICIPATION_MODE)
-   * @returns {Promise<{joined: boolean, vrEntered: boolean, session?: object, reason?: string}>}
+   * @returns {Promise<{joined: boolean, vrEntered: boolean, session?: object,
+   *   reason?: string, error?: string, detail?: object, instanceId?: string}>}
    */
   async joinSession(sessionRecord, mode = PARTICIPATION_MODE.DESKTOP_OBSERVER) {
     const sessionId = sessionRecord?.id;
@@ -914,43 +1479,111 @@ class VRExplorationManager extends BaseManager {
     }
     log.info('Joining VR session...', { sessionId, mode });
 
-    try {
-      const joinPost = apiClient.post(`/vr/sessions/${sessionId}/join`, { mode, deviceId: getDeviceId() });
-      const timeout = new Promise((resolve) => setTimeout(() => resolve(null), 1500));
-      await Promise.race([joinPost, timeout]);
-    } catch (err) {
-      log.warn('VR session join notification failed (continuing):', err.message);
+    const isVRMode = mode === PARTICIPATION_MODE.VR_EXPLORER;
+
+    // Cheap, network-free check of steps 1-2 only (joinResponse is null —
+    // see _resolveOrLoadInstanceForSession) — this is what decides whether
+    // the join POST below can be raced against the WebXR activation budget
+    // or must be awaited in full.
+    const localResolution = isVRMode
+      ? await this._resolveOrLoadInstanceForSession(sessionRecord, null)
+      : null;
+    const hasLocalInstance = !!localResolution?.instance;
+
+    let joinResponse = null;
+    let joinError = null;
+    const body = { mode, deviceId: getDeviceId(), roomId: this._safeRoomId() };
+
+    if (!isVRMode || hasLocalInstance) {
+      const joinPost = apiClient
+        .post(`/vr/sessions/${sessionId}/join`, body)
+        .then((response) => { joinResponse = response; return response; })
+        .catch((err) => { joinError = err; return null; });
+      const timeout = new Promise((resolve) => setTimeout(() => resolve('timeout'), 1500));
+      const raceResult = await Promise.race([joinPost, timeout]);
+      if (raceResult === 'timeout') {
+        log.debug(`VR join notification for ${sessionId} still in flight past the 1.5s budget — continuing locally`);
+      }
+    } else {
+      // Nothing resolvable locally — auto-load needs the join response's
+      // dataset descriptor, so there is no fast path here.
+      try {
+        joinResponse = await apiClient.post(`/vr/sessions/${sessionId}/join`, body);
+      } catch (err) {
+        joinError = err;
+      }
     }
 
-    // Desktop observers are done: participant state flows via Y.js/WS
-    const isVRMode = mode === PARTICIPATION_MODE.VR_EXPLORER;
+    if (joinError) {
+      if (joinError.status >= 400 && joinError.status < 500) {
+        log.warn(`VR session join rejected (${joinError.status}):`, joinError.message);
+        return {
+          joined: false,
+          vrEntered: false,
+          error: joinError.details?.error || joinError.message,
+          detail: joinError.details,
+        };
+      }
+      // Network error / 5xx. Only VR entry needs an instance to fall back
+      // to — desktop modes have nothing left to do here regardless, so keep
+      // their pre-existing "continue, participant state reconciles via
+      // Y.js/WS once connectivity returns" behaviour.
+      if (isVRMode && !hasLocalInstance) {
+        log.warn('VR session join failed and no local instance to fall back on:', joinError.message);
+        return { joined: false, vrEntered: false, reason: 'join-unavailable' };
+      }
+      log.warn('VR session join notification failed (continuing degraded):', joinError.message);
+    }
+
+    // Desktop observers/participants are done: participant state flows via Y.js/WS
     if (!isVRMode) {
       this._emit('sessionJoined', { sessionId, mode });
-      return { joined: true, vrEntered: false, session: sessionRecord };
+      return { joined: true, vrEntered: false, session: sessionRecord, degraded: !!joinError };
     }
 
-    // VR modes need the session's view open locally
-    const viewConfigId = sessionRecord.view_configuration_id;
-    const instance = viewConfigId
-      ? workspaceManager.getInstanceByViewConfigId(viewConfigId)
-      : null;
-    if (!instance) {
-      log.warn(`Cannot enter VR for session ${sessionId}: view ${viewConfigId} not open locally`);
+    // Re-resolve now that a join response may be available — a no-op read
+    // of the already-found instance when hasLocalInstance, otherwise this
+    // is where step 3 (auto-load) actually runs.
+    const resolution = hasLocalInstance
+      ? localResolution
+      : await this._resolveOrLoadInstanceForSession(sessionRecord, joinResponse);
+
+    if (!resolution.instance) {
+      log.warn(`Cannot enter VR for session ${sessionId}: no instance resolved (${resolution.reason})`);
       this._emit('sessionJoined', { sessionId, mode, vrEntered: false });
       return {
         joined: true,
         vrEntered: false,
         session: sessionRecord,
-        reason: 'view-not-open',
+        reason: resolution.reason || 'view-not-open',
       };
     }
 
-    // Enter VR against the shared session id
-    await this.startExploration(instance.instanceId, {
+    if (resolution.loaded) {
+      // See _resolveOrLoadInstanceForSession's docstring: entering VR here
+      // would burn the activation gesture the auto-load itself just spent.
+      this._emit('sessionJoined', { sessionId, mode, vrEntered: false, instanceId: resolution.instance.instanceId });
+      return {
+        joined: true,
+        vrEntered: false,
+        session: sessionRecord,
+        reason: 'ready-press-enter',
+        instanceId: resolution.instance.instanceId,
+      };
+    }
+
+    // Enter VR against the shared session id. `state` (Phase C
+    // buildSessionState() snapshot) rides along so startExploration's own
+    // hydration step (_hydrateSessionState) needs no second round trip —
+    // for the auto-load path this is a no-op re-apply, since
+    // _resolveOrLoadInstanceForSession already hydrated once when it loaded
+    // the instance; Y.js entries are idempotent to replay.
+    await this.startExploration(resolution.instance.instanceId, {
       serverSession: sessionRecord,
       participationMode: mode,
       explorationMode: sessionRecord.default_exploration_mode,
       vrScale: Number(sessionRecord.default_vr_scale) || 1.0,
+      state: joinResponse?.state || null,
     });
 
     this._emit('sessionJoined', { sessionId, mode, vrEntered: true });
@@ -1164,6 +1797,8 @@ class VRExplorationManager extends BaseManager {
       this._offVRSessionObserver?.();
       this._offVRSessionObserver = null;
       this._lastVRSessionHeartbeat = 0;
+      this._lastServerSessionHeartbeat = 0;
+      this._registeredServerSessionId = null;
       // Drop any queued heavy work so it cannot run after exit (see
       // _deferHeavy/_drainDeferredWork) — the toggle's manager/feature state
       // it would have mutated may itself be torn down by the steps above.
@@ -1177,6 +1812,16 @@ class VRExplorationManager extends BaseManager {
       this._offManipulationLock?.();
       this._offManipulationLock = null;
       this._manipulationLock = null;
+      this._leaseRequired = false;
+      this._gestureSnapshot = null;
+      this._gestureOpId = null;
+      this._transformGestureActive = false;
+      this._clipGestureActive = false;
+      this._throttledGestureActive = false;
+      if (this._throttledGestureTimer) {
+        clearTimeout(this._throttledGestureTimer);
+        this._throttledGestureTimer = null;
+      }
       this._vrNotice = null;
 
       // Clear the room-wide "in VR" flag set in startExploration.
@@ -1462,21 +2107,43 @@ class VRExplorationManager extends BaseManager {
   // canManipulate() before placement.
 
   /**
-   * Silent permission read. FAILS OPEN on a missing/throwing lock — every
-   * gate in this file funnels through here, so a session constructed without
-   * a lock (or a test that fabricates _activeContext directly) behaves
-   * exactly as it did before this feature existed.
+   * Silent permission read — Phase D4 fail-closed gate.
+   *
+   * `_leaseRequired` decides which failure mode applies when the lock ITSELF
+   * is unusable (missing, wrong shape, or throws):
+   *  - Server session (`_leaseRequired === true`): fail CLOSED. A session
+   *    confirmed against a real server row (see isServerSessionId) has an
+   *    obtainable lease; a missing/throwing lock at that point is a bug, not
+   *    "nobody's contesting it", so refusing is the safe default.
+   *  - Local / not-yet-confirmed session (`_leaseRequired === false`): fail
+   *    OPEN, exactly the pre-D4 behaviour. `_tryRegisterSession` can fail
+   *    (offline, 500, the client_session_key collision) and strand VR on a
+   *    local `vrsession_*` id with no server row and no obtainable lease —
+   *    unconditional fail-closed would make solo/offline VR completely
+   *    inert. This also keeps ~21 existing tests green that fabricate
+   *    `_activeContext` with no lock at all (see
+   *    VRExplorationManager.manipulationGate.test.js).
+   *
+   * When the lock DOES exist and answers normally, its answer is ALWAYS
+   * authoritative regardless of `_leaseRequired` — a local session still
+   * runs the original Y.js mutual-exclusion
+   * (VRManipulationLock.canManipulate's local-session branch), and that must
+   * still be enforced even though no lease is required.
    * @returns {boolean}
    * @private
    */
   _hasManipulationControl() {
     const lock = this._manipulationLock;
-    if (!lock || typeof lock.canManipulate !== 'function') return true;
+    if (!lock || typeof lock.canManipulate !== 'function') {
+      return !this._leaseRequired;
+    }
     try {
-      return lock.canManipulate() !== false;
+      return lock.canManipulate() === true;
     } catch (err) {
-      log.warn(`VR manipulation lock read failed (allowing): ${err?.message}`);
-      return true;
+      log.warn(
+        `VR manipulation lock read failed (${this._leaseRequired ? 'denying' : 'allowing'}): ${err?.message}`
+      );
+      return !this._leaseRequired;
     }
   }
 
@@ -1496,6 +2163,187 @@ class VRExplorationManager extends BaseManager {
         : `${label} needs data control`
     );
     return false;
+  }
+
+  // ---------------------------------------------------------------------------
+  // PHASE D5 — acquire at gesture start, roll back on rejection
+  // ---------------------------------------------------------------------------
+  //
+  // Every VR control used to mutate local VTK state BEFORE the permission
+  // check (_pushVisualizationPatch/_requireManipulationControl only gate
+  // whether the CHANGE IS BROADCAST, not whether it was applied locally in
+  // the first place) — so a refused participant's own headset silently
+  // diverged from the shared state instead of being told no. begin/end wrap
+  // a gesture (a menu tap, a drag, a throttled value change) so the
+  // permission read happens — and a pre-mutation snapshot is captured —
+  // BEFORE the local mutation, with a rollback path for when the answer
+  // turns out to be no.
+
+  /**
+   * @private Synchronous core of beginManipulationGesture — split out so
+   * SYNCHRONOUS call sites (menu actions that schedule work via _deferHeavy,
+   * or fire a local mutation in the same tick) can gate on the boolean
+   * immediately, in the SAME tick as the local mutation they are about to
+   * perform/schedule. The public beginManipulationGesture is a thin async
+   * wrapper over this — gesture semantics are identical whether a caller
+   * awaits it or not.
+   *
+   * Captures the pre-gesture snapshot UNCONDITIONALLY BEFORE consulting the
+   * lock: a continuous gesture (clip/transform drag) may already be
+   * mutating local VTK state in real time across many frames, so the ONLY
+   * way to guarantee a genuinely pre-gesture snapshot is to take it right
+   * now, before the permission read — not after.
+   *
+   * Deliberately does NOT call an "acquire" endpoint. VRManipulationLock's
+   * public surface is intentionally frozen (see
+   * VRManipulationLock.serverLease.test.js "is unchanged by the server-lease
+   * rewrite") and exposes no "take the lease even though I'm not the
+   * current holder" method — rightly so: a gesture starting must never
+   * silently take the token from whoever legitimately holds it. This calls
+   * the existing public heartbeat() (safe every frame, internally
+   * throttled) to nudge a TTL refresh when we already hold it, then reads
+   * the current answer via _hasManipulationControl().
+   * @param {string} kind
+   * @param {string} [instanceId]
+   * @returns {boolean}
+   */
+  _beginGestureSync(kind, instanceId) {
+    const id = instanceId || this._activeContext?.instance?.instanceId;
+    const instanceData = this._activeContext?.instance?.instanceData;
+    const snapshotState = id && instanceData ? this._safeAggregateState(id, instanceData) : null;
+
+    try {
+      this._manipulationLock?.heartbeat?.();
+    } catch {
+      /* best-effort refresh only */
+    }
+
+    const allowed = this._hasManipulationControl();
+
+    if (!allowed) {
+      this._requireManipulationControl(PATCH_LABELS[kind] || 'That change');
+      // Nothing may have actually mutated yet at THIS call site (most
+      // callers gate the mutation on this return value), but a caller that
+      // can't gate synchronously (frame-loop drag/grab) may already be a
+      // few frames in — restoring here is a no-op in the former case and
+      // the correct undo in the latter.
+      if (id && snapshotState) this._restoreGestureSnapshot(id, snapshotState);
+      this._gestureSnapshot = null;
+      this._gestureOpId = null;
+      return false;
+    }
+
+    this._gestureSnapshot = id ? { kind, instanceId: id, state: snapshotState || {} } : null;
+    this._gestureOpId =
+      `${getParticipantId()}_${kind}_${Date.now().toString(36)}` +
+      Math.random().toString(36).slice(2, 8);
+    return true;
+  }
+
+  /**
+   * Begin a manipulation gesture: read/refresh authority and, on success,
+   * capture a rollback snapshot + mint a per-gesture op id (Phase D6 reuses
+   * it as the mutation envelope's opId across every patch this gesture
+   * sends). Awaitable for callers that can afford to; frame-loop call sites
+   * fire-and-forget instead (see _pushObjectTransformPatch and the
+   * clip-box-updated case in _handleToolAction) since begin() must never
+   * block the XR frame loop.
+   * @param {string} kind - e.g. 'transform', 'clipBox', 'representation',
+   *   'threshold', 'throttled' — anything with a PATCH_LABELS entry gets a
+   *   named refusal notice; anything else falls back to "That change".
+   * @param {{instanceId?: string}} [opts]
+   * @returns {Promise<boolean>}
+   */
+  async beginManipulationGesture(kind, { instanceId } = {}) {
+    return this._beginGestureSync(kind, instanceId);
+  }
+
+  /**
+   * End a manipulation gesture. `committed: true` (default) just clears the
+   * bookkeeping — the gesture's own patches already went out (or were
+   * refused, in which case begin() already rolled back). `committed: false`
+   * lets a caller explicitly abort a gesture that never got a chance to
+   * push anything and restore the pre-gesture snapshot.
+   *
+   * No-ops if `kind` doesn't match the currently open gesture (e.g. a
+   * stale/duplicate end() call after a new gesture already started) — never
+   * clears or rolls back a DIFFERENT gesture's bookkeeping.
+   * @param {string} kind
+   * @param {{committed?: boolean}} [opts]
+   */
+  endManipulationGesture(kind, { committed = true } = {}) {
+    if (!this._gestureSnapshot || this._gestureSnapshot.kind !== kind) return;
+    if (!committed) {
+      this._restoreGestureSnapshot(this._gestureSnapshot.instanceId, this._gestureSnapshot.state);
+    }
+    this._gestureSnapshot = null;
+    this._gestureOpId = null;
+  }
+
+  /**
+   * @private Read aggregateVTKVisualizationState defensively — a throwing
+   * feature must never abort a gesture begin (aggregateVTKVisualizationState
+   * already try/catches per-source internally; this is the outer guard for
+   * the aggregate call itself, e.g. a missing/mid-teardown instance).
+   * @param {string} instanceId
+   * @param {object} instanceData
+   * @returns {object|null}
+   */
+  _safeAggregateState(instanceId, instanceData) {
+    try {
+      return aggregateVTKVisualizationState(instanceId, instanceData);
+    } catch (err) {
+      log.warn(`VR gesture snapshot failed: ${err?.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * @private Restore a captured pre-gesture snapshot via applySharedState —
+   * REUSED deliberately (not a bespoke restore path): it is the only rich
+   * apply path VTKInstanceHandler has, and its
+   * _beginApplyingRemoteState/_endApplyingRemoteState guard stops this
+   * restore from re-broadcasting as a fresh local change. Fire-and-forget:
+   * must never block the XR frame loop or a synchronous menu handler.
+   * @param {string} instanceId
+   * @param {object} state - aggregateVTKVisualizationState() output
+   */
+  _restoreGestureSnapshot(instanceId, state) {
+    try {
+      const handler = this._activeContext?.handler;
+      const instanceData = this._activeContext?.instance?.instanceData;
+      if (!handler || typeof handler.applySharedState !== 'function' || !instanceData) return;
+      Promise.resolve(
+        handler.applySharedState(instanceData, { visualization: state }, '__rollback__')
+      ).catch((err) => log.warn(`VR gesture rollback failed: ${err?.message}`));
+    } catch (err) {
+      log.warn(`VR gesture rollback failed: ${err?.message}`);
+    }
+  }
+
+  /**
+   * Phase D6 mutation envelope — threaded as pushSharedVisualizationUpdate's
+   * optional 4th argument (see _pushVisualizationPatch). `opId` is per
+   * GESTURE (set once in _beginGestureSync, cleared in endManipulationGesture),
+   * not per frame, so every patch sent mid-gesture (a drag's non-final
+   * frames, a throttled value's ticks) dedupes to the same id. `sessionRevision`
+   * (vr_exploration_sessions.revision, the lease-authority epoch — see D1/D2)
+   * is left null here: reading it live would need a new accessor on
+   * VRManipulationLock, whose public surface is deliberately frozen (see
+   * _beginGestureSync's docstring) — revisit if that surface is ever revised
+   * on purpose. Per the plan, this is advisory bookkeeping, not enforcement:
+   * mutation-level conflict detection is already handled by
+   * view_configurations.revision/base_revision, and authority fencing by
+   * lease_epoch.
+   * @private
+   * @returns {{sessionRevision: number|null, actorId: string, opId: string|null}}
+   */
+  _buildMutationMeta() {
+    return {
+      sessionRevision: null,
+      actorId: getParticipantId(),
+      opId: this._gestureOpId || null,
+    };
   }
 
   /** Ask the current holder for the token. @returns {boolean} */
@@ -2012,6 +2860,46 @@ class VRExplorationManager extends BaseManager {
    * as toggleVoiceMute().
    * @returns {boolean} the new connected state, read optimistically
    */
+  /**
+   * Settle microphone permission while DOM prompts can still be shown.
+   * Never throws — voice is optional, VR entry is not.
+   * @private
+   * @returns {Promise<void>}
+   */
+  async _prewarmVoicePermission() {
+    try {
+      await voiceRoomService.initialize();
+    } catch (err) {
+      log.warn('Voice pre-warm failed (continuing without voice):', err?.message);
+    }
+  }
+
+  /**
+   * Join the session's voice room, muted.
+   *
+   * Called automatically on VR entry. It used to be reachable ONLY through the
+   * spatial menu's SESSION drawer — a closed drawer inside an in-world menu —
+   * so in practice two headsets in the same VR session never had voice, which
+   * read as "voice doesn't work in VR". getVoiceRoomName() is scoped to
+   * sessionManager.getRoomId(), the same room the VR session itself is scoped
+   * to, so both headsets land in one LiveKit room.
+   *
+   * Muted on join is deliberate: an automatically opened microphone is a
+   * privacy surprise. The menu's mic toggle unmutes.
+   *
+   * @private
+   * @returns {Promise<void>}
+   */
+  async _autoJoinVoice() {
+    if (voiceRoomService.isConnected()) return;
+    try {
+      await voiceRoomService.joinRoom(getVoiceRoomName(), getParticipantName());
+      log.info('Voice room joined for VR session (muted)');
+    } catch (err) {
+      log.warn('Voice auto-join failed (continuing without voice):', err?.message);
+    }
+  }
+
   toggleVoiceConnection() {
     if (voiceRoomService.isConnected()) {
       voiceRoomService.leaveRoom().catch((err) => log.warn('Voice leave failed:', err?.message));
@@ -2114,6 +3002,14 @@ class VRExplorationManager extends BaseManager {
     const current = instanceTools.getRepresentation?.(instanceId) || 'surface';
     const next = order[(order.indexOf(current) + 1) % order.length];
 
+    // Phase D5: begin() MUST run before _deferHeavy schedules, not inside
+    // the deferred callback — capturing the snapshot in there would read
+    // state AFTER instanceTools.setRepresentation already ran, so a later
+    // rollback would restore the wrong (already-mutated) value. Refused ->
+    // skip the deferred mutation entirely (begin() already flashed the
+    // notice) rather than optimistically applying it anyway.
+    if (!this._beginGestureSync('representation', instanceId)) return null;
+
     // Deferred like the other menu-triggered visualization changes (see
     // _deferHeavy / toggleGlyphs) — the mapper rebuild + sync patch run one
     // frame later; the optimistic `next` is returned immediately.
@@ -2122,6 +3018,7 @@ class VRExplorationManager extends BaseManager {
     this._deferHeavy('Applying appearance…', () => {
       instanceTools.setRepresentation?.(instanceId, next);
       this._pushVisualizationPatch({ representation: next });
+      this.endManipulationGesture('representation');
     }, { boundsMayChange: false });
     this._emit('representationChanged', { representation: next });
     return next;
@@ -2143,10 +3040,14 @@ class VRExplorationManager extends BaseManager {
       return null;
     }
 
+    // Phase D5 — see cycleRepresentation's identical comment.
+    if (!this._beginGestureSync('representation', instanceId)) return null;
+
     // Deferred — see cycleRepresentation. boundsMayChange: false, same reason.
     this._deferHeavy('Applying appearance…', () => {
       instanceTools.setRepresentation?.(instanceId, mode);
       this._pushVisualizationPatch({ representation: mode });
+      this.endManipulationGesture('representation');
     }, { boundsMayChange: false });
     this._emit('representationChanged', { representation: mode });
     return mode;
@@ -2297,6 +3198,11 @@ class VRExplorationManager extends BaseManager {
     if (!id || !this.isThresholdAvailable()) return false;
     const wasEnabled = this.isThresholdEnabled();
 
+    // Phase D5 — same "begin before _deferHeavy schedules" reasoning as
+    // cycleRepresentation/setRepresentation. Refused -> skip the deferred
+    // toggle entirely.
+    if (!this._beginGestureSync('threshold', id)) return wasEnabled;
+
     // Availability + current-state reads above stay synchronous; the actual
     // filter (re)application is the expensive part — deferred, same
     // reasoning as toggleGlyphs (see _deferHeavy).
@@ -2305,10 +3211,12 @@ class VRExplorationManager extends BaseManager {
         vtkThresholdFeature.toggleThreshold(id);
       } catch (err) {
         log.warn(`VR threshold toggle failed: ${err?.message}`);
+        this.endManipulationGesture('threshold', { committed: false });
         return;
       }
       this._syncThreshold(id);
       this._emit('thresholdToggled', { enabled: this.isThresholdEnabled() });
+      this.endManipulationGesture('threshold');
     });
 
     return !wasEnabled;
@@ -2321,13 +3229,21 @@ class VRExplorationManager extends BaseManager {
     const order = ['between', 'above', 'below'];
     const current = vtkThresholdFeature.getState?.(id)?.mode || 'between';
     const next = order[(order.indexOf(current) + 1) % order.length];
+
+    // Phase D5: this action is synchronous end-to-end (no _deferHeavy), so
+    // begin/end simply bracket it — same "gesture-shaped" treatment as the
+    // clip box's discrete invert/reset/cycleAxis actions.
+    if (!this._beginGestureSync('threshold', id)) return null;
+
     try {
       vtkThresholdFeature.setMode(id, next);
     } catch (err) {
       log.warn(`VR threshold mode cycle failed: ${err?.message}`);
+      this.endManipulationGesture('threshold', { committed: false });
       return null;
     }
     this._syncThreshold(id);
+    this.endManipulationGesture('threshold');
     return next;
   }
 
@@ -2342,13 +3258,18 @@ class VRExplorationManager extends BaseManager {
     const names = arrays.map((a) => (typeof a === 'string' ? a : a?.name)).filter(Boolean);
     if (!names.length) return null;
     const next = names[(names.indexOf(state?.activeArray) + 1) % names.length];
+
+    if (!this._beginGestureSync('threshold', id)) return null;
+
     try {
       vtkThresholdFeature.selectArray(id, next);
     } catch (err) {
       log.warn(`VR threshold array cycle failed: ${err?.message}`);
+      this.endManipulationGesture('threshold', { committed: false });
       return null;
     }
     this._syncThreshold(id);
+    this.endManipulationGesture('threshold');
     return next;
   }
 
@@ -2553,6 +3474,24 @@ class VRExplorationManager extends BaseManager {
     const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
     if (now - (this._lastValuePatchAt || 0) < 50) return;
     this._lastValuePatchAt = now;
+
+    // Phase D5: lazily begin on the first tick since the last gesture ended
+    // — a held "+" button or a slider drag fires this at ~20 Hz, and
+    // re-acquiring per-tick would hammer the lease endpoint for no reason
+    // (nothing here needs a fresh network round trip mid-burst; see
+    // _beginGestureSync's docstring — it's a cached read + best-effort
+    // heartbeat nudge, not a POST). There is no discrete "pointer up"
+    // reaching this method, only a stream of value changes, so the gesture
+    // auto-ends after THROTTLED_GESTURE_IDLE_MS of silence instead.
+    if (!this._throttledGestureActive) {
+      this._throttledGestureActive = this._beginGestureSync('throttled');
+    }
+    if (this._throttledGestureTimer) clearTimeout(this._throttledGestureTimer);
+    this._throttledGestureTimer = setTimeout(() => {
+      this._throttledGestureTimer = null;
+      this._throttledGestureActive = false;
+      this.endManipulationGesture('throttled');
+    }, THROTTLED_GESTURE_IDLE_MS);
 
     const payload = patch || (typeof build === 'function' ? build() : null);
     if (payload) this._pushVisualizationPatch(payload);
@@ -2988,6 +3927,9 @@ class VRExplorationManager extends BaseManager {
     vrContext._hasExplicitScale = false;
     vrContext.vrScale = placement.vrScale;
     vrContext.vrOrigin = placement.vrOrigin;
+    // Auto-fit diagonal, kept on the context for the scale/zoom controls that
+    // read it back when re-fitting the dataset to the play area.
+    vrContext._autoFitDiagonal = placement.diagonal;
     // Rotation is part of the same affine XR→data map as scale/origin; start
     // unrotated (yaw radians about world-up through the data center).
     vrContext.vrRotation = 0;
@@ -3644,6 +4586,16 @@ class VRExplorationManager extends BaseManager {
         } catch (err) {
           log.warn(`VR manipulation heartbeat failed: ${err?.message}`);
         }
+
+        // Server SESSION liveness heartbeat (Issue 6) — piggybacks on this
+        // 1Hz tick only for scheduling convenience; it runs at its own,
+        // far coarser SERVER_SESSION_HEARTBEAT_MS cadence via this separate
+        // gate. No-op for a local vrsession_* id (see
+        // _sendServerSessionHeartbeat).
+        if (nowForVRSessionRegistry - this._lastServerSessionHeartbeat >= SERVER_SESSION_HEARTBEAT_MS) {
+          this._lastServerSessionHeartbeat = nowForVRSessionRegistry;
+          this._safeFrameStep('server-session-heartbeat', () => this._sendServerSessionHeartbeat());
+        }
       }
 
       // Broadcast the active controller ray so desktop collaborators can see
@@ -4061,12 +5013,26 @@ class VRExplorationManager extends BaseManager {
 
     // Get controller states
     for (const source of session.inputSources) {
-      if (source.hand) {
-        // Hand tracking - skip for now
+      // NOTE: hand-tracked sources are NOT skipped.
+      //
+      // This used to be `if (source.hand) continue;`, which silently discarded
+      // every input source carrying an XRHand — while 'hand-tracking' is
+      // requested as an optional feature on session start (see enterVR's
+      // optionalFeatures below). Whenever the runtime attached a hand to the
+      // pinch/transient source, or the user simply put the controllers down,
+      // inputState.controllers stayed { left: null, right: null } and EVERY
+      // tool received nothing at all, with no error and no visible symptom.
+      //
+      // A hand-tracked source still exposes targetRaySpace, so it falls
+      // through to the gripless branch below and is treated exactly like a
+      // Vision Pro transient pointer — which is the right model for it: aim
+      // along the target ray, pinch to select, no thumbstick, no grip.
+      if (source.hand && !source.targetRaySpace) {
+        // Nothing to aim with — no ray, no pose, nothing a tool could use.
         continue;
       }
 
-      if (source.gripSpace) {
+      if (source.gripSpace && !source.hand) {
         const handedness = source.handedness;
         try {
           const gripPose = frame.getPose(source.gripSpace, referenceSpace);
@@ -4202,17 +5168,32 @@ class VRExplorationManager extends BaseManager {
         // Probe results are intentionally session-local (transient inspection).
         this._emit('probeCreated', action.data);
         break;
-      case 'clip-box-updated':
+      case 'clip-box-updated': {
         this._emit('clipBoxUpdated', action.data);
+        // Phase D5: already gesture-shaped (final:false during the drag,
+        // final:true once on release) — begin on the first non-final
+        // frame, end once the release frame pushes. The one-shot
+        // invert/reset/cycleAxis actions (see invertClipPlane etc.) arrive
+        // here as a single final:true with no preceding false frame, so
+        // _clipGestureActive never opens for them and this is a no-op past
+        // the existing _pushVisualizationPatch gate.
+        const clipInstanceId = this._activeContext?.vrContext?.instanceId;
+        if (!action.data?.final && !this._clipGestureActive) {
+          this._clipGestureActive = this._beginGestureSync('clipBox', clipInstanceId);
+        }
         // Sync/persist only on gesture end — not every drag frame.
         if (action.data?.final) {
-          const instanceId = this._activeContext?.vrContext?.instanceId;
-          const config = instanceId
-            ? vtkClippingFeature.getConfigForSync(instanceId)
+          const config = clipInstanceId
+            ? vtkClippingFeature.getConfigForSync(clipInstanceId)
             : null;
           if (config) this._pushVisualizationPatch({ clipBox: config });
+          if (this._clipGestureActive) {
+            this._clipGestureActive = false;
+            this.endManipulationGesture('clipBox');
+          }
         }
         break;
+      }
       default:
         // Session-local tool feedback (probe-*, clip-grab-start, ...). Emitted
         // for observers; nothing persisted. A default arm exists so a newly
@@ -4264,7 +5245,12 @@ class VRExplorationManager extends BaseManager {
       // headset opened this dataset itself and holds a DIFFERENT viewConfigId,
       // so viewId alone would address a view no one else has.
       Promise.resolve(
-        pushSharedVisualizationUpdate(viewId, patch, resolveViewSyncKey(instance))
+        pushSharedVisualizationUpdate(
+          viewId,
+          patch,
+          resolveViewSyncKey(instance),
+          this._buildMutationMeta()
+        )
       )
         .then((result) => {
           // The service REFUSES by RETURNING { persisted: false, reason },
@@ -4305,6 +5291,16 @@ class VRExplorationManager extends BaseManager {
       const instanceId = this._activeContext?.instance?.instanceId;
       if (!instanceId) return;
 
+      // Phase D5: begin the gesture on the FIRST non-final frame, not every
+      // frame — VRObjectMoveMode's rising-edge frame anchors the grab (its
+      // delta is zero on that frame, so the object transform hasn't
+      // actually changed yet), making this the earliest point at which a
+      // snapshot is genuinely pre-mutation. The per-frame push below must
+      // NOT re-acquire on every call — gated on _transformGestureActive.
+      if (!final && !this._transformGestureActive) {
+        this._transformGestureActive = this._beginGestureSync('transform', instanceId);
+      }
+
       if (!final) {
         const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
         if (now - (this._lastObjTransformSentAt || 0) < 50) return;
@@ -4324,6 +5320,11 @@ class VRExplorationManager extends BaseManager {
           scale: [scale[0], scale[1], scale[2]],
         },
       });
+
+      if (final && this._transformGestureActive) {
+        this._transformGestureActive = false;
+        this.endManipulationGesture('transform');
+      }
     } catch (err) {
       log.warn(`VR object transform sync failed: ${err?.message}`);
     }

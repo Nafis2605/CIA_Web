@@ -65,9 +65,20 @@ function checkPreprocessingNeeds(dataset, metadata = {}) {
     estimatedTime: 0,
   };
 
-  const pointCount = metadata.pointCount || 0;
-  const polygonCount = metadata.polygonCount || 0;
-  const fileSize = dataset.size_bytes || 0;
+  // Fall back to the dataset row's OWN columns when no metadata object is
+  // supplied. Callers used to pass `dataset.version_metadata`, sourced from a
+  // LEFT JOIN on `dataset_versions` — a table that exists in no migration and
+  // in no live database, so that join always errored and this function only
+  // ever saw an empty metadata object. Every threshold below therefore
+  // compared 0 against its limit and `required` was permanently false.
+  //
+  // `cell_count` is the polygon count for the polydata this app deals in, and
+  // `file_size` is the real column name — `size_bytes` does not exist on
+  // `datasets` either. The explicit metadata argument still wins, so callers
+  // (and tests) that already have richer numbers keep passing them.
+  const pointCount = metadata.pointCount ?? dataset.point_count ?? 0;
+  const polygonCount = metadata.polygonCount ?? dataset.cell_count ?? 0;
+  const fileSize = dataset.size_bytes ?? dataset.file_size ?? 0;
 
   // Check point cloud preprocessing
   if (pointCount > THRESHOLDS.POINTS_HIGH) {
@@ -176,11 +187,16 @@ async function startPreprocessing(pool, datasetId, options = {}) {
 
   // Get dataset info
   const datasetResult = await pool.query(
-    `SELECT d.*,
-            dv.metadata as version_metadata
-     FROM datasets d
-     LEFT JOIN dataset_versions dv ON d.current_version_id = dv.id
-     WHERE d.id = $1`,
+    // NOTE: no join to `dataset_versions`. That table does not exist — not in
+    // init.sql, not in any migration, not in the running database — so this
+    // query raised `relation "dataset_versions" does not exist` on every call.
+    // In startPreprocessing that error propagated; in isReadyForVR a try/catch
+    // swallowed it and fell back to `required: false`, which is why VR entry
+    // still worked while the preprocessing needs it is supposed to compute
+    // were silently never computed. Everything checkPreprocessingNeeds()
+    // reads (point_count, cell_count, bounds, data_arrays) already lives on
+    // `datasets` itself.
+    `SELECT d.* FROM datasets d WHERE d.id = $1`,
     [datasetId]
   );
 
@@ -189,7 +205,7 @@ async function startPreprocessing(pool, datasetId, options = {}) {
   }
 
   const dataset = datasetResult.rows[0];
-  const metadata = dataset.version_metadata || {};
+  const metadata = {};
 
   // Check if preprocessing already complete (unless force)
   if (!force) {
@@ -361,21 +377,82 @@ async function completePreprocessing(pool, preprocessingId, results) {
 /**
  * Check if dataset is ready for VR
  *
+ * A dataset can be "ready" two different ways:
+ *   1. It went through preprocessing and that preprocessing completed
+ *      (or was recorded as NOT_NEEDED).
+ *   2. It never needed preprocessing in the first place — e.g. a small
+ *      dataset that has a `vr_preprocessing` status of PENDING simply
+ *      because no one has ever run `startPreprocessing` for it.
+ *
+ * `getPreprocessingStatus` alone cannot distinguish those two PENDING
+ * cases — "never preprocessed because it's tiny" and "never preprocessed
+ * but urgently needs it" both come back as `status: PENDING`. So this
+ * function additionally loads the dataset row and re-runs
+ * `checkPreprocessingNeeds` (the same size-threshold logic
+ * `startPreprocessing` uses) to learn whether preprocessing is actually
+ * `required` for this dataset.
+ *
+ * THE LOAD-BEARING RULE: if `required` is false, `ready` is forced to
+ * `true` regardless of `status`. Only a dataset where preprocessing is
+ * both required AND not yet complete is ever reported as not ready. This
+ * is what makes it safe to gate VR entry on this function's result — a
+ * naive `status === COMPLETE` check would block every dataset that has
+ * simply never been preprocessed, including ones that never needed it.
+ *
  * @param {Object} pool - Database pool
  * @param {string} datasetId - Dataset UUID
- * @returns {Object} Readiness status
+ * @returns {Object} Readiness status: { ready, required, status, progress,
+ *   operations, estimatedTime, resultMetadata, message }
  */
 async function isReadyForVR(pool, datasetId) {
   const status = await getPreprocessingStatus(pool, datasetId);
 
-  const ready =
+  // Determine whether preprocessing is actually required for this dataset
+  // (independent of whether it has ever been run). Best-effort: if the
+  // dataset lookup fails for any reason, fall back to `required: false`
+  // (the historical/pre-existing behavior) rather than blocking entry.
+  let needs = { required: false, operations: [], estimatedTime: 0 };
+  try {
+    const datasetResult = await pool.query(
+      // See startPreprocessing above: `dataset_versions` does not exist.
+      // The try/catch around this call meant the resulting error was
+      // swallowed and `needs` stayed at its `required: false` default, so
+      // this function has never actually computed a preprocessing requirement.
+      `SELECT d.* FROM datasets d WHERE d.id = $1`,
+      [datasetId]
+    );
+
+    if (datasetResult.rows.length > 0) {
+      const dataset = datasetResult.rows[0];
+      const metadata = {};
+      needs = checkPreprocessingNeeds(dataset, metadata);
+    }
+  } catch (err) {
+    log.error(`Failed to determine VR preprocessing needs for ${datasetId}:`, err);
+  }
+
+  const statusReady =
     status.status === PreprocessingStatus.COMPLETE ||
     status.status === PreprocessingStatus.NOT_NEEDED;
 
+  // See the load-bearing rule above: `required === false` always wins.
+  const ready = needs.required ? statusReady : true;
+
+  // Prefer the operations recorded on the actual preprocessing record
+  // (reflects what was/is actually queued or running); fall back to the
+  // freshly-computed needs when no record exists yet (e.g. PENDING).
+  const operations =
+    status.operations && status.operations.length > 0
+      ? status.operations
+      : needs.operations;
+
   return {
     ready,
+    required: needs.required,
     status: status.status,
     progress: status.progress,
+    operations,
+    estimatedTime: needs.estimatedTime,
     resultMetadata: status.resultMetadata,
     message: ready
       ? "Dataset ready for VR exploration"

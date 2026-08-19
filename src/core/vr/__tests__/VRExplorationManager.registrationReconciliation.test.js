@@ -91,6 +91,17 @@ vi.mock("@Core/vr/VRMultiViewGrid.js", () => ({
 vi.mock("@Services/apiClient.js", () => ({
   apiClient: { post: vi.fn(), get: vi.fn(), delete: vi.fn() },
 }));
+// _tryRegisterSession now requires a resolved roomId before it will POST
+// (see VRExplorationManager.js) — a real, un-initialized sessionManager
+// singleton would make getRoomId() throw and _tryRegisterSession would skip
+// the POST entirely, which is not what this file's late-reconciliation
+// scenarios are testing. Stub a resolved room so registration proceeds.
+vi.mock("@Core/session/sessionManager.js", () => ({
+  sessionManager: {
+    getRoomId: vi.fn(() => "room-1"),
+    getProjectId: vi.fn(() => "project-1"),
+  },
+}));
 vi.mock("@Core/instances/types/vtk/features/index.js", () => ({
   vtkClippingFeature: { getConfigForSync: vi.fn() },
   vtkSceneFeature: {},

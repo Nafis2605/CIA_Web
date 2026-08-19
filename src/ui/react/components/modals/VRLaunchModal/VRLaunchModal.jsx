@@ -110,6 +110,13 @@ function VRLaunchModal({
   // UI state
   const [isLaunching, setIsLaunching] = useState(false);
   const [error, setError] = useState("");
+  // Set only when the last refusal was specifically the Issue 7 VR-
+  // preprocessing-readiness gate (VRExplorationManager._checkVRPreprocessingReadiness,
+  // identified via err.code so this doesn't depend on parsing the message
+  // string) — that refusal, unlike any other startExploration failure, is
+  // meant to be bypassable, so it's the only one that gets an "Enter
+  // anyway" button.
+  const [preprocessingBlocked, setPreprocessingBlocked] = useState(false);
 
   // Check VR support when modal opens
   useEffect(() => {
@@ -160,11 +167,12 @@ function VRLaunchModal({
    * through VRManager (the sole session owner), and enters VR exploration
    * on the handler with a working WebGL/XRWebGLLayer already attached.
    */
-  const handleLaunch = useCallback(async () => {
+  const handleLaunch = useCallback(async (skipPreprocessingCheck = false) => {
     if (!vrSupported || !dataset || !instanceId) return;
 
     setIsLaunching(true);
     setError("");
+    setPreprocessingBlocked(false);
 
     try {
       const sessionConfig = {
@@ -173,6 +181,7 @@ function VRLaunchModal({
         projectId,
         explorationMode: navigationMode,
         vrScale: effectiveScale,
+        ...(skipPreprocessingCheck ? { skipPreprocessingCheck: true } : {}),
       };
 
       const session = await vrExplorationManager.startExploration(instanceId, sessionConfig);
@@ -188,6 +197,7 @@ function VRLaunchModal({
     } catch (err) {
       console.error("Failed to launch VR session:", err);
       setError(err.message || "Failed to launch VR session");
+      setPreprocessingBlocked(err?.code === "vr-preprocessing-required");
       toast.error(`VR launch failed: ${err.message}`);
     } finally {
       setIsLaunching(false);
@@ -203,6 +213,10 @@ function VRLaunchModal({
     onLaunch,
     onClose,
   ]);
+
+  const handleEnterAnyway = useCallback(() => {
+    handleLaunch(true);
+  }, [handleLaunch]);
 
   // Build class names
   const contentClassNames = ["vr-launch-modal", className].filter(Boolean).join(" ");
@@ -222,7 +236,7 @@ function VRLaunchModal({
           </Button>
           <Button
             variant="primary"
-            onClick={handleLaunch}
+            onClick={() => handleLaunch()}
             loading={isLaunching}
             disabled={!vrSupported || checkingSupport || isLaunching || !instanceId}
             icon={getIconComponent("vr")}
@@ -260,6 +274,17 @@ function VRLaunchModal({
           <div className="vr-launch-modal__error" role="alert">
             <Icon name="alertCircle" size={14} />
             <span>{error}</span>
+            {preprocessingBlocked && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={handleEnterAnyway}
+                disabled={isLaunching}
+                className="vr-launch-modal__enter-anyway"
+              >
+                Enter anyway
+              </Button>
+            )}
           </div>
         )}
 

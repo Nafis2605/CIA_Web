@@ -26,16 +26,21 @@ function makeSpyRenderer() {
   };
 }
 
-function makeInputState({ triggerPressed = false } = {}) {
+function makeController(triggerPressed) {
   return {
-    controllers: {
-      right: {
-        targetRay: { position: { x: 0, y: 0, z: 0 }, matrix: new Array(16).fill(0) },
-        triggerPressed,
-        thumbstick: { x: 0, y: 0 },
-        buttons: {},
-      },
-    },
+    targetRay: { position: { x: 0, y: 0, z: 0 }, matrix: new Array(16).fill(0) },
+    triggerPressed,
+    thumbstick: { x: 0, y: 0 },
+    buttons: {},
+  };
+}
+
+function makeInputState({ triggerPressed = false, hand = "right" } = {}) {
+  return {
+    controllers: { [hand]: makeController(triggerPressed) },
+    // Mirrors what VRExplorationManager._resolveActivePointerHand puts on the
+    // input state each frame.
+    activePointerHand: hand,
   };
 }
 
@@ -58,11 +63,11 @@ describe("VRMeasureTool — measurement rendering", () => {
   });
 
   function placeStart() {
-    tool._lastTriggerState = false;
+    tool._lastTriggerState = { left: false, right: false };
     return tool.handleInput(makeInputState({ triggerPressed: true }), {});
   }
   function placeEnd() {
-    tool._lastTriggerState = false;
+    tool._lastTriggerState = { left: false, right: false };
     return tool.handleInput(makeInputState({ triggerPressed: true }), {});
   }
 
@@ -160,6 +165,38 @@ describe("VRMeasureTool — measurement rendering", () => {
     expect(endAction).toMatchObject({ type: "measurement-created" });
   });
 
+  it("places from the LEFT hand when that is the active pointer", () => {
+    // Regression guard. This tool read inputState.controllers.right
+    // unconditionally, so left-handed measurement was silently impossible —
+    // and on Vision Pro, where a gripless pinch is assigned to whichever hand
+    // slot is free, a second simultaneous pinch lands in 'left' and was
+    // dropped entirely. VRAnnotationTool already honoured
+    // _resolveActivePointerHand; measure did not.
+    const action = tool.handleInput(
+      makeInputState({ triggerPressed: true, hand: "left" }),
+      {}
+    );
+    expect(action).toMatchObject({ type: "measurement-start-placed" });
+  });
+
+  it("latches the trigger per hand, so one hand's release cannot re-arm the other", () => {
+    // A single scalar latch cross-talks: releasing the left trigger cleared
+    // the flag the right hand was holding, so a held right trigger re-armed
+    // and placed again every frame.
+    tool.handleInput(makeInputState({ triggerPressed: true, hand: "right" }), {});
+
+    // Left hand taps and releases while the right trigger is still held.
+    tool.handleInput(makeInputState({ triggerPressed: true, hand: "left" }), {});
+    tool.handleInput(makeInputState({ triggerPressed: false, hand: "left" }), {});
+
+    // The right hand never released, so this must NOT read as a new press.
+    const repeat = tool.handleInput(
+      makeInputState({ triggerPressed: true, hand: "right" }),
+      {}
+    );
+    expect(repeat).toBeNull();
+  });
+
   it("getMeasurementState reports idle when the tool is not active", async () => {
     // `if (!this.isActive)` (no call) is a bound-method reference, always
     // truthy, so this branch never took — the status line reported
@@ -191,7 +228,7 @@ describe("VRMeasureTool — chained polyline", () => {
   }
 
   function tap(t) {
-    t._lastTriggerState = false;
+    t._lastTriggerState = { left: false, right: false };
     const r = t.handleInput(makeInputState({ triggerPressed: true }), {});
     t._advance();
     return r;
@@ -373,7 +410,7 @@ describe("VRMeasureTool — glyph selection hint", () => {
 
     tool.handleInput(makeInputState({ triggerPressed: true }), {});
     i = 1;
-    tool._lastTriggerState = false;
+    tool._lastTriggerState = { left: false, right: false };
     tool.handleInput(makeInputState({ triggerPressed: true }), {});
     expect(vtkGlyphFeature.setSelectedPoint).toHaveBeenLastCalledWith(instanceId, 2);
 

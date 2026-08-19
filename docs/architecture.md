@@ -246,6 +246,8 @@ User clicks "Enter VR"
     → XR render loop starts (_onXRFrame)
 ```
 
+`VRExplorationManager` requires a local WebGL/VTK rendering context to enter VR — this holds regardless of `RENDER_MODE`; VR never falls back to server-rendered frames. See [Why does VR always render locally?](#design-decisions) below.
+
 ### Components
 
 | Module | Responsibility |
@@ -338,5 +340,12 @@ Large scientific datasets (millions of points) are too heavy to process in the b
 <summary>Why MinIO and not direct filesystem storage?</summary>
 
 MinIO provides S3-compatible object storage that scales independently of the database and supports pre-signed URLs for direct browser uploads, without exposing the filesystem to application code.
+
+</details>
+
+<details>
+<summary>Why does VR always render locally?</summary>
+
+Headset GPUs can't handle full-resolution scientific datasets, but stereo VR also can't tolerate the latency of a server-streamed frame loop the way a mouse-driven desktop viewport can. The dataset-size half of that problem is solved ahead of time by server-side preprocessing (LOD, octree, bounds, texture compression — see `server/src/services/vrPreprocessing.js`); the per-frame rendering stays local via WebXR. VR is intentionally not connected to the separate desktop server-rendering path (`docs/server-rendering.md`), which streams discrete PNG frames over a WebSocket and has no stereo/pose/WebXR support. Full ADR: [`docs/vr-rendering-architecture.md`](./vr-rendering-architecture.md).
 
 </details>

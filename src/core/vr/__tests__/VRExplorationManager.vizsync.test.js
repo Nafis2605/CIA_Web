@@ -132,7 +132,14 @@ describe("VRExplorationManager â€” VR visualization sync (clip/representati
       type: "clip-box-updated",
       data: { instanceId: "inst-1", final: true },
     });
-    expect(mockPush).toHaveBeenCalledWith("view-1", { clipBox: mockClipConfig }, "dataset-1");
+    // Fourth arg is the Phase D6 mutation envelope, attached to every
+    // _pushVisualizationPatch call now — see _buildMutationMeta.
+    expect(mockPush).toHaveBeenCalledWith(
+      "view-1",
+      { clipBox: mockClipConfig },
+      "dataset-1",
+      expect.objectContaining({ actorId: "user-1" })
+    );
   });
 
   it("does NOT push during drag frames (final: false)", () => {
@@ -154,7 +161,12 @@ describe("VRExplorationManager â€” VR visualization sync (clip/representati
     vrExplorationManager._drainDeferredWork();
 
     expect(instanceTools.setRepresentation).toHaveBeenCalledWith("inst-1", "wireframe");
-    expect(mockPush).toHaveBeenCalledWith("view-1", { representation: "wireframe" }, "dataset-1");
+    expect(mockPush).toHaveBeenCalledWith(
+      "view-1",
+      { representation: "wireframe" },
+      "dataset-1",
+      expect.objectContaining({ actorId: "user-1" })
+    );
   });
 
   it("toggleGlyphs returns the optimistic enabled state immediately, then enables + pushes once the frame drains", () => {
@@ -185,7 +197,12 @@ describe("VRExplorationManager â€” VR visualization sync (clip/representati
     expect(Number.isFinite(opts.scaleFactor)).toBe(true);
     expect(opts.scaleFactor).toBeGreaterThan(0);
 
-    expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig }, "dataset-1");
+    expect(mockPush).toHaveBeenCalledWith(
+      "view-1",
+      { glyph: mockGlyphConfig },
+      "dataset-1",
+      expect.objectContaining({ actorId: "user-1" })
+    );
   });
 
   it("toggleGlyphs disables when already enabled and still pushes the patch once drained", () => {
@@ -198,7 +215,12 @@ describe("VRExplorationManager â€” VR visualization sync (clip/representati
     vrExplorationManager._drainDeferredWork();
 
     expect(vtkGlyphFeature.disableGlyphs).toHaveBeenCalledWith("inst-1");
-    expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig }, "dataset-1");
+    expect(mockPush).toHaveBeenCalledWith(
+      "view-1",
+      { glyph: mockGlyphConfig },
+      "dataset-1",
+      expect.objectContaining({ actorId: "user-1" })
+    );
   });
 
   // setGlyphType exposes the SAME desktop VTKGlyphFeature API as toggleGlyphs
@@ -220,7 +242,12 @@ describe("VRExplorationManager â€” VR visualization sync (clip/representati
         { fake: true },
         expect.objectContaining({ glyphType: "cone", orientationArray: "velocity" })
       );
-      expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig }, "dataset-1");
+      expect(mockPush).toHaveBeenCalledWith(
+      "view-1",
+      { glyph: mockGlyphConfig },
+      "dataset-1",
+      expect.objectContaining({ actorId: "user-1" })
+    );
     });
 
     it("swaps the shape synchronously (not deferred) when glyphs are already enabled", () => {
@@ -231,7 +258,12 @@ describe("VRExplorationManager â€” VR visualization sync (clip/representati
       // Cheap â€” setGlyphType only rebuilds the glyph source, not the mapper â€”
       // so unlike the initial enable above it runs immediately, no drain needed.
       expect(vtkGlyphFeature.setGlyphType).toHaveBeenCalledWith("inst-1", "sphere");
-      expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig }, "dataset-1");
+      expect(mockPush).toHaveBeenCalledWith(
+      "view-1",
+      { glyph: mockGlyphConfig },
+      "dataset-1",
+      expect.objectContaining({ actorId: "user-1" })
+    );
     });
 
     it("disables with typeId === null, same as toggleGlyphs' disable branch", () => {
@@ -243,7 +275,12 @@ describe("VRExplorationManager â€” VR visualization sync (clip/representati
       vrExplorationManager._drainDeferredWork();
 
       expect(vtkGlyphFeature.disableGlyphs).toHaveBeenCalledWith("inst-1");
-      expect(mockPush).toHaveBeenCalledWith("view-1", { glyph: mockGlyphConfig }, "dataset-1");
+      expect(mockPush).toHaveBeenCalledWith(
+      "view-1",
+      { glyph: mockGlyphConfig },
+      "dataset-1",
+      expect.objectContaining({ actorId: "user-1" })
+    );
     });
 
     it("refuses a type requiring orientation when the dataset has no vector array", () => {

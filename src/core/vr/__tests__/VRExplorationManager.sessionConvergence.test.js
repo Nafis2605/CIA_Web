@@ -122,6 +122,17 @@ vi.mock("@Core/vr/VRMultiViewGrid.js", () => ({
 vi.mock("@Services/apiClient.js", () => ({
   apiClient: { post: vi.fn(), get: vi.fn(), delete: vi.fn() },
 }));
+// _tryRegisterSession now requires a resolved roomId before it will POST
+// (see VRExplorationManager.js) — a real, un-initialized sessionManager
+// singleton would make getRoomId() throw and every startExploration() call
+// in this file would skip registration entirely, which is not what this
+// file is testing. Stub a resolved room so registration proceeds as before.
+vi.mock("@Core/session/sessionManager.js", () => ({
+  sessionManager: {
+    getRoomId: vi.fn(() => "room-1"),
+    getProjectId: vi.fn(() => "project-1"),
+  },
+}));
 vi.mock("@Core/instances/types/vtk/features/index.js", () => ({
   vtkClippingFeature: { getConfigForSync: vi.fn() },
   vtkSceneFeature: {},
@@ -174,6 +185,14 @@ describe("VRExplorationManager â€” session convergence (Y.js vr-sessions re
     mockControlManagerInstances.length = 0;
     apiClient.post.mockReset();
     apiClient.post.mockResolvedValue({ id: "server-session-1" });
+    // Issue 6: a rekey that lands on a session-id WE self-registered now
+    // triggers a fast-path DELETE of the orphaned row (see
+    // _watchVRSessionConvergence) — several tests below trigger exactly that
+    // rekey, so apiClient.delete needs a resolved default or the
+    // fire-and-forget .catch() chain would reject against an unmocked
+    // vi.fn() return value.
+    apiClient.delete.mockReset();
+    apiClient.delete.mockResolvedValue({ success: true });
     vi.mocked(vrAvatarSystem.rekey).mockReset();
 
     // Reset the singleton's state â€” leaveSession() isn't exercised here, and
@@ -186,6 +205,8 @@ describe("VRExplorationManager â€” session convergence (Y.js vr-sessions re
     vrExplorationManager._participantSync = null;
     vrExplorationManager._controlManager = null;
     vrExplorationManager._lastVRSessionHeartbeat = 0;
+    vrExplorationManager._lastServerSessionHeartbeat = 0;
+    vrExplorationManager._registeredServerSessionId = null;
   });
 
   it("a second startExploration on the same view adopts the existing sessionId and does not re-register with the server", async () => {
@@ -508,5 +529,111 @@ describe("VRExplorationManager â€” session convergence (Y.js vr-sessions re
     });
 
     expect(session.ownerUserId).toBe("user-1"); // unchanged — no longer listening
+  });
+
+  // Issue 6: a rekey loss must clean up a row WE self-registered (it would
+  // otherwise sit orphaned in 'preparing'/'active' until lazy-expiry
+  // reaping caught it, minutes later) but must NEVER delete a session id
+  // that arrived via the join path — that id belongs to the real host.
+  describe("fast-path orphan cleanup on rekey (Issue 6)", () => {
+    it("deletes our own self-registered row when the claim race resolves against us", async () => {
+      workspaceManager.getInstance.mockReturnValueOnce(makeInstance("view-1", "inst-1"));
+      const session = await vrExplorationManager.startExploration("inst-1", {});
+      const ourId = session.id;
+      expect(ourId).toBe("server-session-1");
+      expect(vrExplorationManager._registeredServerSessionId).toBe("server-session-1");
+
+      yVRSessions.set("ds-1", {
+        sessionId: "vrsession_winner",
+        viewConfigurationId: "ds-1",
+        hostUserId: "user-2",
+        hostUserName: "Other User",
+        datasetId: "ds-1",
+        projectId: null,
+        createdAt: Date.now(),
+        lastHeartbeat: Date.now(),
+        participantCount: 1,
+      });
+
+      expect(session.id).toBe("vrsession_winner");
+      expect(apiClient.delete).toHaveBeenCalledWith(`/vr/sessions/${ourId}`);
+      // The flag is cleared once the cleanup fires — nothing left to
+      // attribute to us any more.
+      expect(vrExplorationManager._registeredServerSessionId).toBeNull();
+    });
+
+    it("never deletes the canonical session id on the join path, even if a rekey occurs", async () => {
+      workspaceManager.getInstance.mockReturnValueOnce(makeInstance("view-2", "inst-2", "ds-joined"));
+
+      // Path 1 (explicit join) — _registeredServerSessionId must stay null:
+      // we didn't register anything, the id came from the host.
+      const session = await vrExplorationManager.startExploration("inst-2", {
+        serverSession: {
+          id: "host-real-id",
+          owner_participant_id: "user-2#device-2",
+          owner_user_name: "Host",
+        },
+      });
+      expect(session.id).toBe("host-real-id");
+      expect(apiClient.post).not.toHaveBeenCalled(); // Path 1 never registers
+      expect(vrExplorationManager._registeredServerSessionId).toBeNull();
+
+      apiClient.delete.mockClear();
+
+      // A rekey on this view's slot regardless — the defensive gate must
+      // hold even though this is a scenario the real client wouldn't
+      // normally produce (Path 1 doesn't watch/claim before this).
+      yVRSessions.set("ds-joined", {
+        sessionId: "vrsession_someone_else",
+        viewConfigurationId: "ds-joined",
+        hostUserId: "user-3",
+        hostUserName: "Someone Else",
+        datasetId: "ds-joined",
+        projectId: null,
+        createdAt: Date.now(),
+        lastHeartbeat: Date.now(),
+        participantCount: 1,
+      });
+
+      expect(session.id).toBe("vrsession_someone_else");
+      expect(apiClient.delete).not.toHaveBeenCalledWith("/vr/sessions/host-real-id");
+      expect(apiClient.delete).not.toHaveBeenCalled();
+    });
+  });
+
+  // THE load-bearing interaction between Issue 5 and Issue 6: a losing
+  // create-race client must adopt the winner's identity, not write ITSELF
+  // into the Yjs registry as host — otherwise the losing client re-creates
+  // the two-hosts bug Issue 5 fixed, through the registry instead of the
+  // manipulation lease.
+  describe("create-race adoption (Issue 6)", () => {
+    it("adopts the winner's ownerUserId/ownerUserName when the server reports adopted:true, and never claims itself as host", async () => {
+      workspaceManager.getInstance.mockReturnValueOnce(makeInstance("view-3", "inst-3", "ds-adopt"));
+      apiClient.post.mockResolvedValueOnce({
+        id: "winner-id",
+        adopted: true,
+        owner_participant_id: "user-9#dev9",
+        owner_user_name: "Winner",
+      });
+
+      const session = await vrExplorationManager.startExploration("inst-3", {});
+
+      expect(session.id).toBe("winner-id");
+      // getParticipantId() is mocked to "user-1" for this whole file — the
+      // bug this guards against is session.ownerUserId ending up as "user-1"
+      // (ourselves) instead of the actual winner.
+      expect(session.ownerUserId).toBe("user-9#dev9");
+      expect(session.ownerUserId).not.toBe("user-1");
+      expect(session.ownerUserName).toBe("Winner");
+
+      // Never registered a row of our own — the fast-path orphan cleanup
+      // must never attribute "winner-id" to us.
+      expect(vrExplorationManager._registeredServerSessionId).toBeNull();
+
+      // Never wrote ourselves into the Yjs registry as host for this view —
+      // the adopted branch deliberately skips claimVRSession entirely (see
+      // startExploration's Path 3 comment).
+      expect(getVRSessionForView("ds-adopt")).toBeNull();
+    });
   });
 });

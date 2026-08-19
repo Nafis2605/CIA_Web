@@ -108,6 +108,13 @@ export const VR_MENU_BUTTONS = Object.freeze([
   // live in the Advanced drawer. Keeping the default surface to four rows
   // gives every Quest-facing card and label materially more screen space.
   // exit stays last (VTKVRSpatialUI/tests rely on the last row ending with it).
+  // Mic mute sits on the DEFAULT surface, not in the Advanced drawer. Voice
+  // now auto-joins on VR entry (VRExplorationManager._autoJoinVoice) and joins
+  // MUTED, so mute/unmute is the one voice control a user actually needs
+  // mid-session — and burying it two levels down (open menu -> open drawer)
+  // is why voice was effectively unusable in-headset. "voice-join" stays in
+  // the Advanced drawer for the rare explicit leave/rejoin.
+  { id: "voice-mute", label: "Mic", icon: "mic", kind: "voice-mute", row: 4, group: "SESSION" },
   { id: "people", label: "People", icon: "user", kind: "drawer", drawerId: "people", row: 4, group: "SESSION" },
   { id: "isolation", label: "Isolate", icon: "fullscreen", kind: "toggle", row: 4, group: "SESSION" },
   { id: "advanced", label: "More", icon: "sliders", kind: "drawer", drawerId: "advanced", row: 4, group: "SESSION" },
@@ -201,8 +208,11 @@ export const VR_MENU_DRAWERS = Object.freeze({
   // reused unchanged when this drawer is open.
   advanced: Object.freeze([
     { id: "walk", label: "Walk", icon: "footprints", kind: "nav-mode-set", mode: "walk", drawerRow: 0, group: "MOVE" },
+    // "voice-mute" is NOT here — it was promoted to the default surface
+    // (VR_MENU_BUTTONS row 4) now that voice auto-joins muted on VR entry.
+    // Listing it in both places would put two buttons with the same id in one
+    // layout, which the hit-test and active-state lookups key on.
     { id: "voice-join", label: "Voice", icon: "headsetMic", kind: "voice-join", drawerRow: 0, group: "SESSION" },
-    { id: "voice-mute", label: "Mute", icon: "mic", kind: "voice-mute", drawerRow: 0, group: "SESSION" },
     { id: "grid", label: "Views", icon: "layoutGrid", kind: "toggle", drawerRow: 1, group: "SCENE" },
     { id: "ref-grid", label: "Grid", icon: "grid", kind: "scene-grid", drawerRow: 1, group: "SCENE" },
     { id: "axes", label: "Axes", icon: "axis3d", kind: "scene-axes", drawerRow: 1, group: "SCENE" },

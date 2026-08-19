@@ -97,7 +97,10 @@ When Vision Pro's browser supports `immersive-vr`:
 - The "Enter Immersive Mode" button appears in the workspace toolbar.
 - Tapping it requests a WebXR session.
 - The app enters spatial view using visionOS's spatial rendering.
-- Camera/view updates from Vision Pro spatial input are sent to the render server.
+- Rendering happens **on the headset**, via WebXR — Vision Pro is not sent
+  server-rendered frames, and its spatial input never round-trips to the render
+  server. The server's only role for VR is preprocessing (LOD, octree, bounds).
+  See `docs/vr-rendering-architecture.md`.
 
 **Input model:** visionOS Safari exposes `transient-pointer` input sources
 (gaze + pinch) instead of tracked controllers. These have a target ray but no

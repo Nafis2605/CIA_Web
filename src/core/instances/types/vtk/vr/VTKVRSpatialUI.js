@@ -319,6 +319,11 @@ export class VRSpatialUI {
     this._panelSideSign = 1;
     this._lastAnchorScale = null;
     this._lastPanelMode = "menu";
+    // One-shot: set by layout() on a menu<->keyboard mode switch so
+    // _updateAnchor corrects the manually-placed anchor's stale floor
+    // clearance for the new footprint, without discarding _manualPlacement
+    // (see _updateAnchor/_reanchorFootprintInPlace).
+    this._pendingFootprintReanchor = false;
     // Actors for buttons whose id fell out of the current layout (e.g. a
     // mode switch), moved here instead of destroyed — see
     // _reconcileButtonActors. Re-adopted if the same id reappears; otherwise
@@ -1312,6 +1317,7 @@ export class VRSpatialUI {
     this._manualPlacement = false;
     this._panelAnchor = null;
     this._lastHeadPos = null;
+    this._pendingFootprintReanchor = false;
     this._updateAnchor(headPose);
   }
 
@@ -1345,6 +1351,7 @@ export class VRSpatialUI {
     this._lastHeadPos = null;
     this._lastAnchorScale = null;
     this._manualPlacement = false;
+    this._pendingFootprintReanchor = false;
   }
 
   /**
@@ -1403,6 +1410,11 @@ export class VRSpatialUI {
       // nulling it here only takes effect starting with the NEXT frame's
       // hitTest() — one frame of lag on keyboard open. Imperceptible.
       this._lastHeadPos = null;
+      // See _updateAnchor/_reanchorFootprintInPlace: when the panel is
+      // manually placed, _lastHeadPos=null above has no effect (the manual-
+      // placement check returns before ever reaching it), so this flag is
+      // what actually gets the new footprint's floor clearance applied.
+      this._pendingFootprintReanchor = true;
       // Repaint the header in place (same canvas/texture, see
       // _drawBackingPanel) — the group legend makes no sense above a QWERTY
       // grid, and vice versa.
@@ -1458,7 +1470,21 @@ export class VRSpatialUI {
    */
   _updateAnchor(headPose) {
     if (!headPose?.position) return;
-    if (this._manualPlacement && this._panelAnchor) return;
+    if (this._manualPlacement && this._panelAnchor) {
+      // A mode switch (menu<->keyboard) still needs to correct THIS
+      // manually-placed anchor's floor clearance for the new footprint —
+      // see layout()'s modeChanged branch — without re-deriving X/Z/
+      // orientation from headPose, which would discard the user's drag.
+      if (this._pendingFootprintReanchor) {
+        this._pendingFootprintReanchor = false;
+        this._reanchorFootprintInPlace();
+      }
+      return;
+    }
+    // The full recompute below already re-derives and re-clamps everything
+    // for the current footprint, so a stale flag can't leak into a later
+    // manual-placement frame.
+    this._pendingFootprintReanchor = false;
     const p = headPose.position;
     const headPos = [p.x, p.y, p.z];
 
@@ -1521,6 +1547,23 @@ export class VRSpatialUI {
     this._panelAnchor = { center, right, up, normal };
     this._lastHeadPos = headPos;
     this._lastAnchorScale = this._vrScale || 1;
+  }
+
+  /**
+   * One-shot correction for a manually-placed panel after layout() swaps the
+   * footprint (menu <-> keyboard). Keeps the user's chosen center X/Z and
+   * right/up/normal exactly as dragged; only lifts center Y so the new
+   * footprint still clears the floor. Operates on the current _panelAnchor,
+   * never headPose, so it cannot relocate a manually-placed panel back
+   * toward the user's face. Triggered once per mode switch via
+   * _pendingFootprintReanchor (see layout()'s modeChanged branch).
+   * @private
+   */
+  _reanchorFootprintInPlace() {
+    const a = this._panelAnchor;
+    if (!a) return;
+    const halfHeight = (this._panelHeight || 0) / 2 + BACKING_PAD_M;
+    a.center[1] = Math.max(a.center[1], FLOOR_CLEARANCE_M + halfHeight);
   }
 
   /**
@@ -2307,6 +2350,7 @@ export class VRSpatialUI {
     this._panelDrop = PANEL_DROP;
     this._panelSideOffset = PANEL_SIDE_OFFSET;
     this._lastPanelMode = "menu";
+    this._pendingFootprintReanchor = false;
     this._statusCanvas = null;
     this._statusCtx = null;
     this._statusTexture = null;

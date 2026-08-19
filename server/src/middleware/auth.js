@@ -127,6 +127,85 @@ async function ensureDevUser(pool, { id, email, name } = {}) {
   }
 }
 
+/**
+ * DEV BYPASS ONLY -- let a per-device identity self-join ONE public room, on
+ * first access to it.
+ *
+ * WHY THIS EXISTS
+ * Real headsets do not authenticate as one of the seeded dev UUIDs: in
+ * dev-bypass mode each browser profile mints its own persistent identity
+ * (src/core/identity/deviceIdentity.js) and sends it as x-user-id. That
+ * identity gets a `users` row from ensureDevUser and nothing else. But the two
+ * newest guards read membership with raw SQL and NO dev-bypass short-circuit,
+ * unlike every other guard in this file (checkProjectMembership below returns
+ * {allowed:true} outright):
+ *
+ *   * resolveRoomAccess()          server/src/routes/vr.js
+ *   * wsManager._checkRoomAccess() server/src/services/websocket.js
+ *
+ * So every headset got 403 not-a-room-member on every /api/vr/* call and
+ * "room:join-error: Access denied" on the WS room channel. The WS denial is
+ * the quiet half: the socket never enters wsManager.roomChannels, so
+ * broadcastToRoom() reaches nobody and every vr:* event is dropped. Two
+ * headsets in one room could not see each other, with no error surfaced
+ * anywhere a user would look.
+ *
+ * SCOPE -- deliberately as narrow as it can be while still fixing that:
+ *   * dev bypass only;
+ *   * ONE room, the one being accessed, not every room;
+ *   * PUBLIC rooms only -- a private room still needs a real invite;
+ *   * writes room_members ONLY, never project_members. Granting project
+ *     membership would make "not a project member" impossible to express in
+ *     dev bypass, which several integration tests correctly pin
+ *     (roomMembership.test.js).
+ *
+ * This is the same access the existing POST /projects/:id/rooms/:id/join
+ * endpoint already grants any caller for a public room -- it just no longer
+ * requires someone to have clicked a button in the Rooms panel first.
+ *
+ * @param {import('pg').Pool} pool
+ * @param {string} roomId - already validated as a UUID by the caller
+ * @param {string} userId
+ * @returns {Promise<boolean>} true if the user is now a member of that room
+ */
+async function ensureDevPublicRoomMembership(pool, roomId, userId) {
+  if (!DEV_BYPASS_AUTH) return false;
+  if (!pool || !roomId || !userId) return false;
+
+  try {
+    // room_members.user_id is a FK to users.id, so the row has to exist first.
+    // The WebSocket path reaches this WITHOUT having gone through any HTTP
+    // request, so ensureDevUser may never have run for this identity — and a
+    // headset's serverSync socket routinely connects before its first API
+    // call. Without this the INSERT below fails the FK, the join is refused,
+    // and nothing ever retries: the socket stays out of roomChannels for the
+    // whole session and every VR broadcast is silently dropped.
+    await ensureDevUser(pool, { id: userId });
+
+    const res = await pool.query(
+      `INSERT INTO room_members (room_id, user_id, role)
+       SELECT r.id, $2, 'member' FROM rooms r
+        WHERE r.id = $1 AND r.is_public = true
+       ON CONFLICT (room_id, user_id) DO NOTHING
+       RETURNING room_id`,
+      [roomId, userId]
+    );
+    // A zero-row result means either the room is not public (correctly
+    // refused) or the row already existed (already a member). Distinguish
+    // them, because the caller needs "is a member now", not "inserted now".
+    if (res.rowCount > 0) return true;
+
+    const existing = await pool.query(
+      `SELECT 1 FROM room_members WHERE room_id = $1 AND user_id = $2`,
+      [roomId, userId]
+    );
+    return existing.rowCount > 0;
+  } catch (err) {
+    log.warn(`ensureDevPublicRoomMembership failed for ${userId}@${roomId}: ${err.message}`);
+    return false;
+  }
+}
+
 const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN || null;
 const INTERNAL_PATH_PREFIXES = [
   "/api/compute/internal",
@@ -657,4 +736,5 @@ module.exports = {
   requireWriteAuth,
   setPool,
   ensureDevUser,
+  ensureDevPublicRoomMembership,
 };

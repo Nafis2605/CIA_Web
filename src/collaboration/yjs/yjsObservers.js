@@ -221,6 +221,59 @@ export function initializeCameraObserver() {
   return () => yCameras.unobserve(handler);
 }
 
+/**
+ * Read a single viewId's entry in yCameras for replay, applying the same
+ * self-echo skip initializeCameraObserver's handler does. Not shared with
+ * that handler directly (unlike _emitVisualizationEntry below) because the
+ * live handler also has to forward Y.js delete events — which never apply to
+ * a replay, since replay only ever iterates entries that currently exist.
+ *
+ * @param {string} viewId
+ * @returns {{action:'update', viewId, camera, userId, syncKey, collaborationViewId}|null}
+ */
+function _readCameraEntry(viewId) {
+  const cameraData = yCameras.get(viewId);
+  if (!cameraData || cameraData.clientId === ydoc.clientID) return null;
+  return {
+    action: "update",
+    viewId,
+    camera: cameraData.camera,
+    userId: cameraData.userId,
+    syncKey: cameraData.syncKey,
+    collaborationViewId: cameraData.collaborationViewId,
+  };
+}
+
+/**
+ * Replay every (or a selected subset of) currently-stored camera entries
+ * through the SAME cameraChangeCallbacks fan-out the live observer uses. See
+ * replayVisualizationState's docstring — same late-join-hydration rationale.
+ *
+ * @param {string[]|null} [viewIds] - specific viewIds to replay, or null (the
+ *   default) to replay every entry currently in yCameras.
+ * @returns {number} count of entries actually replayed (after skips)
+ */
+export function replayCameraState(viewIds = null) {
+  const ids = viewIds || Array.from(yCameras.keys());
+  let count = 0;
+
+  ids.forEach((viewId) => {
+    const payload = _readCameraEntry(viewId);
+    if (!payload) return;
+    count += 1;
+
+    cameraChangeCallbacks.forEach((cb) => {
+      try {
+        cb(payload);
+      } catch (error) {
+        log.error("Camera replay callback error:", error);
+      }
+    });
+  });
+
+  return count;
+}
+
 // ============================================================================
 // Visualization State Observer
 // ============================================================================
@@ -233,6 +286,65 @@ export function onVisualizationChange(callback) {
     visualizationChangeCallbacks = visualizationChangeCallbacks.filter(
       (cb) => cb !== callback
     );
+  };
+}
+
+/**
+ * Read and interpret a single viewId's entry in yVisualizationState, applying
+ * every skip rule the live observer enforces: legacy non-Y.Map entries,
+ * self-echo (this browser connection's own write), and — when `minRevision`
+ * is given — an entry stamped with a revision at or below it.
+ *
+ * This is the ONLY place that turns a raw yVisualizationState entry into the
+ * `{viewId, visualization, userId, syncKey, collaborationViewId}` shape fed to
+ * visualizationChangeCallbacks — used by both initializeVisualizationObserver
+ * (live updates) and replayVisualizationState (late-join hydration), so there
+ * is exactly one interpretation of what a stored entry means.
+ *
+ * @param {string} viewId
+ * @param {{minRevision?: number|null}} [opts]
+ * @returns {{action:'update', viewId, visualization, userId, syncKey, collaborationViewId}|null}
+ *   null when the entry should be skipped.
+ */
+function _emitVisualizationEntry(viewId, { minRevision = null } = {}) {
+  const entry = yVisualizationState.get(viewId);
+  // Legacy plain-object entry from before the nested-Y.Map migration (or the
+  // entry was deleted) — skip rather than throw; self-heals on the next write.
+  if (!(entry instanceof Y.Map)) return null;
+
+  // Skip updates that came from this browser connection.
+  if (entry.get("clientId") === ydoc.clientID) return null;
+
+  if (minRevision != null) {
+    const entryRevision = entry.get("revision");
+    // Only an entry EXPLICITLY stamped at or below minRevision is treated as
+    // stale and skipped. An unstamped entry (entryRevision is not a number —
+    // e.g. written before this field existed, or by a share mode with no
+    // ViewConfiguration to read a revision from, see syncVisualizationToYjs's
+    // docstring) is treated as newer than the snapshot, NOT older: the whole
+    // reason this replay exists is to preserve a peer's in-flight edit that
+    // hasn't round-tripped to REST yet, and that is exactly the case with no
+    // revision to compare. Silently dropping it would undo a live editor's
+    // most recent change for anyone hydrating late. The alternative risk —
+    // a genuinely stale unstamped entry momentarily winning over the
+    // snapshot — is bounded and self-healing: syncVisualizationToYjs always
+    // stamps a revision going forward, so it can only recur until that
+    // view's very next Y.js write.
+    if (typeof entryRevision === "number" && entryRevision <= minRevision) {
+      return null;
+    }
+  }
+
+  const vizMap = entry.get("visualization");
+  const visualization = vizMap instanceof Y.Map ? vizMap.toJSON() : null;
+
+  return {
+    action: "update",
+    viewId,
+    visualization,
+    userId: entry.get("userId"),
+    syncKey: entry.get("syncKey"),
+    collaborationViewId: entry.get("collaborationViewId"),
   };
 }
 
@@ -257,29 +369,14 @@ export function initializeVisualizationObserver() {
     });
 
     changedViewIds.forEach((viewId) => {
-      const entry = yVisualizationState.get(viewId);
-      // Legacy plain-object entry from before this migration (or the entry
-      // was deleted) — skip rather than throw; self-heals on the next write.
-      if (!(entry instanceof Y.Map)) return;
+      const payload = _emitVisualizationEntry(viewId);
+      if (!payload) return;
 
-      // Skip updates that came from this browser connection
-      if (entry.get("clientId") === ydoc.clientID) return;
-
-      const vizMap = entry.get("visualization");
-      const visualization = vizMap instanceof Y.Map ? vizMap.toJSON() : null;
-
-      log.debug(`[CIA Collab] ← viz from ${entry.get("userId")} for view ${viewId}`, visualization);
+      log.debug(`[CIA Collab] ← viz from ${payload.userId} for view ${viewId}`, payload.visualization);
 
       visualizationChangeCallbacks.forEach((cb) => {
         try {
-          cb({
-            action: "update",
-            viewId,
-            visualization,
-            userId: entry.get("userId"),
-            syncKey: entry.get("syncKey"),
-            collaborationViewId: entry.get("collaborationViewId"),
-          });
+          cb(payload);
         } catch (error) {
           log.error("Visualization observer callback error:", error);
         }
@@ -290,6 +387,70 @@ export function initializeVisualizationObserver() {
 
   log.debug("Visualization state observer initialized");
   return () => yVisualizationState.unobserveDeep(handler);
+}
+
+/**
+ * Replay every (or a selected subset of) currently-stored visualization
+ * entries through the SAME visualizationChangeCallbacks fan-out the live
+ * observer uses — no second code path interprets or applies a Y.js
+ * visualization entry. Used for late-join hydration: the live observer is
+ * delta-only (installed via .observeDeep, it only ever fires on a CHANGE), so
+ * anything written to yVisualizationState before a client's observer
+ * attached is otherwise invisible to it.
+ *
+ * @param {string[]|null} [viewIds] - specific viewIds to replay, or null (the
+ *   default) to replay every entry currently in yVisualizationState. Passing
+ *   null is normally correct — the downstream subscriber (workspaceManager)
+ *   already matches entries to local instances by syncKey, not by iterating
+ *   only "expected" viewIds, exactly like the live observer does.
+ * @param {{minRevision?: number|null}} [opts] - see _emitVisualizationEntry.
+ *   Pass the authoritative server snapshot's `revision` (buildSessionState())
+ *   here so a stale Y.js entry can't clobber a fresher snapshot already
+ *   applied.
+ * @returns {number} count of entries actually replayed (after skips)
+ */
+export function replayVisualizationState(viewIds = null, { minRevision = null } = {}) {
+  const ids = viewIds || Array.from(yVisualizationState.keys());
+  let count = 0;
+
+  ids.forEach((viewId) => {
+    const payload = _emitVisualizationEntry(viewId, { minRevision });
+    if (!payload) return;
+    count += 1;
+
+    log.debug(`[CIA Collab] ↺ replaying viz from ${payload.userId} for view ${viewId}`, payload.visualization);
+
+    visualizationChangeCallbacks.forEach((cb) => {
+      try {
+        cb(payload);
+      } catch (error) {
+        log.error("Visualization replay callback error:", error);
+      }
+    });
+  });
+
+  return count;
+}
+
+/**
+ * Late-join hydration: replay both visualization and camera Y.js state
+ * through their existing observer fan-outs in one call. See
+ * replayVisualizationState / replayCameraState — this is a thin combinator,
+ * not a third application path.
+ *
+ * Ordering with the server snapshot (buildSessionState() on the join
+ * response) is the caller's responsibility: apply the authoritative snapshot
+ * FIRST (it carries `revision`), then call this with
+ * `minRevision: snapshot.revision` so an in-flight-but-stale Y.js entry can't
+ * clobber it. See VRExplorationManager's join hydration call sites.
+ *
+ * @param {{viewIds?: string[]|null, minRevision?: number|null}} [opts]
+ * @returns {{visualization: number, camera: number}} counts of entries replayed
+ */
+export function hydrateFromYjs({ viewIds = null, minRevision = null } = {}) {
+  const visualization = replayVisualizationState(viewIds, { minRevision });
+  const camera = replayCameraState(viewIds);
+  return { visualization, camera };
 }
 
 // ============================================================================

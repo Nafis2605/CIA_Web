@@ -32,12 +32,23 @@ function createVrTestApp(pool) {
 
 maybeDescribe('VR session identity (H1 + H2)', () => {
   let app;
+  let roomId;
   const createdSessionIds = [];
 
-  beforeAll(() => {
+  beforeAll(async () => {
     process.env.DEV_BYPASS_AUTH = 'true';
     process.env.NODE_ENV = 'development';
     app = createVrTestApp(pool);
+
+    // Room scoping (021_vr_session_room_scope.sql / Phase A) — POST
+    // /sessions now requires roomId. The seeded project's public Main Room
+    // works for both Alice and Bob (SEED project_members) without needing
+    // any room_members rows of its own.
+    const room = await pool.query(
+      `SELECT id FROM rooms WHERE project_id = $1 AND is_main = true`,
+      [SEED.PROJECT_ID]
+    );
+    roomId = room.rows[0].id;
   });
 
   afterAll(async () => {
@@ -55,7 +66,7 @@ maybeDescribe('VR session identity (H1 + H2)', () => {
       .post('/api/vr/sessions')
       .set('x-user-id', userId)
       .set('x-user-name', userName)
-      .send({ projectId: SEED.PROJECT_ID });
+      .send({ projectId: SEED.PROJECT_ID, roomId });
     expect(res.status).toBe(200);
     createdSessionIds.push(res.body.id);
     return res.body;
@@ -65,6 +76,57 @@ maybeDescribe('VR session identity (H1 + H2)', () => {
     const session = await createSession(SEED.USER_ALICE, 'Alice');
     expect(session.owner_user_id).toBe(SEED.USER_ALICE);
     expect(session.owner_user_name).toBe('Alice');
+  });
+
+  // Issue 5 (device-grained host identity): owner_user_id alone cannot tell
+  // two devices signed into the SAME account apart. owner_participant_id
+  // (021_vr_session_room_scope.sql) is the accountUserId#deviceId composite
+  // that VRExplorationManager's resolveServerSessionOwnerId prefers — these
+  // two tests confirm the server actually populates and returns it, on both
+  // the create and the join response, which is the entire premise the
+  // client-side fix depends on.
+  test('POST /sessions sets owner_participant_id from the composite account+device id', async () => {
+    const res = await request(app)
+      .post('/api/vr/sessions')
+      .set('x-user-id', SEED.USER_ALICE)
+      .set('x-user-name', 'Alice')
+      .send({ projectId: SEED.PROJECT_ID, roomId, deviceId: 'device-alice-headset' });
+    expect(res.status).toBe(200);
+    createdSessionIds.push(res.body.id);
+
+    expect(res.body.owner_participant_id).toBe(`${SEED.USER_ALICE}#device-alice-headset`);
+    // Still present and unchanged — owner_participant_id is additive, not a
+    // replacement.
+    expect(res.body.owner_user_id).toBe(SEED.USER_ALICE);
+  });
+
+  test('POST /sessions/:id/join: the join response\'s embedded session carries owner_participant_id too', async () => {
+    const created = await request(app)
+      .post('/api/vr/sessions')
+      .set('x-user-id', SEED.USER_ALICE)
+      .set('x-user-name', 'Alice')
+      .send({ projectId: SEED.PROJECT_ID, roomId, deviceId: 'device-alice-headset' });
+    expect(created.status).toBe(200);
+    createdSessionIds.push(created.body.id);
+
+    // A second device on the SAME account joins — the scenario the whole fix
+    // exists for. The join response's `session` field is the raw row (see
+    // vr.js's join contract comment), so it must carry the SAME
+    // owner_participant_id the create response did, identifying device A
+    // (not device B, the joiner) as host.
+    const join = await request(app)
+      .post(`/api/vr/sessions/${created.body.id}/join`)
+      .set('x-user-id', SEED.USER_ALICE)
+      .set('x-user-name', 'Alice')
+      .send({ mode: 'vr-explorer', deviceId: 'device-alice-laptop' });
+
+    expect(join.status).toBe(200);
+    expect(join.body.session.owner_participant_id).toBe(
+      `${SEED.USER_ALICE}#device-alice-headset`
+    );
+    expect(join.body.session.owner_participant_id).not.toBe(
+      join.body.participant.participantId
+    );
   });
 
   test('PUT /sessions/:id: a caller cannot spoof ownership via x-user-id to bypass the owner check', async () => {
@@ -120,9 +182,11 @@ maybeDescribe('VR session identity (H1 + H2)', () => {
       .send({ mode: 'vr-explorer', deviceId: 'device-visionpro' });
     expect(join2.status).toBe(200);
 
-    expect(join1.body.participant_id).not.toBe(join2.body.participant_id);
-    expect(join1.body.account_user_id).toBe(SEED.USER_ALICE);
-    expect(join2.body.account_user_id).toBe(SEED.USER_ALICE);
+    // Phase B join response contract nests participant fields under
+    // `participant` (see vr.js's POST /sessions/:id/join contract comment)
+    // and no longer echoes account_user_id there at all — that check moves
+    // to the full participant rows fetched via GET below.
+    expect(join1.body.participant.participantId).not.toBe(join2.body.participant.participantId);
 
     const detail = await request(app)
       .get(`/api/vr/sessions/${session.id}`)
@@ -151,7 +215,7 @@ maybeDescribe('VR session identity (H1 + H2)', () => {
       .set('x-user-name', 'Alice')
       .send({ mode: 'vr-explorer', deviceId: 'device-desktop' });
     expect(second.status).toBe(200);
-    expect(second.body.mode).toBe('vr-explorer');
+    expect(second.body.participant.mode).toBe('vr-explorer');
 
     const detail = await request(app)
       .get(`/api/vr/sessions/${session.id}`)

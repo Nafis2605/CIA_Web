@@ -50,6 +50,7 @@ export class VRMeasureTool extends VRToolInterface {
       name: 'Measure',
       icon: 'ruler',
       category: 'analysis',
+      exactSourcePicking: true,
     });
 
     // The path being built, in data space.
@@ -69,6 +70,11 @@ export class VRMeasureTool extends VRToolInterface {
     this._previewSource = null;
     this._previewPoint = null;
     this._frameCounter = 0;
+
+    // Per-hand, matching VRAnnotationTool. A single scalar latch cross-talks
+    // between hands: releasing one hand's trigger cleared the flag for the
+    // other, so alternating or two-handed use dropped placements.
+    this._lastTriggerState = { left: false, right: false };
   }
 
   async activate(context) {
@@ -90,7 +96,15 @@ export class VRMeasureTool extends VRToolInterface {
   // ===========================================================================
 
   handleInput(inputState, frame) {
-    const rightCtrl = inputState.controllers?.right;
+    // Whichever hand VRExplorationManager._resolveActivePointerHand resolved
+    // as active this frame, instead of hardcoding the right controller. This
+    // tool used to read controllers.right unconditionally, which made
+    // left-handed measurement silently impossible — and on Vision Pro, where
+    // a gripless pinch is assigned to whichever hand slot is free, a second
+    // simultaneous pinch lands in 'left' and was dropped entirely.
+    // VRAnnotationTool already did this; measure did not.
+    const activeHand = inputState.activePointerHand === 'left' ? 'left' : 'right';
+    const activeCtrl = inputState.controllers?.[activeHand];
 
     // Rising-edge detection, updated BEFORE acting on it: the placement branch
     // returns early, so updating afterwards never ran on a successful
@@ -102,11 +116,11 @@ export class VRMeasureTool extends VRToolInterface {
     // out before this update left the latch stuck at `true` from the last
     // pinch that reached it, so no later pinch could ever read as a fresh
     // rising edge again.
-    const triggerPressed = !!rightCtrl?.triggerPressed;
-    const triggerRisingEdge = triggerPressed && !this._lastTriggerState;
-    this._lastTriggerState = triggerPressed;
+    const triggerPressed = !!activeCtrl?.triggerPressed;
+    const triggerRisingEdge = triggerPressed && !this._lastTriggerState[activeHand];
+    this._lastTriggerState[activeHand] = triggerPressed;
 
-    if (!rightCtrl) return null;
+    if (!activeCtrl) return null;
 
     if (triggerRisingEdge) {
       // Measurement placement is intentionally NOT gated by the shared
@@ -114,7 +128,7 @@ export class VRMeasureTool extends VRToolInterface {
       // VRExplorationManager.js's "DATA-MANIPULATION TOKEN" comment. It's an
       // additive, per-user, non-conflicting write, so any participant may
       // place one at any time regardless of who holds the token.
-      return this._addPoint(rightCtrl, frame);
+      return this._addPoint(activeCtrl, frame);
     }
 
     // Rubber-band preview toward wherever the controller is now pointing.
@@ -127,7 +141,7 @@ export class VRMeasureTool extends VRToolInterface {
       this._points.length > 0 &&
       this._frameCounter % PREVIEW_EVERY_N_FRAMES === 0
     ) {
-      const hit = this._performRaycast(rightCtrl, frame);
+      const hit = this._performRaycast(activeCtrl, frame);
       this._previewPoint = hit ? { ...hit.position } : null;
     }
 
@@ -142,7 +156,10 @@ export class VRMeasureTool extends VRToolInterface {
     }
 
     const hit = this._performRaycast(controller, frame);
-    if (!hit) return null;
+    if (!hit) {
+      this._context?.flashNotice?.('No measurement point there — aim at a highlighted surface');
+      return null;
+    }
 
     // pointId/cellId/pickActorRole ride alongside x/y/z on each point —
     // startPoint/endPoint below are plain spreads of these, so the fields
